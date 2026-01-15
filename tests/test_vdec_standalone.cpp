@@ -27,6 +27,12 @@
 #define ALIGN(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 #endif
 
+// Execution mode
+enum ExecutionMode {
+    MODE_THREAD,      // Use separate threads for SendStream and GetFrame (default, like SDK)
+    MODE_SEQUENTIAL   // Sequential execution: SendStream → Wait → GetFrame (simplified)
+};
+
 // Thread control
 enum ThreadCtrl {
     THREAD_CTRL_START,
@@ -520,6 +526,184 @@ static bool decode_jpeg_file(VDEC_CHN vdec_chn, const std::string& filepath,
     }
 }
 
+// Sequential mode: SendStream → Wait → GetFrame (no threads)
+static bool decode_jpeg_file_sequential(VDEC_CHN vdec_chn, const std::string& filepath,
+                                        const char* output_filepath = nullptr) {
+    std::cout << "[DECODE] Loading JPEG file (SEQUENTIAL mode): " << filepath << std::endl;
+
+    // Read file into memory
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "[ERROR] Cannot open file: " << filepath << std::endl;
+        return false;
+    }
+
+    std::streamsize file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> file_data(file_size);
+    if (!file.read(reinterpret_cast<char*>(file_data.data()), file_size)) {
+        std::cerr << "[ERROR] Failed to read file" << std::endl;
+        return false;
+    }
+    file.close();
+
+    std::cout << "[DECODE] File size: " << (file_size / 1024.0) << " KB" << std::endl;
+
+    // Find JPEG start/end markers (0xFF 0xD8 and 0xFF 0xD9)
+    uint8_t* data = file_data.data();
+    size_t data_size = file_data.size();
+    size_t jpeg_start = 0;
+    size_t jpeg_end = data_size;
+
+    // Find JPEG start (SOI marker)
+    for (size_t i = 0; i < data_size - 1; i++) {
+        if (data[i] == 0xFF && data[i + 1] == 0xD8) {
+            jpeg_start = i;
+            break;
+        }
+    }
+
+    // Find JPEG end (EOI marker)
+    for (size_t i = jpeg_start + 2; i < data_size - 1; i++) {
+        if (data[i] == 0xFF && data[i + 1] == 0xD9) {
+            jpeg_end = i + 2;
+            break;
+        }
+    }
+
+    size_t jpeg_size = jpeg_end - jpeg_start;
+    std::cout << "[DECODE] JPEG data: offset=" << jpeg_start
+              << ", size=" << jpeg_size << " bytes" << std::endl;
+
+    // Prepare stream structure
+    VDEC_STREAM_S stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.pu8Addr = data + jpeg_start;
+    stream.u32Len = static_cast<CVI_U32>(jpeg_size);
+    stream.bEndOfFrame = CVI_TRUE;
+    stream.bEndOfStream = CVI_FALSE;
+    stream.bDisplay = CVI_TRUE;
+    stream.u64PTS = 0;
+
+    // Step 1: SendStream with retry logic
+    std::cout << "[DECODE] Sending stream to VDEC..." << std::endl;
+    CVI_S32 rc;
+    int retry_count = 0;
+    const int max_retries = 500;
+
+    do {
+        rc = CVI_VDEC_SendStream(vdec_chn, &stream, -1);
+
+        if (rc == CVI_SUCCESS) {
+            std::cout << "[DECODE] SendStream succeeded" << std::endl;
+            break;
+        } else {
+            retry_count++;
+            if (retry_count >= max_retries) {
+                std::cerr << "[ERROR] SendStream timeout after "
+                          << max_retries << " retries, error: 0x"
+                          << std::hex << rc << std::dec << std::endl;
+                return false;
+            }
+            std::cout << "[DECODE] SendStream failed (0x" << std::hex << rc << std::dec
+                      << "), retry " << retry_count << std::endl;
+            usleep(10000);  // 10ms delay between retries
+        }
+    } while (rc != CVI_SUCCESS);
+
+    // Step 2: Wait for decoding and GetFrame
+    std::cout << "[DECODE] Waiting for decoded frame..." << std::endl;
+    VIDEO_FRAME_INFO_S frame;
+    memset(&frame, 0, sizeof(frame));
+
+    int getframe_retries = 0;
+    const int max_getframe_retries = 100;  // 100 retries * 10ms = 1 second
+
+    while (getframe_retries < max_getframe_retries) {
+        rc = CVI_VDEC_GetFrame(vdec_chn, &frame, 100);  // 100ms timeout
+
+        if (rc == CVI_SUCCESS) {
+            std::cout << "[DECODE] GetFrame succeeded!" << std::endl;
+
+            // Invalidate cache for all planes
+            for (int i = 0; i < 3; i++) {
+                if (frame.stVFrame.pu8VirAddr[i]) {
+                    CVI_SYS_IonInvalidateCache(
+                        frame.stVFrame.u64PhyAddr[i],
+                        frame.stVFrame.pu8VirAddr[i],
+                        frame.stVFrame.u32Stride[i] * frame.stVFrame.u32Height);
+                }
+            }
+
+            std::cout << "[DECODE] Frame info:" << std::endl;
+            std::cout << "  - Width: " << frame.stVFrame.u32Width << std::endl;
+            std::cout << "  - Height: " << frame.stVFrame.u32Height << std::endl;
+            std::cout << "  - PixelFormat: " << (int)frame.stVFrame.enPixelFormat << std::endl;
+            std::cout << "  - PhysAddr[0]: 0x" << std::hex
+                      << frame.stVFrame.u64PhyAddr[0] << std::dec << std::endl;
+
+            // Save YUV data to file
+            if (output_filepath) {
+                FILE* fp = fopen(output_filepath, "wb");
+                if (fp) {
+                    VIDEO_FRAME_S* pstVFrame = &frame.stVFrame;
+
+                    // Calculate total YUV size
+                    size_t total_size = 0;
+                    for (int i = 0; i < 3; i++) {
+                        if (pstVFrame->pu8VirAddr[i]) {
+                            size_t plane_size = pstVFrame->u32Stride[i] * pstVFrame->u32Height;
+                            if (i > 0) {
+                                plane_size = pstVFrame->u32Stride[i] * (pstVFrame->u32Height / 2);
+                            }
+                            total_size += plane_size;
+                        }
+                    }
+
+                    std::cout << "[DECODE] Saving YUV to " << output_filepath
+                              << " (" << total_size << " bytes)" << std::endl;
+
+                    // Write each plane
+                    for (int i = 0; i < 3; i++) {
+                        if (pstVFrame->pu8VirAddr[i]) {
+                            size_t plane_size = pstVFrame->u32Stride[i] * pstVFrame->u32Height;
+                            if (i > 0) {
+                                plane_size = pstVFrame->u32Stride[i] * (pstVFrame->u32Height / 2);
+                            }
+                            fwrite(pstVFrame->pu8VirAddr[i], 1, plane_size, fp);
+                        }
+                    }
+
+                    fclose(fp);
+                    std::cout << "[DECODE] YUV file saved successfully" << std::endl;
+                } else {
+                    std::cerr << "[ERROR] Failed to open output file: "
+                              << output_filepath << std::endl;
+                }
+            }
+
+            // Release frame
+            CVI_VDEC_ReleaseFrame(vdec_chn, &frame);
+            std::cout << "[DECODE] Frame released" << std::endl;
+            return true;
+
+        } else if (rc == CVI_ERR_VDEC_BUF_EMPTY) {
+            // No frame available yet, continue waiting
+            getframe_retries++;
+            usleep(10000);  // 10ms
+            continue;
+        } else {
+            std::cerr << "[ERROR] CVI_VDEC_GetFrame failed: 0x"
+                      << std::hex << rc << std::dec << std::endl;
+            return false;
+        }
+    }
+
+    std::cerr << "[ERROR] GetFrame timeout after " << max_getframe_retries << " retries" << std::endl;
+    return false;
+}
+
 int main(int argc, char* argv[]) {
     std::cout << "========================================" << std::endl;
     std::cout << "  VDEC Standalone Test" << std::endl;
@@ -528,14 +712,73 @@ int main(int argc, char* argv[]) {
     std::cout << std::endl;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <jpeg_file> [output_yuv]" << std::endl;
-        std::cerr << "  jpeg_file: Input JPEG file path" << std::endl;
-        std::cerr << "  output_yuv: Optional YUV output file path (default: no output)" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <jpeg_file> [options]" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Arguments:" << std::endl;
+        std::cerr << "  jpeg_file       Input JPEG file path" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Options:" << std::endl;
+        std::cerr << "  --mode MODE     Execution mode (default: thread)" << std::endl;
+        std::cerr << "                   thread   : Use threads (like SDK sample)" << std::endl;
+        std::cerr << "                   sequential: Sequential execution (simplified)" << std::endl;
+        std::cerr << "  -o OUTPUT       YUV output file path (optional)" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Examples:" << std::endl;
+        std::cerr << "  " << argv[0] << " input.jpg" << std::endl;
+        std::cerr << "  " << argv[0] << " input.jpg --mode thread" << std::endl;
+        std::cerr << "  " << argv[0] << " input.jpg --mode sequential -o output.yuv" << std::endl;
         return 1;
     }
 
-    std::string jpeg_file = argv[1];
-    const char* output_file = (argc >= 3) ? argv[2] : nullptr;
+    // Parse command line arguments
+    std::string jpeg_file;
+    ExecutionMode mode = MODE_THREAD;  // Default: thread mode
+    const char* output_file = nullptr;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--mode" && i + 1 < argc) {
+            std::string mode_str = argv[++i];
+            if (mode_str == "thread" || mode_str == "t") {
+                mode = MODE_THREAD;
+            } else if (mode_str == "sequential" || mode_str == "s") {
+                mode = MODE_SEQUENTIAL;
+            } else {
+                std::cerr << "[ERROR] Invalid mode: " << mode_str << std::endl;
+                std::cerr << "Valid modes: thread, sequential" << std::endl;
+                return 1;
+            }
+        } else if (arg == "-o" && i + 1 < argc) {
+            output_file = argv[++i];
+        } else if (arg[0] != '-') {
+            // Positional argument: JPEG file
+            if (jpeg_file.empty()) {
+                jpeg_file = arg;
+            } else {
+                std::cerr << "[ERROR] Multiple JPEG files specified" << std::endl;
+                return 1;
+            }
+        } else {
+            std::cerr << "[ERROR] Unknown option: " << arg << std::endl;
+            return 1;
+        }
+    }
+
+    if (jpeg_file.empty()) {
+        std::cerr << "[ERROR] No JPEG file specified" << std::endl;
+        return 1;
+    }
+
+    // Display mode
+    std::cout << "[CONFIG] Execution mode: "
+              << (mode == MODE_THREAD ? "THREAD (parallel)" : "SEQUENTIAL (simplified)")
+              << std::endl;
+    std::cout << "[CONFIG] Input file: " << jpeg_file << std::endl;
+    if (output_file) {
+        std::cout << "[CONFIG] Output file: " << output_file << std::endl;
+    }
+    std::cout << std::endl;
     const VDEC_CHN vdec_chn = 0;
     const uint32_t max_width = 1920;
     const uint32_t max_height = 1080;
@@ -551,8 +794,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Decode JPEG file
-    bool success = decode_jpeg_file(vdec_chn, jpeg_file, output_file);
+    // Decode JPEG file using selected mode
+    bool success;
+    if (mode == MODE_SEQUENTIAL) {
+        success = decode_jpeg_file_sequential(vdec_chn, jpeg_file, output_file);
+    } else {
+        success = decode_jpeg_file(vdec_chn, jpeg_file, output_file);
+    }
 
     // Cleanup
     cleanup_vdec_channel(vdec_chn);

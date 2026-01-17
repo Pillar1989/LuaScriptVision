@@ -1135,13 +1135,223 @@ cv::imread()
 
 ---
 
-**最后更新**: 2025-01-16
-**状态**: Phase 1-4.6 完成（包含 IonImageLoader + HwJpegDecoder 全链路硬件加速），Phase 5 设计完成待实现
-**下一步**: 实现 Phase 5（Image/Frame 统一与 Lua 绑定）
+### Phase 7: 完整 Camera 支持（VI → ISP → VPSS）📋 设计完成
+
+**目标**：实现完整的 Camera 到 AI 推理零拷贝流水线，支持 OV5647/GC2053 双传感器自适应。
+
+#### 7.1 资源分配策略（更新）
+
+| 模块 | VPSS_GRP | VPSS_CHN | VDEC_CHN | VI_DEV | VI_PIPE | VI_CHN | 备注 |
+|------|----------|----------|----------|--------|---------|--------|------|
+| CviCamera | 0 | 0 | - | 0 | 0 | 0 | Camera专用，VI绑定模式 |
+| CviVpssProcessor | 1 | 0 | - | - | - | - | 图像处理，SendFrame模式 |
+| HwJpegDecoder | - | - | 0 | - | - | - | JPEG硬解码 |
+
+**数据流**：
+```
+路径1: Camera零拷贝 (全程物理地址)
+Sensor → MIPI → VI(DEV0) → ISP → VPSS(GRP0) → TPU
+
+路径2: JPEG硬件加速 (VDEC→VPSS)
+JPEG File → VDEC(CHN0) → VIDEO_FRAME → SendFrame → VPSS(GRP1) → TPU
+
+路径3: 图片硬件加速 (VB Pool→VPSS)
+Image File → imread → Mat → VB Pool → SendFrame → VPSS(GRP1) → TPU
+```
+
+#### 7.2 传感器驱动抽象层（cvi_sensor.h/cpp）
+
+**支持传感器**：
+- OV5647：5MP，1920x1080@30fps，I2C地址0x36
+- GC2053：2MP，1920x1080@30fps，I2C地址0x3f
+
+**自动检测机制**：
+1. 设置 I2C 总线 (bus_id=2)
+2. 配置 I2C 地址
+3. 调用 `pfnSnsProbe()` 探测
+4. 按优先级尝试：OV5647 → GC2053
+5. 探测成功则使用该传感器
+
+**初始化流程**（参考 sscma-example）：
+```
+CVI_SYS_VI_Open()
+    ↓
+Sensor_Start()
+    ├── pfnSetBusInfo() - I2C总线配置
+    ├── pfnPatchI2cAddr() - I2C地址
+    ├── pfnRegisterCallback() - AE/AWB回调注册
+    ├── pfnExpSensorCb() - 曝光回调
+    │   ├── pfn_cmos_sensor_global_init()
+    │   ├── pfn_cmos_set_image_mode()
+    │   └── pfn_cmos_set_wdr_mode()
+    └── pfnPatchRxAttr() - MIPI属性
+    ↓
+Mipi_Start()
+    ├── CVI_MIPI_SetSensorReset(1) - 复位传感器
+    ├── CVI_MIPI_SetMipiReset(1) - 复位MIPI
+    ├── CVI_MIPI_SetMipiAttr() - 设置MIPI属性
+    ├── CVI_MIPI_SetSensorClock(1) - 使能时钟
+    └── CVI_MIPI_SetSensorReset(0) - 解除复位
+    ↓
+Dev_Start()
+    ├── CVI_VI_SetDevAttr()
+    └── CVI_VI_EnableDev()
+    ↓
+Pipe_Start()
+    ├── CVI_VI_CreatePipe()
+    └── CVI_VI_StartPipe()
+    ↓
+ISP_Init()
+    ├── CVI_AE_Register() - AE算法注册
+    ├── CVI_AWB_Register() - AWB算法注册
+    ├── CVI_ISP_SetBindAttr() - 绑定AE/AWB
+    ├── CVI_ISP_MemInit() - ISP内存初始化
+    ├── CVI_ISP_SetPubAttr() - 公共属性
+    └── CVI_ISP_Init()
+    ↓
+ISP_Start()
+    └── pthread_create(ISP_Thread) - ISP运行线程
+        └── CVI_ISP_Run(ViPipe) - ISP主循环
+    ↓
+Chn_Start()
+    ├── CVI_VI_SetChnAttr()
+    ├── CVI_VI_RegChnFlipMirrorCallBack() - 镜像翻转回调
+    └── CVI_VI_EnableChn()
+```
+
+**API设计**：
+```cpp
+class CviSensor {
+public:
+    enum class SensorType { NONE, OV5647, GC2053, AUTO };
+
+    struct Config {
+        SensorType type = SensorType::AUTO;  // 自动检测
+        int32_t bus_id = 2;                  // I2C总线
+        uint32_t width = 1920;
+        uint32_t height = 1080;
+        int32_t framerate = 30;
+        bool mirror = false;
+        bool flip = false;
+    };
+
+    bool init(const Config& config);  // 初始化（包含ISP）
+    void cleanup();                   // 清理资源
+
+    SensorType get_sensor_type() const;  // 获取检测到的传感器类型
+    const char* get_sensor_name() const; // 获取传感器名称
+    VI_PIPE get_vi_pipe() const;         // 获取VI管道ID
+    VI_CHN get_vi_chn() const;           // 获取VI通道ID
+};
+```
+
+#### 7.3 CviCamera 更新（集成 CviSensor）
+
+**当前问题**：
+- 缺少 ISP 初始化（AE/AWB）
+- 缺少传感器驱动初始化
+- 缺少 MIPI 配置
+
+**更新方案**：
+```cpp
+class CviCamera {
+public:
+    bool open() {
+        // 1. 使用 CviSensor 初始化传感器 + ISP
+        if (!sensor_.init(sensor_config_)) {
+            return false;
+        }
+
+        // 2. 初始化 VPSS（GRP=0，与 VI 绑定）
+        init_vpss_module();
+
+        // 3. 绑定 VI → VPSS
+        bind_vi_vpss();
+
+        return true;
+    }
+
+    bool read(Frame& frame) {
+        // 从 VPSS 获取帧（零拷贝）
+        VIDEO_FRAME_INFO_S vpss_frame;
+        CVI_VPSS_GetChnFrame(vpss_grp_, vpss_chn_, &vpss_frame, timeout);
+        frame = Frame(vpss_frame, vpss_grp_, vpss_chn_);
+        return true;
+    }
+
+private:
+    CviSensor sensor_;  // 传感器管理
+    VPSS_GRP vpss_grp_ = 0;  // Camera专用VPSS组
+    VPSS_CHN vpss_chn_ = 0;
+};
+```
+
+#### 7.4 链接依赖
+
+**传感器驱动库**（需在 CMakeLists.txt 添加）：
+- `libsns_ov5647.a` - OV5647传感器驱动
+- `libsns_gc2053.a` - GC2053传感器驱动
+
+**ISP库**：
+- `libcvi_bin.so` - ISP参数二进制加载
+- `libae.so` - 自动曝光
+- `libawb.so` - 自动白平衡
+- `libisp.so` - ISP核心
+
+**头文件路径**：
+```
+$SG200X_SDK_PATH/cvi_mpi/include/
+  ├── cvi_ae.h
+  ├── cvi_awb.h
+  ├── cvi_isp.h
+  ├── cvi_mipi.h
+  └── cvi_bin.h
+```
+
+#### 7.5 测试计划
+
+**测试文件**：
+1. `test_camera.cpp` - Camera → VI → ISP → VPSS 测试
+2. `test_jpeg_vpss.cpp` - JPEG → VDEC → VPSS 测试（验证全链路）
+
+**测试矩阵**：
+| 测试用例 | 输入源 | 管道 | 验证项 |
+|---------|--------|------|--------|
+| Camera基本 | 传感器 | VI → VPSS(GRP0) | 获取帧成功 |
+| Camera+ISP | 传感器 | VI → ISP → VPSS | AE/AWB工作 |
+| JPEG→VDEC | JPEG文件 | VDEC → VIDEO_FRAME | 硬解码成功 |
+| JPEG→VPSS | JPEG文件 | VDEC → SendFrame → VPSS(GRP1) | resize成功 |
+| 图片→VPSS | PNG文件 | imread → VB → VPSS(GRP1) | resize成功 |
+| 并发测试 | Camera+JPEG | 同时运行两条流水线 | 无资源冲突 |
+
+**设备测试命令**：
+```bash
+# Camera测试
+sshpass -p '11' ssh recamera@192.168.42.1 'echo "11" | sudo -S /tmp/test_camera'
+
+# JPEG→VPSS测试
+sshpass -p '11' ssh recamera@192.168.42.1 '/tmp/test_jpeg_vpss /tmp/test.jpg'
+```
+
+#### 7.6 实现步骤
+
+1. **Step 1**: 创建 cvi_sensor.h/cpp（传感器抽象层）✅ 已完成文件框架
+2. **Step 2**: 更新 CMakeLists.txt（添加传感器库链接）
+3. **Step 3**: 更新 cvi_camera.cpp（集成 CviSensor）
+4. **Step 4**: 创建 test_camera.cpp（Camera测试）
+5. **Step 5**: 创建 test_jpeg_vpss.cpp（JPEG→VPSS测试）
+6. **Step 6**: 设备测试验证
+
+---
+
+**最后更新**: 2026-01-16
+**状态**: Phase 1-4.6 完成，Phase 5 设计完成待实现，Phase 7（Camera支持）设计完成
+**下一步**: 实现 Phase 7（Camera完整支持）
 
 **重要里程碑**：
 - ✅ VPSS 硬件加速（Phase 3）: 6.8x 性能提升
 - ✅ VB Pool 统一管理（Phase 4.6）: 解决资源冲突
 - ✅ VDEC 硬件 JPEG 解码（Phase 4.6）: 34.4x 性能提升
 - ✅ **全链路硬件加速（Phase 4.6）**: JPEG → VDEC → VPSS，12x 端到端加速
+- 📋 **Camera完整支持（Phase 7）**: VI → ISP → VPSS 零拷贝流水线
 

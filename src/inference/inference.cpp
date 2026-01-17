@@ -1,4 +1,7 @@
 #include "inference.h"
+
+#ifdef USE_ONNX_RUNTIME
+
 #include <stdexcept>
 #include <algorithm>
 #include <numeric>
@@ -152,3 +155,5 @@ std::vector<int64_t> OnnxSession::get_output_shape(size_t index) const {
 }
 
 } // namespace inference
+
+#endif  // USE_ONNX_RUNTIME

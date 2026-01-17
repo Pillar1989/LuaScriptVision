@@ -8,6 +8,8 @@
 
 namespace lua_nn {
 
+#ifdef USE_ONNX_RUNTIME
+
 // ========== Session 实现 ==========
 
 Session::Session(const std::string& model_path, int num_threads)
@@ -53,6 +55,8 @@ std::vector<int64_t> Session::input_shape(size_t index) const {
 std::vector<int64_t> Session::output_shape(size_t index) const {
     return session_->get_output_shape(index);
 }
+
+#endif  // USE_ONNX_RUNTIME
 
 // ========== Lua 模块注册 ==========
 
@@ -167,7 +171,8 @@ void register_module(lua_State* L) {
                 .addMetaFunction("__len", [](const TensorView<float>* t) { return t->length(); })
             .endClass()
 
-            // Session绑定
+#ifdef USE_ONNX_RUNTIME
+            // Session绑定 (仅在启用ONNX Runtime时可用)
             .beginClass<Session>("Session")
                 .addConstructor(
                     LUA_SP(std::shared_ptr<Session>),
@@ -177,6 +182,7 @@ void register_module(lua_State* L) {
                 .addProperty("input_names", &Session::input_names)
                 .addProperty("output_names", &Session::output_names)
             .endClass()
+#endif  // USE_ONNX_RUNTIME
         .endModule();
 }
 

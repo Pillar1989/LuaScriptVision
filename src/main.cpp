@@ -14,7 +14,9 @@
 // 推理上下文
 struct InferenceContext {
     lua_State* L = nullptr;
+#ifdef USE_ONNX_RUNTIME
     std::unique_ptr<lua_nn::Session> session;
+#endif
     LuaIntf::LuaRef preprocess;
     LuaIntf::LuaRef postprocess;
     LuaIntf::LuaRef preprocess_config;  // 新增：C++预处理配置
@@ -54,6 +56,7 @@ void print_usage(const char* prog_name) {
     std::cout << "  " << prog_name << " tests/test_basic.lua\n";
 }
 
+#ifdef USE_ONNX_RUNTIME
 // 初始化推理上下文
 std::unique_ptr<InferenceContext> init_inference(const std::string& script_path,
                                                   const std::string& model_path) {
@@ -146,6 +149,7 @@ LuaIntf::LuaRef run_inference(InferenceContext* ctx, lua_cv::Image& img) {
     // 后处理
     return ctx->postprocess.call<LuaIntf::LuaRef>(outputs, meta);
 }
+#endif  // USE_ONNX_RUNTIME
 
 void print_results(LuaIntf::LuaRef& results) {
     int len = results.len();
@@ -343,6 +347,7 @@ int main(int argc, char* argv[]) {
         return run_test_script(first_arg);
     }
 
+#ifdef USE_ONNX_RUNTIME
     // 推理模式：需要至少 3 个参数（script, model, input）
     if (argc < 4) {
         print_usage(argv[0]);
@@ -378,6 +383,7 @@ int main(int argc, char* argv[]) {
 
         // 判断是视频还是图片
         if (is_video_file(input_path)) {
+#ifdef HAVE_OPENCV_VIDEOIO
             // ========== 视频推理模式 ==========
             cv::VideoCapture cap(input_path);
             if (!cap.isOpened()) {
@@ -512,6 +518,12 @@ int main(int argc, char* argv[]) {
             }
             if (show_result) cv::destroyAllWindows();
 
+#else  // !HAVE_OPENCV_VIDEOIO
+            std::cerr << "Error: Video mode not supported (OpenCV built without videoio module)\n";
+            std::cerr << "Please use image input or rebuild OpenCV with videoio support.\n";
+            return 1;
+#endif  // HAVE_OPENCV_VIDEOIO
+
         } else {
             // ========== 图片推理模式 ==========
             std::cout << "Loading image: " << input_path << "\n";
@@ -535,12 +547,18 @@ int main(int argc, char* argv[]) {
                     std::cout << "\nResult saved to: " << save_path << "\n";
                 }
 
+#ifdef HAVE_OPENCV_VIDEOIO
                 if (show_result) {
                     cv::imshow("Result", draw_img);
                     std::cout << "Press any key to exit...\n";
                     cv::waitKey(0);
                     cv::destroyAllWindows();
                 }
+#else
+                if (show_result) {
+                    std::cerr << "Warning: Display mode not supported (OpenCV built without videoio/highgui)\n";
+                }
+#endif
             }
         }
 
@@ -548,6 +566,13 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
+#else
+    // Inference mode requires ONNX Runtime
+    std::cerr << "Error: Inference mode is not available.\n";
+    std::cerr << "This build was compiled without ONNX Runtime support.\n";
+    std::cerr << "Only test mode is available: " << argv[0] << " <test_script.lua>\n";
+    return 1;
+#endif  // USE_ONNX_RUNTIME
 
     return 0;
 }

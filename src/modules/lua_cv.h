@@ -7,40 +7,47 @@
 #include <string>
 #include "LuaIntf.h"
 
-// 使用 lua_nn.h 中的 Tensor (实际是 tensor::Tensor)
+// Use Tensor from lua_nn.h
 #include "lua_nn.h"
+
+// Use Frame from cv module
+#include "cv/cvi_frame.h"
 
 namespace lua_cv {
 
 class Image {
 public:
-    explicit Image(const cv::Mat& mat);
-    Image();  // 默认构造函数
+    explicit Image(lua_cv::Frame&& frame);
+    Image();
 
-    // 属性访问（通过getter，不直接暴露成员）
-    int width() const { return mat_.cols; }
-    int height() const { return mat_.rows; }
-    int channels() const { return mat_.channels(); }
-    bool empty() const { return mat_.empty(); }
+    // Copy operations (uses Frame::clone())
+    Image(const Image& other);
+    Image& operator=(const Image& other);
 
-    // 图像操作（原地修改）
+    // Property access (via getters, not direct member exposure)
+    int width() const;
+    int height() const;
+    int channels() const;
+    bool empty() const;
+
+    // Image operations (modify in-place)
     void resize(int new_w, int new_h);
     void pad(int top, int bottom, int left, int right, int fill_value);
 
-    // 返回Tensor对象
+    // Return Tensor object
     lua_nn::Tensor to_tensor(double scale,
                              const LuaIntf::LuaRef& mean,
                              const LuaIntf::LuaRef& std) const;
 
-    // 工具方法
+    // Utility methods
     Image clone() const;
 
-    // 内部访问（仅C++使用）
-    const cv::Mat& data() const { return mat_; }
-    cv::Mat& data() { return mat_; }
+    // Internal access (C++ only)
+    const lua_cv::Frame& data() const { return frame_; }
+    lua_cv::Frame& data() { return frame_; }
 
 private:
-    cv::Mat mat_;
+    lua_cv::Frame frame_;
 };
 
 // 全局函数

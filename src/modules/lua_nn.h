@@ -16,6 +16,8 @@ namespace lua_nn {
 // 使用 tensor::Tensor 作为 lua_nn::Tensor
 using Tensor = tensor::Tensor;
 
+#ifdef USE_ONNX_RUNTIME
+
 class Session {
 public:
     explicit Session(const std::string& model_path, int num_threads = 4);
@@ -32,6 +34,8 @@ public:
 private:
     std::unique_ptr<inference::OnnxSession> session_;
 };
+
+#endif  // USE_ONNX_RUNTIME
 
 // 注册到Lua
 void register_module(lua_State* L);

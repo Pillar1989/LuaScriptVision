@@ -3,11 +3,14 @@
 #include <vector>
 #include <string>
 #include <memory>
-#include "onnxruntime_cxx_api.h"
 
 // Generic inference engine abstraction
 // Provides ONNX Runtime session management for any model
 namespace inference {
+
+#ifdef USE_ONNX_RUNTIME
+
+#include "onnxruntime_cxx_api.h"
 
 // ============ ONNX Session ============
 
@@ -39,5 +42,7 @@ private:
     std::vector<const char*> input_names_cstr_;
     std::vector<const char*> output_names_cstr_;
 };
+
+#endif  // USE_ONNX_RUNTIME
 
 } // namespace inference

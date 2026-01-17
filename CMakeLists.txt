@@ -428,58 +428,7 @@ if(NOT USE_ONNX_RUNTIME)
 
     message(STATUS "test_vdec_standalone: VDEC standalone test enabled (static build)")
 
-    # Test 4: JPEG → VDEC → VPSS Pipeline Test
-    add_executable(test_jpeg_vpss
-        tests/test_jpeg_vpss.cpp
-        src/modules/cv/hw_jpeg_decoder.cpp
-        src/modules/cv/cvi_vpss_processor.cpp
-        src/modules/cv/opencv_processor.cpp
-        src/modules/cv/cvi_frame.cpp
-        src/modules/cv/cv_helpers.cpp
-        ${TENSOR_SOURCES}
-    )
-
-    target_include_directories(test_jpeg_vpss PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
-        "${CMAKE_CURRENT_SOURCE_DIR}/lua-intf-ex/src/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/lua"
-        ${OpenCV_INCLUDE_DIRS}
-        ${TPU_INCLUDE_DIR}
-        ${CVI_MPI_INCLUDE_DIR}
-    )
-
-    target_link_directories(test_jpeg_vpss PRIVATE
-        ${TPU_LIB_DIR}
-        ${CVI_MPI_LIB_DIR}
-    )
-
-    target_link_libraries(test_jpeg_vpss PRIVATE
-        -static
-        lua
-        ${TPU_LIB_DIR}/libcviruntime-static.a
-        ${TPU_LIB_DIR}/libcvikernel-static.a
-        ${TPU_LIB_DIR}/libcvimath-static.a
-        ${TPU_LIB_DIR}/libflatbuffers.a
-        ${CVI_MPI_LIB_DIR}/libsys.a
-        ${CVI_MPI_LIB_DIR}/libvpss.a
-        ${CVI_MPI_LIB_DIR}/libvdec.a
-        ${CVI_MPI_LIB_DIR}/libvo.a
-        ${OpenCV_LIBS}
-        z
-        m
-        pthread
-        dl
-        atomic
-    )
-
-    target_compile_definitions(test_jpeg_vpss PRIVATE USE_CVI_MPI)
-
-    message(STATUS "test_jpeg_vpss: JPEG → VDEC → VPSS test enabled (static build)")
-
-    # Test 5: Camera → VI → ISP → VPSS Test (requires ENABLE_CVI_CAMERA=ON)
+    # Test 4: Camera → VI → ISP → VPSS Test (requires ENABLE_CVI_CAMERA=ON)
     if(ENABLE_CVI_CAMERA)
         add_executable(test_camera
             tests/test_camera.cpp

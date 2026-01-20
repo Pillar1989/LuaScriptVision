@@ -1,4 +1,7 @@
 #include "cv_helpers.h"
+
+#include <stdexcept>
+
 #include "opencv_processor.h"
 #include "tensor/tensor.h"
 
@@ -6,13 +9,8 @@
 #include "cvi_vpss_processor.h"
 #endif
 
-#include <iostream>
-#include <opencv2/opencv.hpp>
+namespace lua_cv::cv_helpers {
 
-namespace lua_cv {
-namespace cv_helpers {
-
-// Singleton processor instances
 static OpenCvProcessor& get_opencv_processor() {
     static OpenCvProcessor instance;
     return instance;
@@ -27,138 +25,146 @@ static CviVpssProcessor& get_vpss_processor() {
 
 void resize(Frame& frame, int width, int height) {
     if (frame.empty()) {
-        throw std::invalid_argument("cv_helpers::resize() - frame is empty");
+        throw std::invalid_argument("cv_helpers::resize - frame is empty");
     }
-
 #ifdef USE_CVI_MPI
-    // Smart backend selection: VPSS for zero-copy, OpenCV for CPU
-    if (frame.has_physical_addr()) {
+    if (frame.storage_type() == Frame::StorageType::CVI) {
         try {
             get_vpss_processor().resize(frame, width, height);
             return;
-        } catch (const std::exception& e) {
-            std::cerr << "[WARNING] VPSS resize failed: " << e.what()
-                      << ", falling back to OpenCV" << std::endl;
-            // Fall through to OpenCV fallback
+        } catch (const std::exception&) {
+            // Fall back to CPU below.
         }
     }
 #endif
-
-    // CPU fallback (always available)
     get_opencv_processor().resize(frame, width, height);
 }
 
 void cvt_color(Frame& frame, ColorConversion code) {
     if (frame.empty()) {
-        throw std::invalid_argument("cv_helpers::cvt_color() - frame is empty");
+        throw std::invalid_argument("cv_helpers::cvt_color - frame is empty");
     }
-
 #ifdef USE_CVI_MPI
-    // Try VPSS first for zero-copy frames
-    if (frame.has_physical_addr()) {
+    if (frame.storage_type() == Frame::StorageType::CVI) {
         try {
             get_vpss_processor().cvtColor(frame, code);
             return;
-        } catch (const std::exception& e) {
-            // VPSS may not support this conversion, fall back to OpenCV
-            std::cerr << "[WARNING] VPSS cvtColor failed: " << e.what()
-                      << ", falling back to OpenCV" << std::endl;
-            // Fall through to OpenCV fallback
+        } catch (const std::exception&) {
+            // Fall back to CPU below.
         }
     }
 #endif
-
-    // CPU fallback
     get_opencv_processor().cvtColor(frame, code);
 }
 
 void crop(Frame& frame, int x, int y, int w, int h) {
     if (frame.empty()) {
-        throw std::invalid_argument("cv_helpers::crop() - frame is empty");
+        throw std::invalid_argument("cv_helpers::crop - frame is empty");
     }
-
 #ifdef USE_CVI_MPI
-    // Try VPSS first for zero-copy frames
-    if (frame.has_physical_addr()) {
+    if (frame.storage_type() == Frame::StorageType::CVI) {
         try {
             get_vpss_processor().crop(frame, x, y, w, h);
             return;
-        } catch (const std::exception& e) {
-            std::cerr << "[WARNING] VPSS crop failed: " << e.what()
-                      << ", falling back to OpenCV" << std::endl;
-            // Fall through to OpenCV fallback
+        } catch (const std::exception&) {
+            // Fall back to CPU below.
         }
     }
 #endif
-
-    // CPU fallback
     get_opencv_processor().crop(frame, x, y, w, h);
 }
 
 const char* get_backend_name(const Frame& frame) {
 #ifdef USE_CVI_MPI
-    if (frame.has_physical_addr()) {
+    if (frame.storage_type() == Frame::StorageType::CVI) {
         return "vpss";
     }
+#else
+    (void)frame;
 #endif
     return "opencv";
 }
 
-tensor::Tensor frame_to_tensor(
-    const Frame& frame,
-    double scale,
-    const std::vector<double>& mean,
-    const std::vector<double>& std) {
+static void validate_norm_params(int channels,
+                                 const std::vector<double>& mean,
+                                 const std::vector<double>& stddev,
+                                 std::vector<double>& mean_out,
+                                 std::vector<double>& std_out) {
+    auto expand = [](int channels, const std::vector<double>& input, double default_val) {
+        if (input.empty()) {
+            return std::vector<double>(channels, default_val);
+        }
+        if (input.size() == 1) {
+            return std::vector<double>(channels, input[0]);
+        }
+        if (static_cast<int>(input.size()) == channels) {
+            return input;
+        }
+        throw std::invalid_argument("frame_to_tensor - mean/std size mismatch");
+    };
 
+    mean_out = expand(channels, mean, 0.0);
+    std_out = expand(channels, stddev, 1.0);
+    for (double val : std_out) {
+        if (val == 0.0) {
+            throw std::invalid_argument("frame_to_tensor - std contains zero");
+        }
+    }
+}
+
+tensor::Tensor frame_to_tensor(const Frame& frame,
+                               double scale,
+                               const std::vector<double>& mean,
+                               const std::vector<double>& stddev) {
     if (frame.empty()) {
-        throw std::invalid_argument("frame_to_tensor() - frame is empty");
+        throw std::invalid_argument("frame_to_tensor - frame is empty");
     }
 
-    // Convert Frame to cv::Mat (lazy conversion, may be zero-copy)
     const cv::Mat& mat = frame.to_mat();
-
-    // Convert to float
-    cv::Mat float_mat;
-    mat.convertTo(float_mat, CV_32F);
-
-    // HWC → CHW conversion with cv::split optimization
-    int H = float_mat.rows;
-    int W = float_mat.cols;
-    int C = float_mat.channels();
-
-    // Ensure mean/std have enough elements
-    std::vector<double> mean_vec = mean;
-    std::vector<double> std_vec = std;
-    if (mean_vec.size() < static_cast<size_t>(C)) {
-        mean_vec.resize(C, 0.0);
-    }
-    if (std_vec.size() < static_cast<size_t>(C)) {
-        std_vec.resize(C, 1.0);
+    if (mat.empty()) {
+        throw std::invalid_argument("frame_to_tensor - mat is empty");
     }
 
-    // Split channels
-    std::vector<cv::Mat> channels(C);
-    cv::split(float_mat, channels);
+    int channels = mat.channels();
+    if (channels != 1 && channels != 3) {
+        throw std::invalid_argument("frame_to_tensor - unsupported channel count");
+    }
 
-    // Per-channel normalization and CHW data assembly
-    std::vector<float> chw_data(C * H * W);
-    size_t idx = 0;
+    std::vector<double> mean_vec;
+    std::vector<double> std_vec;
+    validate_norm_params(channels, mean, stddev, mean_vec, std_vec);
 
-    for (int c = 0; c < C; ++c) {
-        const float* channel_ptr = channels[c].ptr<float>();
-        double m = mean_vec[c];
-        double s = std_vec[c];
-        for (int i = 0; i < H * W; ++i) {
-            chw_data[idx++] = (channel_ptr[i] * scale - m) / s;
+    int height = mat.rows;
+    int width = mat.cols;
+    std::vector<float> data(static_cast<size_t>(channels) * height * width);
+
+    if (channels == 3) {
+        for (int y = 0; y < height; ++y) {
+            const cv::Vec3b* row = mat.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < width; ++x) {
+                const cv::Vec3b& pix = row[x];
+                for (int c = 0; c < 3; ++c) {
+                    size_t idx = static_cast<size_t>(c) * height * width +
+                                 static_cast<size_t>(y) * width +
+                                 static_cast<size_t>(x);
+                    double v = static_cast<double>(pix[c]);
+                    data[idx] = static_cast<float>((v * scale - mean_vec[c]) / std_vec[c]);
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* row = mat.ptr<uint8_t>(y);
+            for (int x = 0; x < width; ++x) {
+                size_t idx = static_cast<size_t>(y) * width + static_cast<size_t>(x);
+                double v = static_cast<double>(row[x]);
+                data[idx] = static_cast<float>((v * scale - mean_vec[0]) / std_vec[0]);
+            }
         }
     }
 
-    // Create Tensor object (NCHW format)
-    std::vector<int64_t> shape = {1, static_cast<int64_t>(C),
-                                   static_cast<int64_t>(H),
-                                   static_cast<int64_t>(W)};
-    return tensor::Tensor(std::move(chw_data), shape);
+    std::vector<int64_t> shape = {1, channels, height, width};
+    return tensor::Tensor(std::move(data), shape);
 }
 
-} // namespace cv_helpers
-} // namespace lua_cv
+} // namespace lua_cv::cv_helpers

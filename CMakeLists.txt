@@ -339,6 +339,10 @@ if(NOT USE_ONNX_RUNTIME)
         src/modules/cv/opencv_processor.cpp
         src/modules/cv/cvi_frame.cpp
         src/modules/cv/cv_helpers.cpp
+        src/modules/cv/cv_types.cpp
+        src/modules/cv/device_buffer.cpp
+        src/modules/cv/image.cpp
+        src/modules/cv/mmf_context.cpp
         ${TENSOR_SOURCES}
     )
 

@@ -1,68 +1,100 @@
 #include "opencv_processor.h"
+
 #include <stdexcept>
-#include <chrono>
-#include <iostream>
 
 namespace lua_cv {
 
 void OpenCvProcessor::resize(Frame& frame, int width, int height) {
     if (frame.empty()) {
-        throw std::invalid_argument("OpenCvProcessor::resize() - frame is empty");
+        throw std::invalid_argument("OpenCvProcessor::resize - frame is empty");
     }
-
     if (width <= 0 || height <= 0) {
-        throw std::invalid_argument("OpenCvProcessor::resize() - invalid dimensions");
+        throw std::invalid_argument("OpenCvProcessor::resize - invalid dimensions");
     }
 
-    // Convert to cv::Mat (no-op if already cv::Mat)
-    const cv::Mat& input = frame.to_mat();
+    const cv::Mat& src = frame.to_mat();
+    cv::Mat dst;
+    cv::resize(src, dst, cv::Size(width, height));
 
-    // Resize using OpenCV
-    cv::Mat resized;
-    cv::resize(input, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
-
-    // Replace frame with resized result
-    frame = Frame(resized);
+    PixelFormat out_format = frame.pixel_format();
+    if (out_format == PixelFormat::UNKNOWN || frame.storage_type() != Frame::StorageType::OPENCV) {
+        out_format = (dst.channels() == 1) ? PixelFormat::GRAY : PixelFormat::BGR;
+    }
+    frame = Frame(std::move(dst), out_format);
 }
 
 void OpenCvProcessor::cvtColor(Frame& frame, ColorConversion code) {
     if (frame.empty()) {
-        throw std::invalid_argument("OpenCvProcessor::cvtColor() - frame is empty");
+        throw std::invalid_argument("OpenCvProcessor::cvtColor - frame is empty");
     }
 
-    // Convert to cv::Mat
-    const cv::Mat& input = frame.to_mat();
+    const cv::Mat& src = frame.to_mat();
+    cv::Mat dst;
+    int cv_code = -1;
 
-    // Map ColorConversion to OpenCV code
-    int cv_code = static_cast<int>(code);
+    switch (code) {
+        case ColorConversion::BGR2RGB:
+            cv_code = cv::COLOR_BGR2RGB;
+            break;
+        case ColorConversion::RGB2BGR:
+            cv_code = cv::COLOR_RGB2BGR;
+            break;
+        case ColorConversion::BGR2GRAY:
+            cv_code = cv::COLOR_BGR2GRAY;
+            break;
+        case ColorConversion::RGB2GRAY:
+            cv_code = cv::COLOR_RGB2GRAY;
+            break;
+        case ColorConversion::GRAY2BGR:
+            cv_code = cv::COLOR_GRAY2BGR;
+            break;
+        case ColorConversion::GRAY2RGB:
+            cv_code = cv::COLOR_GRAY2RGB;
+            break;
+        default:
+            throw std::invalid_argument("OpenCvProcessor::cvtColor - unsupported conversion");
+    }
 
-    // Perform conversion
-    cv::Mat converted;
-    cv::cvtColor(input, converted, cv_code);
+    cv::cvtColor(src, dst, cv_code);
 
-    // Replace frame
-    frame = Frame(converted);
+    PixelFormat out_format = frame.pixel_format();
+    switch (code) {
+        case ColorConversion::BGR2RGB:
+        case ColorConversion::GRAY2RGB:
+            out_format = PixelFormat::RGB;
+            break;
+        case ColorConversion::RGB2BGR:
+        case ColorConversion::GRAY2BGR:
+            out_format = PixelFormat::BGR;
+            break;
+        case ColorConversion::BGR2GRAY:
+        case ColorConversion::RGB2GRAY:
+            out_format = PixelFormat::GRAY;
+            break;
+        default:
+            break;
+    }
+    frame = Frame(std::move(dst), out_format);
 }
 
 void OpenCvProcessor::crop(Frame& frame, int x, int y, int w, int h) {
     if (frame.empty()) {
-        throw std::invalid_argument("OpenCvProcessor::crop() - frame is empty");
+        throw std::invalid_argument("OpenCvProcessor::crop - frame is empty");
     }
-
-    // Convert to cv::Mat
-    const cv::Mat& input = frame.to_mat();
-
-    // Validate crop region
     if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
-        x + w > input.cols || y + h > input.rows) {
-        throw std::invalid_argument("OpenCvProcessor::crop() - invalid crop region");
+        x + w > frame.width() || y + h > frame.height()) {
+        throw std::invalid_argument("OpenCvProcessor::crop - invalid crop region");
     }
 
-    // Crop using ROI (zero-copy, creates view)
-    cv::Mat cropped = input(cv::Rect(x, y, w, h));
+    const cv::Mat& src = frame.to_mat();
+    cv::Rect roi(x, y, w, h);
+    cv::Mat cropped = src(roi).clone();
 
-    // Clone to ensure we own the data (ROI is just a view)
-    frame = Frame(cropped.clone());
+    PixelFormat out_format = frame.pixel_format();
+    if (out_format == PixelFormat::UNKNOWN || frame.storage_type() != Frame::StorageType::OPENCV) {
+        out_format = (cropped.channels() == 1) ? PixelFormat::GRAY : PixelFormat::BGR;
+    }
+    frame = Frame(std::move(cropped), out_format);
 }
 
 } // namespace lua_cv

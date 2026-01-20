@@ -14,11 +14,31 @@ void run_benchmark_tests(TestSuite& suite) {
     std::cout << "\n[Benchmark] Performance Comparison" << std::endl;
 
     const int iterations = 10;
+    uint32_t bench_width = 1920;
+    uint32_t bench_height = 1080;
 
-    // Benchmark 1: CPU resize (1920x1080 -> 640x640)
+#ifdef USE_CVI_MPI
+    if (find_suitable_vb_pool(bench_width, bench_height, PIXEL_FORMAT_BGR_888) == VB_INVALID_POOLID) {
+        bench_width = 1280;
+        bench_height = 720;
+    }
+#endif
+
+    const std::string resize_label = "CPU Resize " + std::to_string(bench_width) + "x" +
+                                     std::to_string(bench_height) + "->640x640";
+    const std::string vpss_resize_label = "VPSS Resize " + std::to_string(bench_width) + "x" +
+                                          std::to_string(bench_height) + "->640x640";
+    const std::string cpu_pipeline_label = "CPU Full Pipeline (" + std::to_string(bench_width) + "x" +
+                                           std::to_string(bench_height) + ")";
+    const std::string vpss_pipeline_label = "VPSS Full Pipeline (" + std::to_string(bench_width) + "x" +
+                                            std::to_string(bench_height) + ")";
+    const std::string helpers_pipeline_label = "cv_helpers Pipeline (" + std::to_string(bench_width) + "x" +
+                                               std::to_string(bench_height) + ")";
+
+    // Benchmark 1: CPU resize
     {
-        auto result = run_benchmark("CPU Resize 1920x1080->640x640", [&]() {
-            cv::Mat mat = create_test_image(1920, 1080);
+        auto result = run_benchmark(resize_label, [&]() {
+            cv::Mat mat = create_test_image(bench_width, bench_height);
             Frame frame(mat);
             OpenCvProcessor processor;
             processor.resize(frame, 640, 640);
@@ -29,10 +49,10 @@ void run_benchmark_tests(TestSuite& suite) {
     }
 
 #ifdef USE_CVI_MPI
-    // Benchmark 2: VPSS resize (1920x1080 -> 640x640)
+    // Benchmark 2: VPSS resize
     {
-        auto result = run_benchmark("VPSS Resize 1920x1080->640x640", [&]() {
-            cv::Mat mat = create_test_image(1920, 1080);
+        auto result = run_benchmark(vpss_resize_label, [&]() {
+            cv::Mat mat = create_test_image(bench_width, bench_height);
             Frame frame(mat);
             CviVpssProcessor processor;
             processor.resize(frame, 640, 640);
@@ -73,8 +93,8 @@ void run_benchmark_tests(TestSuite& suite) {
 
     // Benchmark 5: CPU full pipeline (resize + cvtColor + crop)
     {
-        auto result = run_benchmark("CPU Full Pipeline", [&]() {
-            cv::Mat mat = create_test_image(1920, 1080);
+        auto result = run_benchmark(cpu_pipeline_label, [&]() {
+            cv::Mat mat = create_test_image(bench_width, bench_height);
             Frame frame(mat);
             OpenCvProcessor processor;
             processor.resize(frame, 640, 640);
@@ -89,8 +109,8 @@ void run_benchmark_tests(TestSuite& suite) {
 #ifdef USE_CVI_MPI
     // Benchmark 6: VPSS full pipeline (resize + cvtColor + crop)
     {
-        auto result = run_benchmark("VPSS Full Pipeline", [&]() {
-            cv::Mat mat = create_test_image(1920, 1080);
+        auto result = run_benchmark(vpss_pipeline_label, [&]() {
+            cv::Mat mat = create_test_image(bench_width, bench_height);
             Frame frame(mat);
             CviVpssProcessor processor;
             processor.resize(frame, 640, 640);
@@ -105,8 +125,8 @@ void run_benchmark_tests(TestSuite& suite) {
 
     // Benchmark 7: cv_helpers smart backend (should auto-select)
     {
-        auto result = run_benchmark("cv_helpers Smart Backend Pipeline", [&]() {
-            cv::Mat mat = create_test_image(1920, 1080);
+        auto result = run_benchmark(helpers_pipeline_label, [&]() {
+            cv::Mat mat = create_test_image(bench_width, bench_height);
             Frame frame(mat);
             cv_helpers::resize(frame, 640, 640);
             cv_helpers::cvt_color(frame, ColorConversion::BGR2RGB);

@@ -161,106 +161,87 @@ cv::Mat create_test_image(int width, int height) {
 
 #ifdef USE_CVI_MPI
 #include <cvi_buffer.h>  // For COMMON_GetPicBufferSize
-
-// VB Pool ID definitions - used by VPSS to attach to correct pool
-// These must match the order in init_cvi_system()
-constexpr VB_POOL VB_POOL_1080P = 0;  // 1920x1080 RGB888
-constexpr VB_POOL VB_POOL_720P = 1;   // 1280x720 RGB888
-constexpr VB_POOL VB_POOL_AI = 2;     // 640x640 RGB888
-constexpr VB_POOL VB_POOL_VGA = 3;    // 640x480 RGB888
-constexpr VB_POOL VB_POOL_QVGA = 4;   // 320x240 RGB888
+#include "cv/mmf_context.h"
+#ifdef USE_CVI_CAMERA
+#include "cv/cvi_sensor.h"
+#endif
 
 // Helper to find suitable pool for a given frame size
 VB_POOL find_suitable_vb_pool(uint32_t width, uint32_t height, PIXEL_FORMAT_E fmt) {
     uint32_t needed_size = COMMON_GetPicBufferSize(width, height, fmt,
                             DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
 
-    // Pool sizes (must match init_cvi_system configuration)
-    static const struct { VB_POOL id; uint32_t size; } pools[] = {
-        {VB_POOL_1080P, COMMON_GetPicBufferSize(1920, 1080, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0)},
-        {VB_POOL_720P,  COMMON_GetPicBufferSize(1280, 720,  PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0)},
-        {VB_POOL_AI,    COMMON_GetPicBufferSize(640,  640,  PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0)},
-        {VB_POOL_VGA,   COMMON_GetPicBufferSize(640,  480,  PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0)},
-        {VB_POOL_QVGA,  COMMON_GetPicBufferSize(320,  240,  PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0)},
-    };
+    if (CVI_VB_IsInited() != CVI_TRUE) {
+        return VB_INVALID_POOLID;
+    }
 
-    // Find smallest pool that can fit the frame (pools are sorted by size descending)
-    for (int i = 4; i >= 0; --i) {
-        if (pools[i].size >= needed_size) {
-            return pools[i].id;
+    VB_CONFIG_S vb_config;
+    std::memset(&vb_config, 0, sizeof(vb_config));
+    CVI_S32 rc = CVI_VB_GetConfig(&vb_config);
+    if (rc != CVI_SUCCESS || vb_config.u32MaxPoolCnt == 0) {
+        return VB_INVALID_POOLID;
+    }
+
+    VB_POOL best_pool = VB_INVALID_POOLID;
+    uint32_t best_size = 0;
+
+    for (uint32_t i = 0; i < vb_config.u32MaxPoolCnt; ++i) {
+        uint32_t blk_size = vb_config.astCommPool[i].u32BlkSize;
+        uint32_t blk_cnt = vb_config.astCommPool[i].u32BlkCnt;
+        if (blk_size == 0 || blk_cnt == 0) {
+            continue;
+        }
+        if (blk_size >= needed_size &&
+            (best_pool == VB_INVALID_POOLID || blk_size < best_size)) {
+            best_pool = static_cast<VB_POOL>(i);
+            best_size = blk_size;
         }
     }
 
-    // Default to largest pool
-    return VB_POOL_1080P;
+    return best_pool;
 }
 
 bool init_cvi_system() {
     std::cout << "[INIT] Initializing CVI VB and SYS modules..." << std::endl;
 
-    // Step 1: Clean up any previous state (from crashed test or other process)
-    CVI_SYS_Exit();
-    CVI_VB_Exit();
+    uint32_t sensor_width = 1920;
+    uint32_t sensor_height = 1080;
+#ifdef USE_CVI_CAMERA
+    CviSensor sensor;
+    if (sensor.init()) {
+        sensor_width = static_cast<uint32_t>(sensor.get_width());
+        sensor_height = static_cast<uint32_t>(sensor.get_height());
+        sensor.cleanup();
+    }
+#endif
 
-    // Step 2: Configure VB pools using COMMON_GetPicBufferSize for correct size calculation
-    // All pools are public pools - VPSS will attach to these, not create new dynamic pools
-    VB_CONFIG_S vb_config;
-    memset(&vb_config, 0, sizeof(vb_config));
-    vb_config.u32MaxPoolCnt = 5;
+    lua_cv::VbPoolPlan vb_plan;
+    vb_plan.add_pool(sensor_width, sensor_height, lua_cv::PixelFormat::NV21, 3, VB_REMAP_MODE_CACHED);
+    if (sensor_width != 1280 || sensor_height != 720) {
+        vb_plan.add_pool(1280, 720, lua_cv::PixelFormat::NV21, 3, VB_REMAP_MODE_CACHED);
+    }
+    vb_plan.add_pool(1280, 720, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
+    vb_plan.add_pool(640, 640, lua_cv::PixelFormat::BGR, 3, VB_REMAP_MODE_CACHED);
+    vb_plan.add_pool(640, 480, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
+    vb_plan.add_pool(320, 240, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
 
-    // Pool 0: 1920x1080 RGB888 (largest, for 1080p input/output)
-    vb_config.astCommPool[0].u32BlkSize = COMMON_GetPicBufferSize(
-        1920, 1080, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
-    vb_config.astCommPool[0].u32BlkCnt = 5;
-    vb_config.astCommPool[0].enRemapMode = VB_REMAP_MODE_CACHED;
+    lua_cv::MmfContext::Config config;
+    config.vb_plan = vb_plan;
+    config.force_reset = true;
 
-    // Pool 1: 1280x720 RGB888 (720p input)
-    vb_config.astCommPool[1].u32BlkSize = COMMON_GetPicBufferSize(
-        1280, 720, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
-    vb_config.astCommPool[1].u32BlkCnt = 3;
-    vb_config.astCommPool[1].enRemapMode = VB_REMAP_MODE_CACHED;
-
-    // Pool 2: 640x640 RGB888 (AI input size)
-    vb_config.astCommPool[2].u32BlkSize = COMMON_GetPicBufferSize(
-        640, 640, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
-    vb_config.astCommPool[2].u32BlkCnt = 5;
-    vb_config.astCommPool[2].enRemapMode = VB_REMAP_MODE_CACHED;
-
-    // Pool 3: 640x480 RGB888 (VGA output)
-    vb_config.astCommPool[3].u32BlkSize = COMMON_GetPicBufferSize(
-        640, 480, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
-    vb_config.astCommPool[3].u32BlkCnt = 3;
-    vb_config.astCommPool[3].enRemapMode = VB_REMAP_MODE_CACHED;
-
-    // Pool 4: 320x240 RGB888 (QVGA output)
-    vb_config.astCommPool[4].u32BlkSize = COMMON_GetPicBufferSize(
-        320, 240, PIXEL_FORMAT_BGR_888, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
-    vb_config.astCommPool[4].u32BlkCnt = 3;
-    vb_config.astCommPool[4].enRemapMode = VB_REMAP_MODE_CACHED;
-
-    CVI_S32 rc = CVI_VB_SetConfig(&vb_config);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VB_SetConfig failed: " << rc << std::endl;
-        return false;
+    for (int i = 0; i < VI_MAX_PIPE_NUM; ++i) {
+        config.mode_plan.vi_vpss_mode.aenMode[i] = VI_OFFLINE_VPSS_ONLINE;
     }
 
-    rc = CVI_VB_Init();
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VB_Init failed (rc=" << rc << ")" << std::endl;
-        return false;
+    config.mode_plan.vpss_mode.enMode = VPSS_MODE_DUAL;
+    for (int i = 0; i < VPSS_IP_NUM; ++i) {
+        config.mode_plan.vpss_mode.aenInput[i] = (i == 0) ? VPSS_INPUT_MEM : VPSS_INPUT_ISP;
+        config.mode_plan.vpss_mode.ViPipe[i] = 0;
     }
 
-    rc = CVI_SYS_Init();
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_SYS_Init failed: " << rc << std::endl;
-        CVI_VB_Exit();
+    if (!lua_cv::MmfContext::instance().init(config)) {
+        std::cerr << "[ERROR] MmfContext init failed" << std::endl;
         return false;
-    }
-
-    std::cout << "[INIT] VB pools configured:" << std::endl;
-    for (uint32_t i = 0; i < vb_config.u32MaxPoolCnt; ++i) {
-        std::cout << "  Pool " << i << ": " << vb_config.astCommPool[i].u32BlkSize
-                  << " bytes x " << vb_config.astCommPool[i].u32BlkCnt << " blocks" << std::endl;
     }
 
     std::cout << "[INIT] VB and SYS modules initialized successfully\n" << std::endl;
@@ -269,7 +250,6 @@ bool init_cvi_system() {
 
 void cleanup_cvi_system() {
     std::cout << "\n[CLEANUP] Shutting down CVI VB and SYS modules..." << std::endl;
-    CVI_SYS_Exit();
-    CVI_VB_Exit();
+    lua_cv::MmfContext::instance().shutdown();
 }
 #endif

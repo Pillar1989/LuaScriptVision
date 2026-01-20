@@ -43,7 +43,7 @@ void run_vpss_tests(TestSuite& suite) {
         cv::Mat mat = create_test_image(1280, 720);  // Use 720p instead of 1080p
 
         VB_BLK vb_block;
-        VB_POOL vb_pool = 2;  // Pool 2: For 1280x720 RGB888 frames
+        VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
         VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
         Frame frame(video_frame, false);  // owns_memory=false
 
@@ -64,7 +64,7 @@ void run_vpss_tests(TestSuite& suite) {
             cv::Mat mat = create_test_image(320, 240);
 
             VB_BLK vb_block;
-            VB_POOL vb_pool = 1;  // Pool 1: For 640x640 RGB888 frames
+            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
             VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
             Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
 
@@ -91,7 +91,7 @@ void run_vpss_tests(TestSuite& suite) {
             cv::Mat mat = create_test_image(640, 480);
 
             VB_BLK vb_block;
-            VB_POOL vb_pool = 1;  // Pool 1: For 640x640 RGB888 frames
+            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
             VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
             Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
 
@@ -117,7 +117,7 @@ void run_vpss_tests(TestSuite& suite) {
             cv::Mat mat = create_test_image(640, 480);
 
             VB_BLK vb_block;
-            VB_POOL vb_pool = 1;  // Pool 1: For 640x640 RGB888 frames
+            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
             VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
             Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
 
@@ -158,14 +158,28 @@ void run_vpss_tests(TestSuite& suite) {
 
     // Test 4.7: Multiple operations chaining
     {
-        cv::Mat mat = create_test_image(1920, 1080);
+        uint32_t test_width = 1920;
+        uint32_t test_height = 1080;
+        VB_POOL vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
+        if (vb_pool == VB_INVALID_POOLID) {
+            test_width = 1280;
+            test_height = 720;
+            vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
+        }
+
+        if (vb_pool == VB_INVALID_POOLID) {
+            suite.add_result("VPSS chained operations", false, 0,
+                           "No suitable VB pool for chained test");
+            return;
+        }
+
+        cv::Mat mat = create_test_image(test_width, test_height);
 
         const int iterations = 3;
         std::vector<double> times;
 
         for (int i = 0; i < iterations; ++i) {
             VB_BLK vb_block;
-            VB_POOL vb_pool = 0;  // Pool 0: For 1920x1080 RGB888 frames
             VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
             Frame frame(video_frame, 0, 0);
 

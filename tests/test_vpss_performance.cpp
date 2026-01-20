@@ -16,16 +16,31 @@ void run_vpss_performance_tests(TestSuite& suite) {
     CviVpssProcessor processor;
     Timer timer;
 
-    // Test case: 1920x1080 -> 640x640 resize
-    cv::Mat mat = create_test_image(1920, 1080);
+    uint32_t input_width = 1920;
+    uint32_t input_height = 1080;
+    VB_POOL vb_pool = find_suitable_vb_pool(input_width, input_height, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        input_width = 1280;
+        input_height = 720;
+        vb_pool = find_suitable_vb_pool(input_width, input_height, PIXEL_FORMAT_BGR_888);
+    }
+
+    if (vb_pool == VB_INVALID_POOLID) {
+        suite.add_result("Perf: VPSS setup", false, 0, "No suitable VB pool for VPSS tests");
+        return;
+    }
+
+    // Test case: input -> 640x640 resize
+    cv::Mat mat = create_test_image(input_width, input_height);
 
     // ========== Test 1: OpenCV CPU baseline (resize only) ==========
+    double cpu_resize_time = 0.0;
     {
         Frame frame(mat);  // 一次clone
         timer.start();
         OpenCvProcessor cpu_processor;
         cpu_processor.resize(frame, 640, 640);
-        double cpu_resize_time = timer.elapsed_ms();
+        cpu_resize_time = timer.elapsed_ms();
         suite.add_result("Perf: OpenCV CPU resize only", true, cpu_resize_time);
     }
 
@@ -34,10 +49,11 @@ void run_vpss_performance_tests(TestSuite& suite) {
     {
         timer.start();
         VB_BLK vb_block;
-        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block);
+        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
         conversion_time = timer.elapsed_ms();
         CVI_VB_ReleaseBlock(vb_block);
-        suite.add_result("Perf: mat_to_video_frame (6.2MB)", true, conversion_time);
+        suite.add_result("Perf: mat_to_video_frame", true, conversion_time,
+                        std::to_string(input_width) + "x" + std::to_string(input_height));
     }
 
     // ========== Test 3: 纯VPSS处理（预先转换，只测VPSS） ==========
@@ -45,7 +61,7 @@ void run_vpss_performance_tests(TestSuite& suite) {
     {
         // 预先转换到VIDEO_FRAME
         VB_BLK vb_block;
-        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block);
+        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
         Frame frame(video_frame, 0, 0);  // VPSS context
 
         // Warm up VPSS pipeline
@@ -53,7 +69,7 @@ void run_vpss_performance_tests(TestSuite& suite) {
 
         // 再次转换，测量纯VPSS处理
         VB_BLK vb_block2;
-        VIDEO_FRAME_INFO_S video_frame2 = processor.mat_to_video_frame(mat, vb_block2);
+        VIDEO_FRAME_INFO_S video_frame2 = processor.mat_to_video_frame(mat, vb_block2, vb_pool);
         Frame frame2(video_frame2, 0, 0);
 
         timer.start();
@@ -72,7 +88,7 @@ void run_vpss_performance_tests(TestSuite& suite) {
     {
         VB_BLK vb_block;
         timer.start();
-        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block);
+        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
         Frame frame(video_frame, 0, 0);
         processor.resize(frame, 640, 640);
         vpss_total_time = timer.elapsed_ms();
@@ -88,7 +104,7 @@ void run_vpss_performance_tests(TestSuite& suite) {
 
         for (int i = 0; i < iterations; ++i) {
             VB_BLK vb_block;
-            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block);
+            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
             Frame frame(video_frame, 0, 0);
 
             timer.start();
@@ -106,13 +122,14 @@ void run_vpss_performance_tests(TestSuite& suite) {
     }
 
     // ========== 性能分析总结 ==========
-    std::cout << "\n  Performance Analysis Summary (1920x1080 -> 640x640):" << std::endl;
+    std::cout << "\n  Performance Analysis Summary (" << input_width << "x" << input_height
+              << " -> 640x640):" << std::endl;
     std::cout << "    mat_to_video_frame:  " << std::fixed << std::setprecision(1)
               << conversion_time << " ms (cached memcpy + flush)" << std::endl;
     std::cout << "    Pure VPSS hardware:  " << vpss_only_time << " ms" << std::endl;
     std::cout << "    VPSS total:          " << vpss_total_time << " ms" << std::endl;
     std::cout << "\n    Speedup vs OpenCV: " << std::setprecision(1)
-              << (127.0 / vpss_total_time) << "x faster" << std::endl;
+              << (cpu_resize_time / vpss_total_time) << "x faster" << std::endl;
     std::cout << std::endl;
 }
 

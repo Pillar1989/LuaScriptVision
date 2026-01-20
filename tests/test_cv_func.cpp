@@ -38,6 +38,7 @@ void run_real_image_tests(TestSuite& suite, const std::string& image_path);
 void run_benchmark_tests(TestSuite& suite);
 void run_vpss_performance_tests(TestSuite& suite);
 void run_ion_loader_tests(TestSuite& suite, const std::string& image_path);
+void run_camera_capture_tests(TestSuite& suite);
 
 // Test registry
 struct TestInfo {
@@ -55,6 +56,7 @@ static const TestInfo available_tests[] = {
     {"bench",     "Performance benchmarks",              false},
     {"perf",      "VPSS detailed performance analysis",  false},
     {"ion",       "IonImageLoader performance",          true},
+    {"camera",    "Camera capture (VI→ISP→VPSS)",        false},
     {"all",       "Run all tests",                       false},
 };
 
@@ -144,13 +146,16 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
 
+    bool cvi_initialized = false;
+
 #ifdef USE_CVI_MPI
-    // Initialize CVI system for VPSS tests
     std::cout << "========================================" << std::endl;
     if (!init_cvi_system()) {
         std::cerr << "[ERROR] Failed to initialize CVI system" << std::endl;
         std::cerr << "VPSS hardware tests will fail" << std::endl;
         std::cout << std::endl;
+    } else {
+        cvi_initialized = true;
     }
     std::cout << "========================================" << std::endl;
 #else
@@ -209,12 +214,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (should_run("camera")) {
+        run_camera_capture_tests(suite);
+    }
+
     // Print summary
     suite.print_summary();
 
 #ifdef USE_CVI_MPI
-    // Cleanup CVI system
-    cleanup_cvi_system();
+    // Cleanup CVI system (only if we initialized it)
+    if (cvi_initialized) {
+        cleanup_cvi_system();
+    }
 #endif
 
     return suite.all_passed() ? 0 : 1;

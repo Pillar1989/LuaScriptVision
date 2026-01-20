@@ -103,4 +103,5 @@ cv::Mat create_test_image(int width, int height);
 #ifdef USE_CVI_MPI
 bool init_cvi_system();
 void cleanup_cvi_system();
+VB_POOL find_suitable_vb_pool(uint32_t width, uint32_t height, PIXEL_FORMAT_E fmt);
 #endif

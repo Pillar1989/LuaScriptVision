@@ -210,6 +210,9 @@ if(NOT USE_ONNX_RUNTIME)
 
     # Camera/ISP libraries (only when Camera enabled)
     if(ENABLE_CVI_CAMERA)
+        # Add ISP include directory for camera headers
+        target_include_directories(lua_runner PRIVATE ${CVI_ISP_INCLUDE_DIR})
+
         set(CVI_CAMERA_LIBS
             ${CVI_MPI_LIB_DIR}/libvi.a
             ${CVI_MPI_LIB_DIR}/libisp.a
@@ -222,20 +225,40 @@ if(NOT USE_ONNX_RUNTIME)
             ${CVI_MPI_LIB_DIR}/libsns_full.a
         )
         target_compile_definitions(lua_runner PRIVATE USE_CVI_CAMERA)
+
+        # Use link group for proper static library resolution (ISP depends on sys)
+        target_link_libraries(lua_runner PRIVATE
+            -static
+            ${TPU_LIB_DIR}/libcviruntime-static.a
+            ${TPU_LIB_DIR}/libcvikernel-static.a
+            ${TPU_LIB_DIR}/libcvimath-static.a
+            ${TPU_LIB_DIR}/libflatbuffers.a
+            -Wl,--start-group
+            ${CVI_CAMERA_LIBS}
+            ${CVI_MPI_LIB_DIR}/libsys.a
+            ${CVI_MPI_LIB_DIR}/libvpss.a
+            ${CVI_MPI_LIB_DIR}/libvdec.a
+            ${CVI_MPI_LIB_DIR}/libvo.a
+            -Wl,--end-group
+            z
+            m
+            pthread
+            dl
+            atomic
+        )
     else()
         set(CVI_CAMERA_LIBS "")
-    endif()
 
-    target_link_libraries(lua_runner PRIVATE
-        -static
-        ${CVI_BASE_LIBS}
-        ${CVI_CAMERA_LIBS}
-        z
-        m
-        pthread
-        dl
-        atomic
-    )
+        target_link_libraries(lua_runner PRIVATE
+            -static
+            ${CVI_BASE_LIBS}
+            z
+            m
+            pthread
+            dl
+            atomic
+        )
+    endif()
     message(STATUS "lua_runner: Sophgo TPU support linked")
 endif()
 
@@ -333,6 +356,7 @@ if(NOT USE_ONNX_RUNTIME)
         tests/test_real_image.cpp
         tests/test_vpss_performance.cpp
         tests/test_ion_loader.cpp
+        tests/test_camera_capture.cpp
         src/modules/cv/cvi_vpss_processor.cpp
         src/modules/cv/ion_image_loader.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
@@ -371,10 +395,12 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--start-group
         ${CVI_MPI_LIB_DIR}/libsys.a
         ${CVI_MPI_LIB_DIR}/libvpss.a
         ${CVI_MPI_LIB_DIR}/libvdec.a
         ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
         ${OpenCV_LIBS}
         z
         m
@@ -384,6 +410,38 @@ if(NOT USE_ONNX_RUNTIME)
     )
 
     message(STATUS "test_cv_func: CV module comprehensive test enabled (static build)")
+
+    # Add camera sources and ISP libraries when ENABLE_CVI_CAMERA is ON
+    if(ENABLE_CVI_CAMERA)
+        target_sources(test_cv_func PRIVATE
+            src/modules/cv/cvi_camera.cpp
+            src/modules/cv/cvi_sensor.cpp
+        )
+
+        target_include_directories(test_cv_func PRIVATE
+            ${CVI_ISP_INCLUDE_DIR}
+        )
+
+        # Re-link with ISP libraries inside link group for proper static resolution
+        target_link_libraries(test_cv_func PRIVATE
+            -Wl,--start-group
+            ${CVI_MPI_LIB_DIR}/libvi.a
+            ${CVI_MPI_LIB_DIR}/libisp.a
+            ${CVI_MPI_LIB_DIR}/libisp_algo.a
+            ${CVI_MPI_LIB_DIR}/libae.a
+            ${CVI_MPI_LIB_DIR}/libawb.a
+            ${CVI_MPI_LIB_DIR}/libaf.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin_isp.a
+            ${CVI_MPI_LIB_DIR}/libsns_full.a
+            ${CVI_MPI_LIB_DIR}/libsys.a
+            -Wl,--end-group
+        )
+
+        target_compile_definitions(test_cv_func PRIVATE USE_CVI_CAMERA)
+
+        message(STATUS "test_cv_func: Camera capture tests enabled (ISP libraries linked)")
+    endif()
 
     # Test 3: VDEC Standalone Test (isolated JPEG decoder test)
     # Static linking for embedded deployment
@@ -432,59 +490,6 @@ if(NOT USE_ONNX_RUNTIME)
 
     message(STATUS "test_vdec_standalone: VDEC standalone test enabled (static build)")
 
-    # Test 4: Camera → VI → ISP → VPSS Test (requires ENABLE_CVI_CAMERA=ON)
-    if(ENABLE_CVI_CAMERA)
-        add_executable(test_camera
-            tests/test_camera.cpp
-            src/modules/cv/cvi_camera.cpp
-            src/modules/cv/cvi_sensor.cpp
-            src/modules/cv/cvi_vpss_processor.cpp
-            src/modules/cv/opencv_processor.cpp
-            src/modules/cv/cvi_frame.cpp
-            src/modules/cv/cv_helpers.cpp
-            ${TENSOR_SOURCES}
-        )
-
-        target_include_directories(test_camera PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
-            "${CMAKE_CURRENT_SOURCE_DIR}/lua-intf-ex/src/include"
-            "${CMAKE_CURRENT_SOURCE_DIR}/lua"
-            ${OpenCV_INCLUDE_DIRS}
-            ${TPU_INCLUDE_DIR}
-            ${CVI_MPI_INCLUDE_DIR}
-            ${CVI_ISP_INCLUDE_DIR}
-        )
-
-        target_link_directories(test_camera PRIVATE
-            ${TPU_LIB_DIR}
-            ${CVI_MPI_LIB_DIR}
-        )
-
-        target_link_libraries(test_camera PRIVATE
-            -static
-            lua
-            ${CVI_BASE_LIBS}
-            ${CVI_CAMERA_LIBS}
-            ${OpenCV_LIBS}
-            z
-            m
-            pthread
-            dl
-            atomic
-        )
-
-        target_compile_definitions(test_camera PRIVATE USE_CVI_MPI USE_CVI_CAMERA)
-
-        message(STATUS "test_camera: Camera → VI → ISP → VPSS test enabled (static build)")
-    endif()
-
-    # Test 6: CVI Camera test (disabled due to complex ISP dependencies)
-    # TODO: Fix ISP library linking before enabling
-    # add_executable(test_cvi_camera ...)
-
     # Dynamic linking version (commented out - for reference only)
     # # Use dynamic linking like sample_vdec Makefile, with RPATH for device
     # target_link_libraries(test_vdec_standalone PRIVATE
@@ -519,4 +524,3 @@ if(NOT USE_ONNX_RUNTIME)
     #     INSTALL_RPATH "/mnt/system/usr/lib:/mnt/system/usr/lib/3rd"
     # )
 endif()
-

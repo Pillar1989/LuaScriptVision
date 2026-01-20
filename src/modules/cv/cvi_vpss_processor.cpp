@@ -1,537 +1,548 @@
 #include "cvi_vpss_processor.h"
 
-#ifdef USE_CVI_MPI
-
 #include <stdexcept>
-#include <chrono>
+#include <cstring>
 #include <iostream>
+#include <sstream>
+#include <vector>
+#include <algorithm>
+#include <unistd.h>
+
+#ifdef USE_CVI_MPI
 #include <cvi_sys.h>
-#include <cvi_vb.h>
+#include <linux/cvi_comm_vpss.h>
+#include <linux/cvi_errno.h>
+#endif
 
 namespace lua_cv {
 
-CviVpssProcessor::CviVpssProcessor()
-    : vpss_grp_(1)  // Use GRP=1 (GRP=0 reserved for camera pipeline)
-    , vpss_chn_(0)
-    , vb_pool_(VB_INVALID_POOLID)
-    , initialized_(false)
-    , cached_input_w_(0)
-    , cached_input_h_(0)
-    , cached_output_w_(0)
-    , cached_output_h_(0)
-    , cached_input_fmt_(PIXEL_FORMAT_MAX)
-    , cached_output_fmt_(PIXEL_FORMAT_MAX) {
+CviVpssProcessor::CviVpssProcessor() {
 }
 
 CviVpssProcessor::~CviVpssProcessor() {
-    cleanup_vpss_pipeline();
+#ifdef USE_CVI_MPI
+    destroy_group();
+#endif
 }
 
 void CviVpssProcessor::resize(Frame& frame, int width, int height) {
+#ifdef USE_CVI_MPI
     if (frame.empty()) {
-        throw std::invalid_argument("CviVpssProcessor::resize() - frame is empty");
+        throw std::invalid_argument("CviVpssProcessor::resize - frame is empty");
     }
-
     if (width <= 0 || height <= 0) {
-        throw std::invalid_argument("CviVpssProcessor::resize() - invalid dimensions");
+        throw std::invalid_argument("CviVpssProcessor::resize - invalid dimensions");
     }
 
-    VIDEO_FRAME_INFO_S input;
-    VB_BLK temp_vb_block = VB_INVALID_HANDLE;
-    bool needs_vb_release = false;
-
-    // Handle both zero-copy (VIDEO_FRAME) and file input (cv::Mat) paths
-    if (frame.has_physical_addr()) {
-        // Path A: Zero-copy (from Camera or previous VPSS)
-        input = frame.to_video_frame();
-    } else {
-        // Path B: File input - convert Mat to VIDEO_FRAME_INFO_S
-        input = mat_to_video_frame(frame.to_mat(), temp_vb_block);
-        needs_vb_release = true;
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
     }
 
-    PIXEL_FORMAT_E input_format = input.stVFrame.enPixelFormat;
-    uint32_t input_width = input.stVFrame.u32Width;
-    uint32_t input_height = input.stVFrame.u32Height;
-
-    // Initialize/reconfigure VPSS pipeline if needed
-    CVI_S32 rc = init_vpss_pipeline(
-        input_width, input_height, input_format,
-        width, height, input_format);  // Keep same format
-
-    if (rc != CVI_SUCCESS) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        throw std::runtime_error("CviVpssProcessor::resize() - Failed to initialize VPSS pipeline");
-    }
-
-    // Process frame through VPSS
-    VIDEO_FRAME_INFO_S output;
-    rc = vpss_process_frame(input, output);
-
-    // Release temporary VB block (VPSS processing complete)
-    if (needs_vb_release) {
-        CVI_VB_ReleaseBlock(temp_vb_block);
-    }
-
-    if (rc != CVI_SUCCESS) {
-        throw std::runtime_error("CviVpssProcessor::resize() - VPSS processing failed");
-    }
-
-    // Replace frame with VPSS output
-    // Use new constructor with VPSS context for proper memory management
-    frame = Frame(output, vpss_grp_, vpss_chn_);
+    process_frame(frame, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                  input_format, false, 0, 0, 0, 0);
+#else
+    (void)frame;
+    (void)width;
+    (void)height;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
 }
 
 void CviVpssProcessor::cvtColor(Frame& frame, ColorConversion code) {
+#ifdef USE_CVI_MPI
     if (frame.empty()) {
-        throw std::invalid_argument("CviVpssProcessor::cvtColor() - frame is empty");
+        throw std::invalid_argument("CviVpssProcessor::cvtColor - frame is empty");
     }
 
-    VIDEO_FRAME_INFO_S input;
-    VB_BLK temp_vb_block = VB_INVALID_HANDLE;
-    bool needs_vb_release = false;
-
-    // Handle both zero-copy and file input paths
-    if (frame.has_physical_addr()) {
-        input = frame.to_video_frame();
-    } else {
-        input = mat_to_video_frame(frame.to_mat(), temp_vb_block);
-        needs_vb_release = true;
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
     }
 
-    PIXEL_FORMAT_E input_fmt = input.stVFrame.enPixelFormat;
-    uint32_t width = input.stVFrame.u32Width;
-    uint32_t height = input.stVFrame.u32Height;
-
-    // Map ColorConversion to PIXEL_FORMAT_E
-    PIXEL_FORMAT_E output_fmt;
+    PixelFormat output_format = input_format;
     switch (code) {
-        case ColorConversion::BGR2RGB:  // BGR2RGB and RGB2BGR have same value (4)
-            // RGB/BGR swap - VPSS doesn't directly support, use same format
-            // (actual conversion happens at pixel level, VPSS may not distinguish)
-            output_fmt = (input_fmt == PIXEL_FORMAT_RGB_888 || input_fmt == PIXEL_FORMAT_BGR_888)
-                         ? PIXEL_FORMAT_RGB_888 : input_fmt;
+        case ColorConversion::BGR2RGB:
+        case ColorConversion::GRAY2RGB:
+            output_format = PixelFormat::RGB;
             break;
-
-        case ColorConversion::BGR2NV12:
-        case ColorConversion::RGB2NV12:
-            output_fmt = PIXEL_FORMAT_YUV_PLANAR_420;  // NV12
+        case ColorConversion::RGB2BGR:
+        case ColorConversion::GRAY2BGR:
+            output_format = PixelFormat::BGR;
             break;
-
-        case ColorConversion::NV12_BGR:
-        case ColorConversion::NV12_RGB:
-            output_fmt = PIXEL_FORMAT_RGB_888;
-            break;
-
         case ColorConversion::BGR2GRAY:
         case ColorConversion::RGB2GRAY:
-            output_fmt = PIXEL_FORMAT_YUV_400;  // Grayscale
+            output_format = PixelFormat::GRAY;
             break;
-
         default:
-            if (needs_vb_release) {
-                CVI_VB_ReleaseBlock(temp_vb_block);
-            }
-            throw std::runtime_error(
-                "CviVpssProcessor::cvtColor() - unsupported color conversion code");
+            throw std::invalid_argument("CviVpssProcessor::cvtColor - unsupported conversion");
     }
 
-    // If no format change needed, return early
-    if (input_fmt == output_fmt && code != ColorConversion::BGR2RGB && code != ColorConversion::RGB2BGR) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        return;
-    }
-
-    // Initialize VPSS pipeline with format conversion
-    CVI_S32 rc = init_vpss_pipeline(
-        width, height, input_fmt,
-        width, height, output_fmt);  // Same size, different format
-
-    if (rc != CVI_SUCCESS) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        throw std::runtime_error("CviVpssProcessor::cvtColor() - Failed to initialize VPSS pipeline");
-    }
-
-    // Process frame through VPSS
-    VIDEO_FRAME_INFO_S output;
-    rc = vpss_process_frame(input, output);
-
-    // Release temporary VB block
-    if (needs_vb_release) {
-        CVI_VB_ReleaseBlock(temp_vb_block);
-    }
-
-    if (rc != CVI_SUCCESS) {
-        throw std::runtime_error("CviVpssProcessor::cvtColor() - VPSS processing failed");
-    }
-
-    // Replace frame with VPSS output (with VPSS context for proper cleanup)
-    frame = Frame(output, vpss_grp_, vpss_chn_);
+    process_frame(frame, static_cast<uint32_t>(frame.width()),
+                  static_cast<uint32_t>(frame.height()), output_format,
+                  false, 0, 0, 0, 0);
+#else
+    (void)frame;
+    (void)code;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
 }
 
 void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
+#ifdef USE_CVI_MPI
     if (frame.empty()) {
-        throw std::invalid_argument("CviVpssProcessor::crop() - frame is empty");
+        throw std::invalid_argument("CviVpssProcessor::crop - frame is empty");
+    }
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
+        x + w > frame.width() || y + h > frame.height()) {
+        throw std::invalid_argument("CviVpssProcessor::crop - invalid crop region");
     }
 
-    // Validate crop parameters
-    if (w <= 0 || h <= 0) {
-        throw std::invalid_argument("CviVpssProcessor::crop() - invalid crop dimensions");
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
     }
 
-    if (x < 0 || y < 0) {
-        throw std::invalid_argument("CviVpssProcessor::crop() - invalid crop coordinates");
+    process_frame(frame, static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                  input_format, true, x, y, w, h);
+#else
+    (void)frame;
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
+}
+
+#ifdef USE_CVI_MPI
+VIDEO_FRAME_INFO_S CviVpssProcessor::mat_to_video_frame(const cv::Mat& mat, VB_BLK& vb_block) {
+    return mat_to_video_frame(mat, vb_block, VB_INVALID_POOLID);
+}
+
+VIDEO_FRAME_INFO_S CviVpssProcessor::mat_to_video_frame(const cv::Mat& mat, VB_BLK& vb_block, VB_POOL pool) {
+    if (mat.empty()) {
+        throw std::invalid_argument("mat_to_video_frame - input mat is empty");
     }
 
-    VIDEO_FRAME_INFO_S input;
-    VB_BLK temp_vb_block = VB_INVALID_HANDLE;
-    bool needs_vb_release = false;
+    PixelFormat fmt = (mat.channels() == 1) ? PixelFormat::GRAY : PixelFormat::BGR;
+    PIXEL_FORMAT_E cvi_fmt = to_cvi_pixel_format(fmt);
+    if (cvi_fmt == PIXEL_FORMAT_MAX) {
+        throw std::invalid_argument("mat_to_video_frame - unsupported format");
+    }
 
-    // Handle both zero-copy and file input paths
-    if (frame.has_physical_addr()) {
-        input = frame.to_video_frame();
+    VB_CAL_CONFIG_S cal{};
+    COMMON_GetPicBufferConfig(static_cast<CVI_U32>(mat.cols),
+                              static_cast<CVI_U32>(mat.rows),
+                              cvi_fmt, DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0, &cal);
+
+    CVI_U32 alloc_size = cal.u32VBSize;
+    auto try_get_block = [&](VB_POOL pool_id, CVI_U32 size) -> VB_BLK {
+        VB_BLK blk = CVI_VB_GetBlock(pool_id, size);
+        if (blk != VB_INVALID_HANDLE) {
+            alloc_size = size;
+        }
+        return blk;
+    };
+
+    vb_block = try_get_block(pool, cal.u32VBSize);
+    if (vb_block == VB_INVALID_HANDLE && pool != VB_INVALID_POOLID) {
+        vb_block = try_get_block(VB_INVALID_POOLID, cal.u32VBSize);
+    }
+    if (vb_block == VB_INVALID_HANDLE) {
+        for (int retry = 0; retry < 3 && vb_block == VB_INVALID_HANDLE; ++retry) {
+            usleep(2000);
+            vb_block = try_get_block(VB_INVALID_POOLID, cal.u32VBSize);
+        }
+    }
+    if (vb_block == VB_INVALID_HANDLE) {
+        VB_CONFIG_S vb_config{};
+        CVI_S32 cfg_rc = CVI_VB_GetConfig(&vb_config);
+        if (cfg_rc == CVI_SUCCESS && vb_config.u32MaxPoolCnt > 0) {
+            struct Candidate {
+                VB_POOL id;
+                CVI_U32 blk_size;
+            };
+            std::vector<Candidate> candidates;
+            candidates.reserve(vb_config.u32MaxPoolCnt);
+            for (CVI_U32 i = 0; i < vb_config.u32MaxPoolCnt; ++i) {
+                CVI_U32 blk_size = vb_config.astCommPool[i].u32BlkSize;
+                CVI_U32 blk_cnt = vb_config.astCommPool[i].u32BlkCnt;
+                if (blk_size >= cal.u32VBSize && blk_cnt > 0) {
+                    candidates.push_back({static_cast<VB_POOL>(i), blk_size});
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          return a.blk_size > b.blk_size;
+                      });
+            for (const auto& cand : candidates) {
+                vb_block = try_get_block(cand.id, cal.u32VBSize);
+                if (vb_block != VB_INVALID_HANDLE) {
+                    break;
+                }
+                if (cand.blk_size != cal.u32VBSize) {
+                    vb_block = try_get_block(cand.id, cand.blk_size);
+                    if (vb_block != VB_INVALID_HANDLE) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (vb_block == VB_INVALID_HANDLE) {
+        throw std::runtime_error("mat_to_video_frame - CVI_VB_GetBlock failed");
+    }
+
+    CVI_U64 phys = CVI_VB_Handle2PhysAddr(vb_block);
+    void* virt = CVI_SYS_MmapCache(phys, alloc_size);
+    if (!virt) {
+        CVI_VB_ReleaseBlock(vb_block);
+        throw std::runtime_error("mat_to_video_frame - CVI_SYS_MmapCache failed");
+    }
+
+    uint8_t* dst = static_cast<uint8_t*>(virt);
+    int copy_bytes = mat.cols * mat.channels();
+    int dst_stride = static_cast<int>(cal.u32MainStride);
+
+    for (int y = 0; y < mat.rows; ++y) {
+        std::memcpy(dst + static_cast<size_t>(y) * dst_stride,
+                    mat.ptr<uint8_t>(y),
+                    static_cast<size_t>(copy_bytes));
+    }
+
+    CVI_SYS_IonFlushCache(phys, virt, alloc_size);
+    CVI_SYS_Munmap(virt, alloc_size);
+
+    VIDEO_FRAME_INFO_S frame{};
+    frame.stVFrame.u32Width = static_cast<CVI_U32>(mat.cols);
+    frame.stVFrame.u32Height = static_cast<CVI_U32>(mat.rows);
+    frame.stVFrame.enPixelFormat = cvi_fmt;
+    frame.stVFrame.enVideoFormat = VIDEO_FORMAT_LINEAR;
+    frame.stVFrame.enCompressMode = COMPRESS_MODE_NONE;
+    frame.stVFrame.enDynamicRange = DYNAMIC_RANGE_SDR8;
+    frame.stVFrame.enColorGamut = COLOR_GAMUT_BT709;
+
+    frame.stVFrame.u32Stride[0] = cal.u32MainStride;
+    frame.stVFrame.u32Stride[1] = cal.u32CStride;
+    frame.stVFrame.u32Stride[2] = cal.u32CStride;
+    if (cal.plane_num <= 1) {
+        frame.stVFrame.u32Length[0] = cal.u32MainSize;
+        frame.stVFrame.u32Length[1] = 0;
+        frame.stVFrame.u32Length[2] = 0;
     } else {
-        input = mat_to_video_frame(frame.to_mat(), temp_vb_block);
-        needs_vb_release = true;
+        frame.stVFrame.u32Length[0] = cal.u32MainYSize;
+        frame.stVFrame.u32Length[1] = cal.u32MainCSize;
+        frame.stVFrame.u32Length[2] = 0;
     }
 
-    int frame_width = static_cast<int>(input.stVFrame.u32Width);
-    int frame_height = static_cast<int>(input.stVFrame.u32Height);
-
-    if (x + w > frame_width || y + h > frame_height) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        throw std::invalid_argument(
-            "CviVpssProcessor::crop() - crop region exceeds frame bounds");
+    frame.stVFrame.u64PhyAddr[0] = phys;
+    if (cal.u32MainCSize > 0) {
+        frame.stVFrame.u64PhyAddr[1] = phys + cal.u32MainYSize;
     }
 
-    PIXEL_FORMAT_E input_fmt = input.stVFrame.enPixelFormat;
+    frame.u32PoolId = CVI_VB_Handle2PoolId(vb_block);
 
-    // Initialize VPSS pipeline for crop + resize to output size
-    CVI_S32 rc = init_vpss_pipeline(
-        frame_width, frame_height, input_fmt,
-        w, h, input_fmt);  // Output is crop size
-
-    if (rc != CVI_SUCCESS) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        throw std::runtime_error("CviVpssProcessor::crop() - Failed to initialize VPSS pipeline");
-    }
-
-    // Configure crop region on VPSS channel
-    VPSS_CROP_INFO_S crop_info;
-    crop_info.bEnable = CVI_TRUE;
-    crop_info.enCropCoordinate = VPSS_CROP_ABS_COOR;  // Absolute coordinates
-    crop_info.stCropRect.s32X = x;
-    crop_info.stCropRect.s32Y = y;
-    crop_info.stCropRect.u32Width = w;
-    crop_info.stCropRect.u32Height = h;
-
-    rc = CVI_VPSS_SetChnCrop(vpss_grp_, vpss_chn_, &crop_info);
-    if (rc != CVI_SUCCESS) {
-        if (needs_vb_release) {
-            CVI_VB_ReleaseBlock(temp_vb_block);
-        }
-        std::cerr << "[ERROR] CVI_VPSS_SetChnCrop failed: " << rc << std::endl;
-        throw std::runtime_error("CviVpssProcessor::crop() - Failed to set crop region");
-    }
-
-    // Process frame through VPSS
-    VIDEO_FRAME_INFO_S output;
-    rc = vpss_process_frame(input, output);
-
-    // Release temporary VB block
-    if (needs_vb_release) {
-        CVI_VB_ReleaseBlock(temp_vb_block);
-    }
-
-    // Disable crop for next operation
-    crop_info.bEnable = CVI_FALSE;
-    CVI_VPSS_SetChnCrop(vpss_grp_, vpss_chn_, &crop_info);
-
-    if (rc != CVI_SUCCESS) {
-        throw std::runtime_error("CviVpssProcessor::crop() - VPSS processing failed");
-    }
-
-    // Replace frame with cropped output (with VPSS context for proper cleanup)
-    frame = Frame(output, vpss_grp_, vpss_chn_);
+    return frame;
 }
 
-// ========== Private Implementation ==========
-
-CVI_S32 CviVpssProcessor::init_vpss_pipeline(
-    uint32_t input_w, uint32_t input_h, PIXEL_FORMAT_E input_fmt,
-    uint32_t output_w, uint32_t output_h, PIXEL_FORMAT_E output_fmt) {
-
-    // Check if we can reuse existing pipeline
-    if (initialized_ &&
-        cached_input_w_ == input_w &&
-        cached_input_h_ == input_h &&
-        cached_output_w_ == output_w &&
-        cached_output_h_ == output_h &&
-        cached_input_fmt_ == input_fmt &&
-        cached_output_fmt_ == output_fmt) {
-        // Pipeline already configured correctly
-        return CVI_SUCCESS;
+void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height, PixelFormat input_format) {
+    if (!MmfContext::instance().is_initialized()) {
+        throw std::runtime_error("CviVpssProcessor - MmfContext not initialized");
     }
 
-    // Need to reconfigure pipeline - cleanup first
-    cleanup_vpss_pipeline();
-
-    CVI_S32 rc;
-
-    // Step 0: Ensure VPSS group doesn't exist (force cleanup from previous crash)
-    CVI_VPSS_StopGrp(vpss_grp_);
-    CVI_VPSS_DisableChn(vpss_grp_, vpss_chn_);
-    CVI_VPSS_DestroyGrp(vpss_grp_);
-
-    // Step 1: Create VPSS group
-    VPSS_GRP_ATTR_S grp_attr = {0};
-    grp_attr.u32MaxW = input_w;
-    grp_attr.u32MaxH = input_h;
-    grp_attr.enPixelFormat = input_fmt;
-    grp_attr.stFrameRate.s32SrcFrameRate = -1;  // No frame rate control
-    grp_attr.stFrameRate.s32DstFrameRate = -1;
-
-    rc = CVI_VPSS_CreateGrp(vpss_grp_, &grp_attr);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_CreateGrp failed: " << rc << std::endl;
-        return rc;
-    }
-
-    // Step 2: Reset VPSS group
-    rc = CVI_VPSS_ResetGrp(vpss_grp_);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_ResetGrp failed: " << rc << std::endl;
-        CVI_VPSS_DestroyGrp(vpss_grp_);
-        return rc;
-    }
-
-    // Step 3: Configure VPSS channel
-    VPSS_CHN_ATTR_S chn_attr = {0};
-    chn_attr.u32Width = output_w;
-    chn_attr.u32Height = output_h;
-    chn_attr.enVideoFormat = VIDEO_FORMAT_LINEAR;
-    chn_attr.enPixelFormat = output_fmt;
-    chn_attr.stFrameRate.s32SrcFrameRate = -1;
-    chn_attr.stFrameRate.s32DstFrameRate = -1;
-    chn_attr.bFlip = CVI_FALSE;
-    chn_attr.bMirror = CVI_FALSE;
-    chn_attr.u32Depth = 1;  // Output queue depth
-    chn_attr.stAspectRatio.enMode = ASPECT_RATIO_NONE;
-    chn_attr.stNormalize.bEnable = CVI_FALSE;
-
-    rc = CVI_VPSS_SetChnAttr(vpss_grp_, vpss_chn_, &chn_attr);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_SetChnAttr failed: " << rc << std::endl;
-        CVI_VPSS_DestroyGrp(vpss_grp_);
-        return rc;
-    }
-
-    // Step 4: Enable VPSS channel
-    rc = CVI_VPSS_EnableChn(vpss_grp_, vpss_chn_);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_EnableChn failed: " << rc << std::endl;
-        CVI_VPSS_DestroyGrp(vpss_grp_);
-        return rc;
-    }
-
-    // Note: We do NOT create a dynamic VB pool here.
-    // VPSS will use the pre-configured public pools (set up by init_cvi_system).
-    // The public pools must cover all possible output sizes using COMMON_GetPicBufferSize.
-    // This avoids dynamic pool creation issues (pool count limits, cleanup on crash).
-
-    // Step 5: Start VPSS group
-    rc = CVI_VPSS_StartGrp(vpss_grp_);
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_StartGrp failed: " << rc << std::endl;
-        CVI_VPSS_DisableChn(vpss_grp_, vpss_chn_);
-        CVI_VPSS_DestroyGrp(vpss_grp_);
-        return rc;
-    }
-
-    // Update cache
-    cached_input_w_ = input_w;
-    cached_input_h_ = input_h;
-    cached_output_w_ = output_w;
-    cached_output_h_ = output_h;
-    cached_input_fmt_ = input_fmt;
-    cached_output_fmt_ = output_fmt;
-    initialized_ = true;
-
-    return CVI_SUCCESS;
-}
-
-void CviVpssProcessor::cleanup_vpss_pipeline() {
-    if (!initialized_) {
+    if (group_created_ && input_width == max_width_ && input_height == max_height_
+        && input_format == input_format_) {
         return;
     }
 
-    // Stop VPSS group
-    CVI_VPSS_StopGrp(vpss_grp_);
+    destroy_group();
 
-    // Disable channel
-    CVI_VPSS_DisableChn(vpss_grp_, vpss_chn_);
-
-    // Destroy group
-    CVI_VPSS_DestroyGrp(vpss_grp_);
-
-    initialized_ = false;
-}
-
-CVI_S32 CviVpssProcessor::vpss_process_frame(
-    const VIDEO_FRAME_INFO_S& input,
-    VIDEO_FRAME_INFO_S& output) {
-
-    // Send frame to VPSS group
-    CVI_S32 rc = CVI_VPSS_SendFrame(vpss_grp_, &input, 1000);  // 1 second timeout
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_SendFrame failed: " << rc << std::endl;
-        return rc;
-    }
-
-    // Get processed frame from VPSS channel
-    rc = CVI_VPSS_GetChnFrame(vpss_grp_, vpss_chn_, &output, 1000);  // 1 second timeout
-    if (rc != CVI_SUCCESS) {
-        std::cerr << "[ERROR] CVI_VPSS_GetChnFrame failed: " << rc << std::endl;
-        return rc;
-    }
-
-    return CVI_SUCCESS;
-}
-
-VIDEO_FRAME_INFO_S CviVpssProcessor::mat_to_video_frame(const cv::Mat& mat, VB_BLK& out_vb_block, VB_POOL vb_pool) {
-    if (mat.empty()) {
-        throw std::runtime_error("mat_to_video_frame: input Mat is empty");
-    }
-
-    if (!mat.isContinuous()) {
-        throw std::runtime_error("mat_to_video_frame: input Mat must be continuous");
-    }
-
-    // Alignment requirement for DMA
-    constexpr uint32_t ALIGNMENT = 64;
-    auto ALIGN = [](uint32_t x, uint32_t a) -> uint32_t { return (x + a - 1) & ~(a - 1); };
-
-    uint32_t width = mat.cols;
-    uint32_t height = mat.rows;
-    int cv_type = mat.type();
-
-    // Determine pixel format and bytes per pixel
-    PIXEL_FORMAT_E pixel_format;
-    uint32_t bpp;  // bytes per pixel
-
-    switch (cv_type) {
-        case CV_8UC3:
-            pixel_format = PIXEL_FORMAT_BGR_888;  // OpenCV default
-            bpp = 3;
-            break;
-        case CV_8UC1:
-            pixel_format = PIXEL_FORMAT_YUV_400;  // Grayscale
-            bpp = 1;
-            break;
-        default:
-            throw std::runtime_error("mat_to_video_frame: unsupported Mat type (only CV_8UC3 and CV_8UC1)");
-    }
-
-    // Calculate stride (must be 64-byte aligned)
-    uint32_t stride = ALIGN(width * bpp, ALIGNMENT);
-
-    // Calculate total memory size
-    uint32_t plane_size = stride * height;
-    uint32_t total_size = plane_size;  // Single plane for RGB/BGR/GRAY
-
-    // Allocate VB block from specified pool
-    VB_BLK vb_block = CVI_VB_GetBlock(vb_pool, total_size);
-    if (vb_block == VB_INVALID_HANDLE) {
-        throw std::runtime_error("mat_to_video_frame: CVI_VB_GetBlock failed (size=" +
-                                std::to_string(total_size) + ")");
-    }
-
-    // Get physical address
-    CVI_U64 phys_addr = CVI_VB_Handle2PhysAddr(vb_block);
-    if (phys_addr == 0) {
-        CVI_VB_ReleaseBlock(vb_block);
-        throw std::runtime_error("mat_to_video_frame: CVI_VB_Handle2PhysAddr failed");
-    }
-
-    // Map to cached virtual address for fast CPU writes
-    // VB pools are configured with VB_REMAP_MODE_CACHED
-    void* virt_addr = CVI_SYS_MmapCache(phys_addr, total_size);
-    if (virt_addr == nullptr) {
-        CVI_VB_ReleaseBlock(vb_block);
-        throw std::runtime_error("mat_to_video_frame: CVI_SYS_MmapCache failed");
-    }
-
-    // Copy Mat data to VB memory (with stride)
-    // Using cached mapping: CPU writes go to cache first (fast),
-    // then flush cache to physical memory for DMA access
-    try {
-        const uint8_t* src_ptr = mat.data;
-        uint8_t* dst_ptr = static_cast<uint8_t*>(virt_addr);
-        uint32_t row_bytes = width * bpp;
-
-        if (stride == row_bytes) {
-            // Optimized: single large memcpy when no padding
-            std::memcpy(dst_ptr, src_ptr, row_bytes * height);
-        } else {
-            // Copy row by row when stride alignment needed
-            for (uint32_t row = 0; row < height; ++row) {
-                std::memcpy(dst_ptr + row * stride,
-                           src_ptr + row * row_bytes,
-                           row_bytes);
+    VPSS_GRP_ATTR_S grp_attr{};
+    grp_attr.u32MaxW = input_width;
+    grp_attr.u32MaxH = input_height;
+    grp_attr.enPixelFormat = to_cvi_pixel_format(input_format);
+    grp_attr.stFrameRate.s32SrcFrameRate = -1;
+    grp_attr.stFrameRate.s32DstFrameRate = -1;
+    CVI_U8 vpss_dev = 0;
+    const auto& mode = MmfContext::instance().mode_plan().vpss_mode;
+    if (mode.enMode == VPSS_MODE_DUAL) {
+        for (int i = 0; i < VPSS_IP_NUM; ++i) {
+            if (mode.aenInput[i] == VPSS_INPUT_MEM) {
+                vpss_dev = static_cast<CVI_U8>(i);
+                break;
             }
         }
+    }
+    grp_attr.u8VpssDev = vpss_dev;
 
-        // Flush CPU cache to physical memory before VPSS DMA reads
-        CVI_SYS_IonFlushCache(phys_addr, virt_addr, total_size);
-
-    } catch (...) {
-        CVI_SYS_Munmap(virt_addr, total_size);
-        CVI_VB_ReleaseBlock(vb_block);
-        throw;
+    if (grp_ < 0) {
+        grp_ = CVI_VPSS_GetAvailableGrp();
+        if (grp_ < 0) {
+            throw std::runtime_error("CviVpssProcessor - no available VPSS group");
+        }
     }
 
-    // Unmap virtual address (VPSS will access via physical address)
-    CVI_SYS_Munmap(virt_addr, total_size);
+    CVI_S32 rc = CVI_VPSS_CreateGrp(grp_, &grp_attr);
+    if (rc == CVI_ERR_VPSS_EXIST) {
+        std::cerr << "[WARN] CviVpssProcessor: VPSS group exists, destroying and retrying" << std::endl;
+        CVI_S32 cleanup_rc = CVI_VPSS_DisableChn(grp_, chn_);
+        if (cleanup_rc != CVI_SUCCESS) {
+            std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_DisableChn failed: 0x"
+                      << std::hex << cleanup_rc << std::dec << std::endl;
+        }
+        cleanup_rc = CVI_VPSS_StopGrp(grp_);
+        if (cleanup_rc != CVI_SUCCESS) {
+            std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_StopGrp failed: 0x"
+                      << std::hex << cleanup_rc << std::dec << std::endl;
+        }
+        cleanup_rc = CVI_VPSS_DestroyGrp(grp_);
+        if (cleanup_rc != CVI_SUCCESS) {
+            std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_DestroyGrp failed: 0x"
+                      << std::hex << cleanup_rc << std::dec << std::endl;
+        }
+        rc = CVI_VPSS_CreateGrp(grp_, &grp_attr);
+    }
+    if (rc != CVI_SUCCESS) {
+        std::ostringstream oss;
+        oss << "CviVpssProcessor - CVI_VPSS_CreateGrp failed: 0x" << std::hex << rc;
+        throw std::runtime_error(oss.str());
+    }
 
-    // Construct VIDEO_FRAME_INFO_S
-    VIDEO_FRAME_INFO_S frame_info;
-    std::memset(&frame_info, 0, sizeof(frame_info));
+    rc = CVI_VPSS_ResetGrp(grp_);
+    if (rc != CVI_SUCCESS) {
+        CVI_VPSS_DestroyGrp(grp_);
+        throw std::runtime_error("CviVpssProcessor - CVI_VPSS_ResetGrp failed");
+    }
 
-    VIDEO_FRAME_S& vf = frame_info.stVFrame;
-    vf.u32Width = width;
-    vf.u32Height = height;
-    vf.enPixelFormat = pixel_format;
-    vf.enVideoFormat = VIDEO_FORMAT_LINEAR;
-    vf.enCompressMode = COMPRESS_MODE_NONE;
-    vf.enColorGamut = COLOR_GAMUT_BT709;
-
-    // Physical address and stride
-    vf.u64PhyAddr[0] = phys_addr;
-    vf.u32Stride[0] = stride;
-    vf.u32Length[0] = plane_size;
-
-    // Virtual address (0 for VPSS usage - it will map internally if needed)
-    vf.pu8VirAddr[0] = nullptr;
-
-    // Time stamp (not used for static images)
-    vf.u64PTS = 0;
-
-    // Return VB block handle for later release
-    out_vb_block = vb_block;
-
-    return frame_info;
+    group_created_ = true;
+    group_started_ = false;
+    max_width_ = input_width;
+    max_height_ = input_height;
+    input_format_ = input_format;
 }
 
-} // namespace lua_cv
+void CviVpssProcessor::ensure_channel(uint32_t out_width, uint32_t out_height, PixelFormat out_format) {
+    if (!group_created_) {
+        throw std::runtime_error("CviVpssProcessor - VPSS group not created");
+    }
 
-#endif // USE_CVI_MPI
+    bool need_reconfig = (!group_started_ || out_width_ != out_width || out_height_ != out_height || out_format_ != out_format);
+
+    if (!need_reconfig) {
+        return;
+    }
+
+    if (group_started_) {
+        CVI_VPSS_DisableChn(grp_, chn_);
+    }
+
+    VPSS_CHN_ATTR_S chn_attr{};
+    chn_attr.u32Width = out_width;
+    chn_attr.u32Height = out_height;
+    chn_attr.enVideoFormat = VIDEO_FORMAT_LINEAR;
+    chn_attr.enPixelFormat = to_cvi_pixel_format(out_format);
+    chn_attr.stFrameRate.s32SrcFrameRate = -1;
+    chn_attr.stFrameRate.s32DstFrameRate = -1;
+    chn_attr.u32Depth = 1;
+
+    CVI_S32 rc = CVI_VPSS_SetChnAttr(grp_, chn_, &chn_attr);
+    if (rc != CVI_SUCCESS) {
+        throw std::runtime_error("CviVpssProcessor - CVI_VPSS_SetChnAttr failed");
+    }
+
+    rc = CVI_VPSS_EnableChn(grp_, chn_);
+    if (rc != CVI_SUCCESS) {
+        throw std::runtime_error("CviVpssProcessor - CVI_VPSS_EnableChn failed");
+    }
+
+    if (!group_started_) {
+        rc = CVI_VPSS_StartGrp(grp_);
+        if (rc != CVI_SUCCESS) {
+            throw std::runtime_error("CviVpssProcessor - CVI_VPSS_StartGrp failed");
+        }
+        group_started_ = true;
+    }
+
+    VB_POOL pool = select_output_pool(out_width, out_height, out_format);
+    if (pool == VB_INVALID_POOLID) {
+        throw std::runtime_error("CviVpssProcessor - no suitable VB pool for output");
+    }
+
+    if (out_pool_ != VB_INVALID_POOLID && out_pool_ != pool) {
+        CVI_VPSS_DetachVbPool(grp_, chn_);
+    }
+    if (out_pool_ != pool) {
+        rc = CVI_VPSS_AttachVbPool(grp_, chn_, pool);
+        if (rc != CVI_SUCCESS) {
+            throw std::runtime_error("CviVpssProcessor - CVI_VPSS_AttachVbPool failed");
+        }
+        out_pool_ = pool;
+    }
+
+    out_width_ = out_width;
+    out_height_ = out_height;
+    out_format_ = out_format;
+}
+
+void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t out_height,
+                                     PixelFormat out_format, bool use_crop,
+                                     int crop_x, int crop_y, int crop_w, int crop_h) {
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
+    }
+
+    ensure_group(static_cast<uint32_t>(frame.width()), static_cast<uint32_t>(frame.height()), input_format);
+    ensure_channel(out_width, out_height, out_format);
+
+    VPSS_CROP_INFO_S crop_info{};
+    if (use_crop) {
+        crop_info.bEnable = CVI_TRUE;
+        crop_info.enCropCoordinate = VPSS_CROP_ABS_COOR;
+        crop_info.stCropRect.s32X = crop_x;
+        crop_info.stCropRect.s32Y = crop_y;
+        crop_info.stCropRect.u32Width = static_cast<CVI_U32>(crop_w);
+        crop_info.stCropRect.u32Height = static_cast<CVI_U32>(crop_h);
+        CVI_S32 rc = CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
+        if (rc != CVI_SUCCESS) {
+            throw std::runtime_error("CviVpssProcessor - CVI_VPSS_SetChnCrop failed");
+        }
+    }
+
+    VIDEO_FRAME_INFO_S input_frame{};
+    VB_BLK input_block = VB_INVALID_HANDLE;
+    bool input_from_mat = false;
+
+    if (frame.storage_type() == Frame::StorageType::CVI && frame.video_frame()) {
+        input_frame = *frame.video_frame();
+    } else {
+        input_frame = mat_to_video_frame(frame.to_mat(), input_block, select_output_pool(frame.width(), frame.height(), input_format));
+        input_from_mat = true;
+    }
+
+    CVI_S32 rc = CVI_SUCCESS;
+    const int send_attempts = 3;
+    for (int attempt = 0; attempt < send_attempts; ++attempt) {
+        rc = CVI_VPSS_SendFrame(grp_, &input_frame, -1);
+        if (rc == CVI_SUCCESS) {
+            break;
+        }
+        if (rc != CVI_ERR_VPSS_NOBUF && rc != CVI_ERR_VPSS_BUF_EMPTY) {
+            break;
+        }
+        usleep(5000);
+    }
+    if (input_from_mat && input_block != VB_INVALID_HANDLE) {
+        CVI_VB_ReleaseBlock(input_block);
+    }
+    if (rc != CVI_SUCCESS) {
+        if (use_crop) {
+            crop_info.bEnable = CVI_FALSE;
+            CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
+        }
+        std::ostringstream oss;
+        oss << "CviVpssProcessor - CVI_VPSS_SendFrame failed: 0x" << std::hex << rc;
+        throw std::runtime_error(oss.str());
+    }
+
+    VIDEO_FRAME_INFO_S output_frame{};
+    const int get_attempts = 5;
+    for (int attempt = 0; attempt < get_attempts; ++attempt) {
+        rc = CVI_VPSS_GetChnFrame(grp_, chn_, &output_frame, 100);
+        if (rc == CVI_SUCCESS) {
+            break;
+        }
+        if (rc != CVI_ERR_VPSS_NOBUF && rc != CVI_ERR_VPSS_BUF_EMPTY) {
+            break;
+        }
+        usleep(5000);
+    }
+    if (use_crop) {
+        crop_info.bEnable = CVI_FALSE;
+        CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
+    }
+
+    if (rc != CVI_SUCCESS) {
+        std::ostringstream oss;
+        oss << "CviVpssProcessor - CVI_VPSS_GetChnFrame failed: 0x" << std::hex << rc;
+        throw std::runtime_error(oss.str());
+    }
+
+    Frame out(output_frame, grp_, chn_);
+    out.set_vpss_owner(grp_, chn_);
+    frame = std::move(out);
+}
+
+VB_POOL CviVpssProcessor::select_output_pool(uint32_t width, uint32_t height, PixelFormat format) const {
+    PixelFormat pool_format = format;
+    if (format == PixelFormat::RGB || format == PixelFormat::GRAY) {
+        pool_format = PixelFormat::BGR;
+    }
+
+    if (MmfContext::instance().is_initialized()) {
+        VB_POOL pool = MmfContext::instance().vb_plan().find_pool(width, height, pool_format);
+        if (pool != VB_INVALID_POOLID) {
+            return pool;
+        }
+    }
+
+    uint32_t needed = COMMON_GetPicBufferSize(width, height,
+                                              to_cvi_pixel_format(pool_format),
+                                              DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
+    if (needed == 0) {
+        return VB_INVALID_POOLID;
+    }
+
+    VB_CONFIG_S vb_config{};
+    CVI_S32 rc = CVI_VB_GetConfig(&vb_config);
+    if (rc != CVI_SUCCESS || vb_config.u32MaxPoolCnt == 0) {
+        return VB_INVALID_POOLID;
+    }
+
+    VB_POOL best_pool = VB_INVALID_POOLID;
+    uint32_t best_size = 0;
+    for (uint32_t i = 0; i < vb_config.u32MaxPoolCnt; ++i) {
+        uint32_t blk_size = vb_config.astCommPool[i].u32BlkSize;
+        uint32_t blk_cnt = vb_config.astCommPool[i].u32BlkCnt;
+        if (blk_size == 0 || blk_cnt == 0) {
+            continue;
+        }
+        if (blk_size >= needed && (best_pool == VB_INVALID_POOLID || blk_size < best_size)) {
+            best_pool = static_cast<VB_POOL>(i);
+            best_size = blk_size;
+        }
+    }
+
+    return best_pool;
+}
+
+void CviVpssProcessor::destroy_group() {
+    if (!group_created_) {
+        return;
+    }
+
+    if (group_started_) {
+        CVI_VPSS_DisableChn(grp_, chn_);
+        CVI_VPSS_StopGrp(grp_);
+        group_started_ = false;
+    }
+
+    if (out_pool_ != VB_INVALID_POOLID) {
+        CVI_VPSS_DetachVbPool(grp_, chn_);
+        out_pool_ = VB_INVALID_POOLID;
+    }
+
+    CVI_VPSS_DestroyGrp(grp_);
+    group_created_ = false;
+    grp_ = -1;
+    max_width_ = 0;
+    max_height_ = 0;
+    input_format_ = PixelFormat::UNKNOWN;
+    out_width_ = 0;
+    out_height_ = 0;
+    out_format_ = PixelFormat::UNKNOWN;
+}
+#endif
+
+} // namespace lua_cv

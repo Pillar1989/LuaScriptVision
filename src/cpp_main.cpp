@@ -1,12 +1,19 @@
+#include <array>
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <chrono>
 #include <cmath>
 #include <algorithm>
-#include <numeric>
+#include <limits>
+#include <stdexcept>
 #include <opencv2/opencv.hpp>
-#include "inference/inference.h"
+#include "inference/session_factory.h"
+#include "inference/layout.h"
+#ifdef USE_CVI_TPU
+#include "inference/cvi_session.h"
+#endif
 #include "main_util.h"
 
 // Configuration
@@ -30,40 +37,76 @@ struct PreprocessMeta {
     int ori_w, ori_h;
 };
 
-// YOLO model configuration (auto-detected from output shape)
-struct YoloConfig {
-    int num_boxes;
-    int box_dim;
-    bool has_objectness;
-    bool transposed;  // [1, 85, 25200] vs [1, 25200, 85]
-
-    // Auto-detect YOLO version from output shape
-    // YOLOv5: [1, 25200, 85] with objectness
-    // YOLO11: [1, 84, 8400] without objectness (CHW format)
-    static YoloConfig detect(const std::vector<int64_t>& shape) {
-        YoloConfig cfg;
-        int64_t dim1 = shape[1];
-        int64_t dim2 = shape[2];
-
-        cfg.transposed = (dim1 < dim2 && dim2 > 100);
-        cfg.num_boxes = cfg.transposed ? dim2 : dim1;
-        cfg.box_dim = cfg.transposed ? dim1 : dim2;
-
-        // YOLOv5: 85 = 4(xywh) + 1(objectness) + 80(classes)
-        // YOLO11: 84 = 4(xywh) + 80(classes)
-        cfg.has_objectness = (cfg.box_dim == 85);
-
-        return cfg;
-    }
-
-    void print() const {
-        std::cout << "YOLO Config:\n";
-        std::cout << "  Format: " << (transposed ? "CHW [1, " + std::to_string(box_dim) + ", " + std::to_string(num_boxes) + "]"
-                                                  : "HWC [1, " + std::to_string(num_boxes) + ", " + std::to_string(box_dim) + "]") << "\n";
-        std::cout << "  Version: " << (has_objectness ? "YOLOv5" : "YOLO11") << "\n";
-        std::cout << "  Boxes: " << num_boxes << "\n";
-    }
+struct PreprocessParams {
+    std::array<float, 3> mean;
+    std::array<float, 3> scale;
+    bool swap_rb;
+    int pad_value;
 };
+
+struct TimingBreakdown {
+    double preprocess_ms = 0.0;
+    double inference_ms = 0.0;
+    double postprocess_ms = 0.0;
+    double resize_ms = 0.0;
+    double blob_ms = 0.0;
+    double cvi_input_ms = 0.0;
+    double cvi_forward_ms = 0.0;
+    double cvi_output_ms = 0.0;
+};
+
+std::string shape_to_string(const std::vector<int64_t>& shape) {
+    std::string out = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += std::to_string(shape[i]);
+    }
+    out += "]";
+    return out;
+}
+
+PreprocessParams default_preprocess_params() {
+    PreprocessParams params;
+    params.mean = {0.0f, 0.0f, 0.0f};
+    params.scale = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
+    params.swap_rb = true;
+    params.pad_value = 114;
+    return params;
+}
+
+PreprocessParams tdl_yolov8_preprocess_params() {
+    PreprocessParams params;
+    constexpr float kStd = 254.97195f;
+    params.mean = {0.0f, 0.0f, 0.0f};
+    params.scale = {1.0f / kStd, 1.0f / kStd, 1.0f / kStd};
+    params.swap_rb = true;
+    params.pad_value = 0;
+    return params;
+}
+
+bool ends_with(const std::string& value, const std::string& suffix) {
+    if (suffix.size() > value.size()) {
+        return false;
+    }
+    return std::equal(suffix.rbegin(), suffix.rend(), value.rbegin());
+}
+
+enum class ModelKind {
+    YoloV8Head,
+    YoloV8Fused,
+};
+
+ModelKind model_kind_from_path(const std::string& model_path) {
+    if (ends_with(model_path, ".cvimodel")) {
+        return ModelKind::YoloV8Head;
+    }
+    if (ends_with(model_path, ".onnx")) {
+        return ModelKind::YoloV8Fused;
+    }
+    throw std::runtime_error("Unsupported model extension: " + model_path);
+}
 
 // ============ Preprocessing (Optimized) ============
 
@@ -100,30 +143,42 @@ PreprocessMeta letterbox_resize(const cv::Mat& img, cv::Mat& output,
     return {r, left, top, w, h};
 }
 
-void hwc_to_chw_bgr2rgb(const cv::Mat& padded, std::vector<float>& blob, bool pre_allocated = false) {
+void hwc_to_blob(const cv::Mat& padded, std::vector<float>& blob,
+                 inference::Layout layout, const PreprocessParams& params,
+                 bool pre_allocated = false) {
     const int H = padded.rows;
     const int W = padded.cols;
     const int HW = H * W;
 
-    // Only resize if not pre-allocated (video mode uses pre-allocated buffers)
-    if (!pre_allocated) {
-        blob.resize(3 * HW);
+    size_t required = static_cast<size_t>(HW) * 3;
+    if (!pre_allocated || blob.size() != required) {
+        blob.resize(required);
     }
 
     const uint8_t* src = padded.data;
-
-    // Optimized: direct pointer access + BGR→RGB conversion
-    // Use multiplication instead of division (3-5x faster on embedded systems)
-    constexpr float scale = 1.0f / 255.0f;
 
     for (int i = 0; i < H; ++i) {
         const uint8_t* row = src + i * W * 3;
         for (int j = 0; j < W; ++j) {
             const int idx = i * W + j;
-            // BGR → RGB: swap channels 0 and 2
-            blob[2 * HW + idx] = row[j * 3 + 0] * scale;  // B → R
-            blob[1 * HW + idx] = row[j * 3 + 1] * scale;  // G → G
-            blob[0 * HW + idx] = row[j * 3 + 2] * scale;  // R → B
+            float b = row[j * 3 + 0];
+            float g = row[j * 3 + 1];
+            float r = row[j * 3 + 2];
+
+            float c0 = params.swap_rb ? r : b;
+            float c1 = g;
+            float c2 = params.swap_rb ? b : r;
+
+            if (layout == inference::Layout::NHWC) {
+                size_t base = static_cast<size_t>(idx) * 3;
+                blob[base + 0] = (c0 - params.mean[0]) * params.scale[0];
+                blob[base + 1] = (c1 - params.mean[1]) * params.scale[1];
+                blob[base + 2] = (c2 - params.mean[2]) * params.scale[2];
+            } else {
+                blob[0 * HW + idx] = (c0 - params.mean[0]) * params.scale[0];
+                blob[1 * HW + idx] = (c1 - params.mean[1]) * params.scale[1];
+                blob[2 * HW + idx] = (c2 - params.mean[2]) * params.scale[2];
+            }
         }
     }
 }
@@ -172,102 +227,283 @@ std::vector<Detection> nms(std::vector<Detection>& boxes, float iou_thres) {
     return result;
 }
 
-void restore_coords(Detection& det, const PreprocessMeta& meta) {
-    det.x = (det.x - meta.pad_x) / meta.scale;
-    det.y = (det.y - meta.pad_y) / meta.scale;
-    det.w = det.w / meta.scale;
-    det.h = det.h / meta.scale;
+float clamp_value(float v, float lo, float hi) {
+    return std::max(lo, std::min(v, hi));
 }
 
-// Generic YOLO postprocessing (supports both v5 and v11)
-std::vector<Detection> postprocess_yolo(
-    const float* output,
-    const YoloConfig& cfg,
-    const PreprocessMeta& meta,
-    float conf_thres,
-    float iou_thres
-) {
-    std::vector<Detection> proposals;
-    proposals.reserve(cfg.num_boxes / 20);
+void restore_coords(Detection& det, const PreprocessMeta& meta) {
+    float x1 = (det.x - meta.pad_x) / meta.scale;
+    float y1 = (det.y - meta.pad_y) / meta.scale;
+    float x2 = x1 + det.w / meta.scale;
+    float y2 = y1 + det.h / meta.scale;
 
-    const int cls_start = cfg.has_objectness ? 5 : 4;
-    const int num_classes = cfg.box_dim - cls_start;
+    float max_w = static_cast<float>(meta.ori_w);
+    float max_h = static_cast<float>(meta.ori_h);
 
-    if (cfg.transposed) {
-        // CHW format: [1, 84/85, 8400/25200]
-        const float* cx_ptr = output + 0 * cfg.num_boxes;
-        const float* cy_ptr = output + 1 * cfg.num_boxes;
-        const float* w_ptr  = output + 2 * cfg.num_boxes;
-        const float* h_ptr  = output + 3 * cfg.num_boxes;
-        const float* obj_ptr = cfg.has_objectness ? (output + 4 * cfg.num_boxes) : nullptr;
+    x1 = clamp_value(x1, 0.0f, max_w);
+    y1 = clamp_value(y1, 0.0f, max_h);
+    x2 = clamp_value(x2, 0.0f, max_w);
+    y2 = clamp_value(y2, 0.0f, max_h);
 
-        for (int i = 0; i < cfg.num_boxes; ++i) {
-            float obj_conf = obj_ptr ? obj_ptr[i] : 1.0f;
-            if (obj_conf < conf_thres) continue;
+    det.x = x1;
+    det.y = y1;
+    det.w = std::max(0.0f, x2 - x1);
+    det.h = std::max(0.0f, y2 - y1);
+}
 
-            // Find max class score
-            float max_cls_conf = 0;
-            int cls_id = 0;
-            for (int c = 0; c < num_classes; ++c) {
-                float conf = output[(cls_start + c) * cfg.num_boxes + i];
-                if (conf > max_cls_conf) {
-                    max_cls_conf = conf;
-                    cls_id = c;
-                }
-            }
+float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
 
-            float final_score = obj_conf * max_cls_conf;
-            if (final_score < conf_thres) continue;
+struct YoloV8Head {
+    int h = 0;
+    int w = 0;
+    int stride = 0;
+    const float* reg = nullptr;
+    const float* cls = nullptr;
+};
 
-            Detection det{
-                cx_ptr[i] - w_ptr[i] * 0.5f,
-                cy_ptr[i] - h_ptr[i] * 0.5f,
-                w_ptr[i], h_ptr[i],
-                final_score, cls_id
-            };
-            proposals.push_back(det);
+struct YoloV8Params {
+    int num_classes = 80;
+    int reg_max = 16;
+    std::array<int, 3> strides = {8, 16, 32};
+
+    int reg_channels() const { return reg_max * 4; }
+};
+
+float dfl_distance(const float* reg_ptr, int side, int reg_max, int idx, int hw) {
+    if (reg_max <= 1) {
+        return 0.0f;
+    }
+    const float* base = reg_ptr + side * reg_max * hw;
+    float max_val = -std::numeric_limits<float>::infinity();
+    for (int k = 0; k < reg_max; ++k) {
+        float v = base[k * hw + idx];
+        if (v > max_val) {
+            max_val = v;
         }
-    } else {
-        // HWC format: [1, 8400/25200, 84/85]
-        for (int i = 0; i < cfg.num_boxes; ++i) {
-            const float* row = output + i * cfg.box_dim;
+    }
+    float sum = 0.0f;
+    float acc = 0.0f;
+    for (int k = 0; k < reg_max; ++k) {
+        float v = base[k * hw + idx];
+        float exp_v = std::exp(v - max_val);
+        sum += exp_v;
+        acc += exp_v * static_cast<float>(k);
+    }
+    if (sum <= 0.0f) {
+        return 0.0f;
+    }
+    return acc / sum;
+}
 
-            float obj_conf = cfg.has_objectness ? row[4] : 1.0f;
-            if (obj_conf < conf_thres) continue;
+std::vector<YoloV8Head> collect_yolov8_heads(
+    const std::vector<std::vector<float>>& outputs,
+    const std::vector<std::vector<int64_t>>& shapes,
+    int input_w,
+    int input_h,
+    const YoloV8Params& params) {
+    if (outputs.size() != shapes.size()) {
+        throw std::runtime_error("YOLOv8 head output count mismatch");
+    }
+    if (outputs.size() < params.strides.size() * 2) {
+        throw std::runtime_error("YOLOv8 head outputs missing");
+    }
 
-            // Find max class score
-            float max_cls_conf = 0;
-            int cls_id = 0;
-            const float* cls_scores = row + cls_start;
-            for (int c = 0; c < num_classes; ++c) {
-                if (cls_scores[c] > max_cls_conf) {
-                    max_cls_conf = cls_scores[c];
-                    cls_id = c;
-                }
+    struct HeadSlot {
+        int stride = 0;
+        int h = 0;
+        int w = 0;
+        const float* reg = nullptr;
+        const float* cls = nullptr;
+    };
+
+    std::vector<HeadSlot> slots;
+    slots.reserve(params.strides.size());
+    for (int stride : params.strides) {
+        if (stride <= 0 || input_w % stride != 0 || input_h % stride != 0) {
+            throw std::runtime_error("YOLOv8 stride not aligned with input size");
+        }
+        slots.push_back({stride, input_h / stride, input_w / stride, nullptr, nullptr});
+    }
+
+    int reg_channels = params.reg_channels();
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        const auto& shape = shapes[i];
+        if (shape.size() != 4 || shape[0] != 1) {
+            throw std::runtime_error("YOLOv8 head output rank mismatch");
+        }
+        int c = static_cast<int>(shape[1]);
+        int h = static_cast<int>(shape[2]);
+        int w = static_cast<int>(shape[3]);
+
+        HeadSlot* slot = nullptr;
+        for (auto& s : slots) {
+            if (s.h == h && s.w == w) {
+                slot = &s;
+                break;
             }
-
-            float final_score = obj_conf * max_cls_conf;
-            if (final_score < conf_thres) continue;
-
-            Detection det{
-                row[0] - row[2] * 0.5f,
-                row[1] - row[3] * 0.5f,
-                row[2], row[3],
-                final_score, cls_id
-            };
-            proposals.push_back(det);
+        }
+        if (!slot) {
+            throw std::runtime_error("YOLOv8 head output shape mismatch");
+        }
+        if (c == reg_channels) {
+            if (slot->reg) {
+                throw std::runtime_error("YOLOv8 head regression duplicate");
+            }
+            slot->reg = outputs[i].data();
+        } else if (c == params.num_classes) {
+            if (slot->cls) {
+                throw std::runtime_error("YOLOv8 head class duplicate");
+            }
+            slot->cls = outputs[i].data();
+        } else {
+            throw std::runtime_error("YOLOv8 head channel mismatch");
         }
     }
 
-    // Perform NMS on letterbox coordinates
-    auto final_boxes = nms(proposals, iou_thres);
+    std::vector<YoloV8Head> heads;
+    heads.reserve(slots.size());
+    for (const auto& slot : slots) {
+        if (!slot.reg || !slot.cls) {
+            throw std::runtime_error("YOLOv8 head missing tensors");
+        }
+        heads.push_back({slot.h, slot.w, slot.stride, slot.reg, slot.cls});
+    }
 
-    // Restore coordinates to original image space (only for final detections)
-    // This is more efficient than restoring all proposals (typically 100-500 boxes)
+    return heads;
+}
+
+std::vector<Detection> postprocess_yolov8_heads(
+    const std::vector<YoloV8Head>& heads,
+    const YoloV8Params& params,
+    int input_w,
+    int input_h,
+    const PreprocessMeta& meta,
+    float conf_thres,
+    float iou_thres) {
+    std::vector<std::vector<Detection>> per_class(
+        static_cast<size_t>(params.num_classes));
+    float inverse_th = std::log(conf_thres / (1.0f - conf_thres));
+    float input_w_f = static_cast<float>(input_w);
+    float input_h_f = static_cast<float>(input_h);
+
+    for (const auto& head : heads) {
+        int hw = head.h * head.w;
+        for (int idx = 0; idx < hw; ++idx) {
+            float max_logit = -std::numeric_limits<float>::infinity();
+            int best_class = -1;
+            for (int c = 0; c < params.num_classes; ++c) {
+                float logit = head.cls[c * hw + idx];
+                if (logit > max_logit) {
+                    max_logit = logit;
+                    best_class = c;
+                }
+            }
+            if (max_logit < inverse_th || best_class < 0) {
+                continue;
+            }
+            float best_score = sigmoid(max_logit);
+
+            float left = dfl_distance(head.reg, 0, params.reg_max, idx, hw) * head.stride;
+            float top = dfl_distance(head.reg, 1, params.reg_max, idx, hw) * head.stride;
+            float right = dfl_distance(head.reg, 2, params.reg_max, idx, hw) * head.stride;
+            float bottom = dfl_distance(head.reg, 3, params.reg_max, idx, hw) * head.stride;
+
+            int x = idx % head.w;
+            int y = idx / head.w;
+            float cx = (static_cast<float>(x) + 0.5f) * head.stride;
+            float cy = (static_cast<float>(y) + 0.5f) * head.stride;
+
+            float x1 = std::max(0.0f, std::min(cx - left, input_w_f));
+            float y1 = std::max(0.0f, std::min(cy - top, input_h_f));
+            float x2 = std::max(0.0f, std::min(cx + right, input_w_f));
+            float y2 = std::max(0.0f, std::min(cy + bottom, input_h_f));
+
+            if (x2 <= x1 || y2 <= y1) {
+                continue;
+            }
+
+            Detection det{
+                x1,
+                y1,
+                x2 - x1,
+                y2 - y1,
+                best_score,
+                best_class
+            };
+            per_class[static_cast<size_t>(best_class)].push_back(det);
+        }
+    }
+
+    std::vector<Detection> final_boxes;
+    for (auto& class_boxes : per_class) {
+        if (class_boxes.empty()) {
+            continue;
+        }
+        auto class_nms = nms(class_boxes, iou_thres);
+        final_boxes.insert(final_boxes.end(), class_nms.begin(), class_nms.end());
+    }
+
     for (auto& det : final_boxes) {
         restore_coords(det, meta);
     }
+    return final_boxes;
+}
 
+std::vector<Detection> postprocess_yolov8_fused(
+    const std::vector<float>& output,
+    const std::vector<int64_t>& shape,
+    const PreprocessMeta& meta,
+    float conf_thres,
+    float iou_thres) {
+    if (shape.size() != 3 || shape[0] != 1 || shape[1] != 84) {
+        throw std::runtime_error("YOLOv8 fused output shape mismatch");
+    }
+    int num_boxes = static_cast<int>(shape[2]);
+    int box_dim = static_cast<int>(shape[1]);
+    if (static_cast<int64_t>(output.size()) != shape[1] * shape[2]) {
+        throw std::runtime_error("YOLOv8 fused output size mismatch");
+    }
+
+    const float* cx_ptr = output.data() + 0 * num_boxes;
+    const float* cy_ptr = output.data() + 1 * num_boxes;
+    const float* w_ptr = output.data() + 2 * num_boxes;
+    const float* h_ptr = output.data() + 3 * num_boxes;
+
+    std::vector<Detection> proposals;
+    proposals.reserve(static_cast<size_t>(num_boxes / 10));
+
+    int num_classes = box_dim - 4;
+    for (int i = 0; i < num_boxes; ++i) {
+        float max_cls_conf = 0.0f;
+        int cls_id = 0;
+        for (int c = 0; c < num_classes; ++c) {
+            float conf = output[(4 + c) * num_boxes + i];
+            if (conf > max_cls_conf) {
+                max_cls_conf = conf;
+                cls_id = c;
+            }
+        }
+        if (max_cls_conf < conf_thres) {
+            continue;
+        }
+
+        Detection det{
+            cx_ptr[i] - w_ptr[i] * 0.5f,
+            cy_ptr[i] - h_ptr[i] * 0.5f,
+            w_ptr[i],
+            h_ptr[i],
+            max_cls_conf,
+            cls_id
+        };
+        proposals.push_back(det);
+    }
+
+    auto final_boxes = nms(proposals, iou_thres);
+    for (auto& det : final_boxes) {
+        restore_coords(det, meta);
+    }
     return final_boxes;
 }
 
@@ -301,15 +537,16 @@ void draw_detections(cv::Mat& frame, const std::vector<Detection>& detections) {
 // ============ Utilities ============
 
 void print_usage(const char* prog) {
-    std::cout << "Usage: " << prog << " <model.onnx> <input> [show] [save=output.mp4] [frames=N]\n";
+    std::cout << "Usage: " << prog << " <model.onnx|model.cvimodel> <input> [show] [save=output.mp4] [frames=N]\n";
     std::cout << "\nInput: image (.jpg, .png) or video (.mp4, .avi)\n";
     std::cout << "Options:\n";
     std::cout << "  show         - Display results\n";
     std::cout << "  save=FILE    - Save output video\n";
     std::cout << "  frames=N     - Process first N frames only\n";
-    std::cout << "\nExamples:\n";
-    std::cout << "  " << prog << " yolo11n.onnx image.jpg show\n";
-    std::cout << "  " << prog << " yolov5n.onnx video.mp4 show save=out.mp4\n";
+    std::cout << "  profile      - Print detailed timing breakdown\n";
+    std::cout << "\nModel expectations:\n";
+    std::cout << "  .cvimodel: YOLOv8 head outputs (6 tensors: 3 reg + 3 cls)\n";
+    std::cout << "  .onnx: YOLOv8 fused output with shape [1,84,N]\n";
 }
 
 // ============ Main ============
@@ -326,12 +563,17 @@ int main(int argc, char* argv[]) {
     bool show_result = false;
     std::string save_path = "";
     int max_frames = -1;
+    bool profile = false;
+    float conf_thres = CONF_THRES;
+    float iou_thres = IOU_THRES;
 
     // Parse options
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "show") {
             show_result = true;
+        } else if (arg == "profile") {
+            profile = true;
         } else if (arg.find("save=") == 0) {
             save_path = arg.substr(5);
         } else if (arg.find("frames=") == 0) {
@@ -339,36 +581,135 @@ int main(int argc, char* argv[]) {
         }
     }
 
+#if defined(USE_CVI_TPU)
+    if (show_result) {
+        std::cout << "[WARN] Display not supported on SG200X SDK, disabling show.\n";
+        show_result = false;
+    }
+#endif
+
     try {
         // Load model
         std::cout << "Loading model: " << model_path << "\n";
-        inference::OnnxSession session(model_path, 4);
+        auto session = inference::create_session(model_path, 4);
+        std::cout << "Backend: " << session->backend_name() << "\n";
+
+        auto model_input_shape = session->get_input_shape(0);
+        auto input_layout = inference::infer_layout(model_input_shape);
+        if (input_layout == inference::Layout::Unknown) {
+            input_layout = inference::Layout::NCHW;
+        }
+
+        int input_h = INPUT_H;
+        int input_w = INPUT_W;
+        if (model_input_shape.size() == 4) {
+            if (input_layout == inference::Layout::NCHW) {
+                if (model_input_shape[2] > 0) input_h = static_cast<int>(model_input_shape[2]);
+                if (model_input_shape[3] > 0) input_w = static_cast<int>(model_input_shape[3]);
+            } else if (input_layout == inference::Layout::NHWC) {
+                if (model_input_shape[1] > 0) input_h = static_cast<int>(model_input_shape[1]);
+                if (model_input_shape[2] > 0) input_w = static_cast<int>(model_input_shape[2]);
+            }
+        }
+
+        std::vector<int64_t> run_shape = (input_layout == inference::Layout::NHWC)
+            ? std::vector<int64_t>{1, input_h, input_w, 3}
+            : std::vector<int64_t>{1, 3, input_h, input_w};
+
+        ModelKind model_kind = model_kind_from_path(model_path);
+        YoloV8Params yolo_params;
+
+#ifdef USE_CVI_TPU
+        auto* cvi_session = dynamic_cast<inference::CviSession*>(session.get());
+        if (model_kind == ModelKind::YoloV8Head && !cvi_session) {
+            throw std::runtime_error("CVI model requires TPU backend");
+        }
+        if (model_kind == ModelKind::YoloV8Head &&
+            cvi_session->output_count() != static_cast<int>(yolo_params.strides.size() * 2)) {
+            throw std::runtime_error("YOLOv8 head model expects 6 output tensors");
+        }
+#else
+        if (model_kind == ModelKind::YoloV8Head) {
+            throw std::runtime_error("CVI model requires TPU backend");
+        }
+#endif
+
+        PreprocessParams preprocess_params =
+            (model_kind == ModelKind::YoloV8Head) ? tdl_yolov8_preprocess_params()
+                                                  : default_preprocess_params();
+
+        std::cout << "Model input shape: " << shape_to_string(model_input_shape)
+                  << " layout=" << inference::layout_name(input_layout) << "\n";
+        std::cout << "Preprocess: swap_rb=" << (preprocess_params.swap_rb ? "true" : "false")
+                  << " mean=(" << preprocess_params.mean[0] << ", "
+                  << preprocess_params.mean[1] << ", " << preprocess_params.mean[2] << ")"
+                  << " scale=(" << preprocess_params.scale[0] << ", "
+                  << preprocess_params.scale[1] << ", " << preprocess_params.scale[2] << ")"
+                  << " pad=" << preprocess_params.pad_value
+                  << ((model_kind == ModelKind::YoloV8Head) ? " (tdl_yolov8)" : "") << "\n";
+        std::cout << "Postprocess: conf=" << std::fixed << std::setprecision(2) << conf_thres
+                  << " iou=" << iou_thres << "\n";
 
         // Lambda for inference (image mode)
-        auto infer_func = [&](const cv::Mat& frame) -> std::vector<Detection> {
+        auto infer_func = [&](const cv::Mat& frame, TimingBreakdown* timing) -> std::vector<Detection> {
+            auto t0 = std::chrono::high_resolution_clock::now();
             // 1. Preprocess
             cv::Mat padded;
-            auto meta = letterbox_resize(frame, padded, INPUT_W, INPUT_H, STRIDE, 114);
+            auto meta = letterbox_resize(frame, padded, input_w, input_h, STRIDE,
+                                         static_cast<uint8_t>(preprocess_params.pad_value));
+            auto t1 = std::chrono::high_resolution_clock::now();
             std::vector<float> blob;
-            hwc_to_chw_bgr2rgb(padded, blob);
+            hwc_to_blob(padded, blob, input_layout, preprocess_params);
+            auto t2 = std::chrono::high_resolution_clock::now();
 
-            // 2. Inference
-            auto [output, shape] = session.run(blob.data(), {1, 3, INPUT_H, INPUT_W});
-
-            // 3. Postprocess (auto-detect and cache YOLO config)
-            static YoloConfig cached_cfg;
-            static bool first_run = true;
-            if (first_run) {
-                cached_cfg = YoloConfig::detect(shape);
-                cached_cfg.print();
-                std::cout << "\n";
-                first_run = false;
+            std::vector<Detection> results;
+            std::chrono::high_resolution_clock::time_point t3;
+            if (model_kind == ModelKind::YoloV8Head) {
+#ifdef USE_CVI_TPU
+                std::vector<std::vector<float>> outputs;
+                std::vector<std::vector<int64_t>> shapes;
+                cvi_session->run_all(blob.data(), run_shape, &outputs, &shapes);
+                t3 = std::chrono::high_resolution_clock::now();
+                auto heads = collect_yolov8_heads(outputs, shapes, input_w, input_h, yolo_params);
+                results = postprocess_yolov8_heads(
+                    heads, yolo_params, input_w, input_h, meta, conf_thres, iou_thres);
+#else
+                throw std::runtime_error("CVI model requires TPU backend");
+#endif
+            } else {
+                auto out_pair = session->run(blob.data(), run_shape);
+                t3 = std::chrono::high_resolution_clock::now();
+                results = postprocess_yolov8_fused(
+                    out_pair.first, out_pair.second, meta, conf_thres, iou_thres);
             }
-
-            return postprocess_yolo(output.data(), cached_cfg, meta, CONF_THRES, IOU_THRES);
+            auto t4 = std::chrono::high_resolution_clock::now();
+            if (timing) {
+                timing->preprocess_ms =
+                    std::chrono::duration<double, std::milli>(t2 - t0).count();
+                timing->inference_ms =
+                    std::chrono::duration<double, std::milli>(t3 - t2).count();
+                timing->postprocess_ms =
+                    std::chrono::duration<double, std::milli>(t4 - t3).count();
+                timing->resize_ms =
+                    std::chrono::duration<double, std::milli>(t1 - t0).count();
+                timing->blob_ms =
+                    std::chrono::duration<double, std::milli>(t2 - t1).count();
+#ifdef USE_CVI_TPU
+                if (model_kind == ModelKind::YoloV8Head) {
+                    const auto& stats = cvi_session->last_run_stats();
+                    timing->cvi_input_ms = stats.input_ms;
+                    timing->cvi_forward_ms = stats.forward_ms;
+                    timing->cvi_output_ms = stats.output_ms;
+                }
+#endif
+            }
+            return results;
         };
 
         if (is_video_file(input_path)) {
+#if defined(USE_CVI_TPU)
+            throw std::runtime_error("Video input not supported on SG200X SDK (no OpenCV videoio)");
+#else
             // ========== Video inference ==========
             cv::VideoCapture cap(input_path);
             if (!cap.isOpened()) {
@@ -398,28 +739,34 @@ int main(int argc, char* argv[]) {
 
             // Pre-allocate buffers for video processing (avoid per-frame allocation)
             cv::Mat padded_buffer;
-            std::vector<float> blob_buffer(3 * INPUT_H * INPUT_W);
+            std::vector<float> blob_buffer(3 * input_h * input_w);
 
             // Optimized video inference lambda (uses pre-allocated buffers + cached config)
             auto video_infer_func = [&](const cv::Mat& frame) -> std::vector<Detection> {
                 // 1. Preprocess (reuse buffers)
-                auto meta = letterbox_resize(frame, padded_buffer, INPUT_W, INPUT_H, STRIDE, 114);
-                hwc_to_chw_bgr2rgb(padded_buffer, blob_buffer, true);  // true = pre-allocated
+                auto meta = letterbox_resize(frame, padded_buffer, input_w, input_h, STRIDE,
+                                             static_cast<uint8_t>(preprocess_params.pad_value));
+                hwc_to_blob(padded_buffer, blob_buffer, input_layout, preprocess_params, true);
 
-                // 2. Inference
-                auto [output, shape] = session.run(blob_buffer.data(), {1, 3, INPUT_H, INPUT_W});
-
-                // 3. Postprocess (cache YOLO config to avoid repeated detection)
-                static YoloConfig cached_cfg;
-                static bool first_run = true;
-                if (first_run) {
-                    cached_cfg = YoloConfig::detect(shape);
-                    cached_cfg.print();
-                    std::cout << "\n";
-                    first_run = false;
+                std::vector<Detection> results;
+                if (model_kind == ModelKind::YoloV8Head) {
+#ifdef USE_CVI_TPU
+                    std::vector<std::vector<float>> outputs;
+                    std::vector<std::vector<int64_t>> shapes;
+                    cvi_session->run_all(blob_buffer.data(), run_shape, &outputs, &shapes);
+                    auto heads = collect_yolov8_heads(outputs, shapes, input_w, input_h, yolo_params);
+                    results = postprocess_yolov8_heads(
+                        heads, yolo_params, input_w, input_h, meta, conf_thres, iou_thres);
+#else
+                    throw std::runtime_error("CVI model requires TPU backend");
+#endif
+                } else {
+                    auto out_pair = session->run(blob_buffer.data(), run_shape);
+                    results = postprocess_yolov8_fused(
+                        out_pair.first, out_pair.second, meta, conf_thres, iou_thres);
                 }
 
-                return postprocess_yolo(output.data(), cached_cfg, meta, CONF_THRES, IOU_THRES);
+                return results;
             };
 
             std::cout << "Processing video...\n\n";
@@ -497,6 +844,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "\nOutput saved: " << save_path << "\n";
             }
             if (show_result) cv::destroyAllWindows();
+#endif
 
         } else {
             // ========== Image inference ==========
@@ -507,12 +855,24 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "Image size: " << img.cols << "x" << img.rows << "\n\n";
 
-            auto start = std::chrono::high_resolution_clock::now();
-            auto results = infer_func(img);
-            auto end = std::chrono::high_resolution_clock::now();
-
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-            std::cout << "Inference time: " << elapsed << " ms\n";
+            TimingBreakdown timing;
+            auto results = infer_func(img, &timing);
+            double total_ms = timing.preprocess_ms + timing.inference_ms + timing.postprocess_ms;
+            std::cout << "Timing (ms): preprocess=" << std::fixed << std::setprecision(2)
+                      << timing.preprocess_ms << ", inference=" << timing.inference_ms
+                      << ", postprocess=" << timing.postprocess_ms
+                      << ", total=" << total_ms << "\n";
+            if (profile) {
+                std::cout << "  preprocess detail (ms): resize=" << timing.resize_ms
+                          << ", blob=" << timing.blob_ms << "\n";
+#ifdef USE_CVI_TPU
+                if (model_kind == ModelKind::YoloV8Head) {
+                    std::cout << "  cvi detail (ms): input=" << timing.cvi_input_ms
+                              << ", forward=" << timing.cvi_forward_ms
+                              << ", output=" << timing.cvi_output_ms << "\n";
+                }
+#endif
+            }
 
             print_results(results);
 
@@ -524,11 +884,13 @@ int main(int argc, char* argv[]) {
                     std::cout << "\nResult saved: " << save_path << "\n";
                 }
 
+#if !defined(USE_CVI_TPU)
                 if (show_result) {
                     cv::imshow("Result", img);
                     std::cout << "Press any key to exit...\n";
                     cv::waitKey(0);
                 }
+#endif
             }
         }
 

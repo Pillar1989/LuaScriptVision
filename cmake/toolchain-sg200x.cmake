@@ -52,9 +52,17 @@ set(RISCV_FLAGS "-mcpu=c906fdv -march=rv64gcv0p7_zfh_xthead -mabi=lp64d")
 set(CMAKE_C_FLAGS_INIT "${RISCV_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${RISCV_FLAGS}")
 
-# Release optimization (LTO disabled due to cross-compilation linking issues)
-set(CMAKE_C_FLAGS_RELEASE_INIT "-O3 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3 -DNDEBUG")
+# Release optimization (required for TPU performance)
+set(CMAKE_C_FLAGS_RELEASE_INIT "-O3 -DNDEBUG -flto")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3 -DNDEBUG -flto")
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE_INIT "-flto")
+set(CMAKE_SHARED_LINKER_FLAGS_RELEASE_INIT "-flto")
+
+# Default to Release unless explicitly specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE not set, defaulting to Release")
+endif()
 
 # =============================================================================
 # Sophgo TPU SDK Paths

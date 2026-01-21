@@ -276,36 +276,55 @@ if(USE_ONNX_RUNTIME)
 endif()
 
 # ==========================================================
-# 5. Pure C++ Inference App (only with ONNX Runtime)
+# 5. Pure C++ Inference App (ONNX Runtime or CVI Runtime)
 # ==========================================================
+add_executable(cpp_infer
+    src/cpp_main.cpp
+    ${INFERENCE_SOURCES}
+)
+
+target_link_libraries(cpp_infer PRIVATE
+    ${OpenCV_LIBS}
+)
+
+target_include_directories(cpp_infer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${OpenCV_INCLUDE_DIRS}
+)
+
 if(USE_ONNX_RUNTIME)
-    add_executable(cpp_infer
-        src/cpp_main.cpp
-        ${INFERENCE_SOURCES}
-    )
-
-    target_link_libraries(cpp_infer PRIVATE
-        ${OpenCV_LIBS}
-        onnxruntime
-    )
-
-    target_include_directories(cpp_infer PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        ${OpenCV_INCLUDE_DIRS}
-        ${ONNXRUNTIME_INCLUDE_DIRS}
-    )
-
-    if(UNIX AND NOT APPLE)
-        target_link_libraries(cpp_infer PRIVATE dl)
-    endif()
+    target_link_libraries(cpp_infer PRIVATE onnxruntime)
+    target_include_directories(cpp_infer PRIVATE ${ONNXRUNTIME_INCLUDE_DIRS})
 
     set_target_properties(cpp_infer PROPERTIES
         BUILD_RPATH "${ONNXRUNTIME_LIB_DIR}"
         INSTALL_RPATH "${ONNXRUNTIME_LIB_DIR}"
     )
-
-    message(STATUS "cpp_infer: ONNX Runtime benchmark enabled")
+else()
+    target_sources(cpp_infer PRIVATE
+        src/modules/tensor/cvi_tpu_memory.cpp
+    )
+    target_include_directories(cpp_infer PRIVATE ${TPU_INCLUDE_DIR})
+    target_link_directories(cpp_infer PRIVATE ${TPU_LIB_DIR})
+    target_link_libraries(cpp_infer PRIVATE
+        -static
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
 endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(cpp_infer PRIVATE dl)
+endif()
+
+message(STATUS "cpp_infer: inference benchmark enabled")
 
 # ==========================================================
 # 6. Test Programs for SG200X

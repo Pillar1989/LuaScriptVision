@@ -6,7 +6,9 @@
 #include <string>
 
 #include "LuaIntf.h"
-#include "inference/inference.h"
+#ifdef USE_ONNX_RUNTIME
+#include "inference/onnx_session.h"
+#endif
 
 // 使用 tensor 模块的 Tensor 类
 #include "tensor/tensor.h"

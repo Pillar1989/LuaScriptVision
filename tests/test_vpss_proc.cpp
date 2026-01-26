@@ -1,210 +1,284 @@
 /**
  * test_vpss_proc.cpp - CviVpssProcessor hardware acceleration tests
- *
- * Tests VPSS hardware backend:
- * - VIDEO_FRAME creation and conversion
- * - Hardware resize operations
- * - Hardware color conversion
- * - Hardware crop operations
- * - Zero-copy performance
  */
 
 #include "test_common.h"
+#include <stdexcept>
 
 #ifdef USE_CVI_MPI
 
-void run_vpss_tests(TestSuite& suite) {
-    std::cout << "\n[Test 4] CviVpssProcessor Hardware Acceleration" << std::endl;
+namespace {
+void require_cvi_ready() {
+    if (!is_cvi_ready()) {
+        GTEST_SKIP() << "CVI system not initialized";
+    }
+}
+
+uint8_t read_plane_byte(const VIDEO_FRAME_INFO_S& frame, int plane) {
+    if (plane < 0 || plane >= 3) {
+        throw std::invalid_argument("read_plane_byte - invalid plane index");
+    }
+    CVI_U64 phys = frame.stVFrame.u64PhyAddr[plane];
+    if (phys == 0) {
+        throw std::runtime_error("read_plane_byte - missing physical address");
+    }
+    CVI_U32 length = frame.stVFrame.u32Length[plane];
+    if (length == 0) {
+        CVI_U32 stride = frame.stVFrame.u32Stride[plane];
+        if (stride == 0) {
+            stride = frame.stVFrame.u32Stride[0];
+        }
+        length = stride * frame.stVFrame.u32Height;
+    }
+    if (length == 0) {
+        throw std::runtime_error("read_plane_byte - invalid plane length");
+    }
+    void* mapped = CVI_SYS_MmapCache(phys, length);
+    if (!mapped) {
+        throw std::runtime_error("read_plane_byte - CVI_SYS_MmapCache failed");
+    }
+    CVI_SYS_IonInvalidateCache(phys, mapped, length);
+    uint8_t value = static_cast<uint8_t*>(mapped)[0];
+    CVI_SYS_Munmap(mapped, length);
+    return value;
+}
+}
+
+TEST(VpssProcessorTest, MatToVideoFrame) {
+    require_cvi_ready();
+
+    cv::Mat mat = create_test_image(640, 480);
+    Frame frame(mat);
+
+    EXPECT_EQ(frame.storage_type(), Frame::StorageType::OPENCV);
+}
+
+TEST(VpssProcessorTest, ResizeDownscale) {
+    require_cvi_ready();
 
     CviVpssProcessor processor;
-    Timer timer;
+    cv::Mat mat = create_test_image(1280, 720);
 
-    // Test 4.1: Mat to VIDEO_FRAME conversion
-    timer.start();
-    {
-        cv::Mat mat = create_test_image(640, 480);
-
-        // Convert to VIDEO_FRAME - just create Frame from Mat
-        bool convert_ok = false;
-        try {
-            Frame frame(mat);
-            convert_ok = (frame.storage_type() == Frame::StorageType::OPENCV);
-        } catch (const std::exception& e) {
-            suite.add_result("VPSS mat to VIDEO_FRAME", false, timer.elapsed_ms(), e.what());
-            return;
-        }
-
-        suite.add_result("VPSS mat to VIDEO_FRAME", convert_ok, timer.elapsed_ms());
+    VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
 
-    // Test 4.2: Hardware resize (downscale)
-    timer.start();
-    {
-        cv::Mat mat = create_test_image(1280, 720);  // Use 720p instead of 1080p
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
 
-        VB_BLK vb_block;
-        VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
-        VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
-        Frame frame(video_frame, false);  // owns_memory=false
+    processor.resize(frame, 640, 640);
 
-        processor.resize(frame, 640, 640);
+    EXPECT_EQ(frame.width(), 640);
+    EXPECT_EQ(frame.height(), 640);
+}
 
-        CVI_VB_ReleaseBlock(vb_block);
-    }
-    suite.add_result("VPSS resize (1280x720 -> 640x640)", true,
-                   timer.elapsed_ms(),
-                   "Zero-copy hardware acceleration");
+TEST(VpssProcessorTest, ResizeUpscale) {
+    require_cvi_ready();
 
-    // Test 4.3: Hardware resize (upscale)
-    {
-        const int iterations = 3;
-        std::vector<double> times;
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(320, 240);
 
-        for (int i = 0; i < iterations; ++i) {
-            cv::Mat mat = create_test_image(320, 240);
-
-            VB_BLK vb_block;
-            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
-            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
-            Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
-
-            timer.start();
-            processor.resize(frame, 640, 480);
-            times.push_back(timer.elapsed_ms());
-
-            CVI_VB_ReleaseBlock(vb_block);
-        }
-
-        double min_time = *std::min_element(times.begin(), times.end());
-
-        suite.add_result("VPSS resize upscale (320x240 -> 640x480)", true,
-                       min_time,
-                       "Best of " + std::to_string(iterations) + " iterations");
+    VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
 
-    // Test 4.4: Hardware color conversion
-    {
-        const int iterations = 3;
-        std::vector<double> times;
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
 
-        for (int i = 0; i < iterations; ++i) {
-            cv::Mat mat = create_test_image(640, 480);
+    processor.resize(frame, 640, 480);
 
-            VB_BLK vb_block;
-            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
-            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
-            Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
+    EXPECT_EQ(frame.width(), 640);
+    EXPECT_EQ(frame.height(), 480);
+}
 
-            timer.start();
-            processor.cvtColor(frame, ColorConversion::BGR2RGB);
-            times.push_back(timer.elapsed_ms());
+TEST(VpssProcessorTest, CvtColorBgrToRgb) {
+    require_cvi_ready();
 
-            CVI_VB_ReleaseBlock(vb_block);
-        }
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(640, 480);
 
-        double min_time = *std::min_element(times.begin(), times.end());
-
-        suite.add_result("VPSS cvtColor (BGR2RGB)", true, min_time,
-                       "Best of " + std::to_string(iterations) + " iterations");
+    VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
 
-    // Test 4.5: Hardware crop
-    {
-        const int iterations = 3;
-        std::vector<double> times;
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
 
-        for (int i = 0; i < iterations; ++i) {
-            cv::Mat mat = create_test_image(640, 480);
+    processor.cvtColor(frame, ColorConversion::BGR2RGB);
 
-            VB_BLK vb_block;
-            VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
-            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
-            Frame frame(video_frame, false);  // owns_memory=false, USER-allocated VB
+    SUCCEED();
+}
 
-            timer.start();
-            processor.crop(frame, 100, 100, 320, 240);
-            times.push_back(timer.elapsed_ms());
+TEST(VpssProcessorTest, Crop) {
+    require_cvi_ready();
 
-            CVI_VB_ReleaseBlock(vb_block);
-        }
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(640, 480);
 
-        double min_time = *std::min_element(times.begin(), times.end());
-
-        suite.add_result("VPSS crop (640x480 -> 320x240)", true,
-                       min_time,
-                       "Best of " + std::to_string(iterations) + " iterations");
+    VB_POOL vb_pool = find_suitable_vb_pool(mat.cols, mat.rows, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
 
-    // Test 4.6: Physical address mode after VPSS processing
-    timer.start();
-    {
-        cv::Mat mat = create_test_image(640, 480);
-        Frame frame(mat);  // OPENCV type, no physical address initially
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
 
-        // After VPSS processing, should have physical address
-        processor.resize(frame, 320, 240);
+    processor.crop(frame, 100, 100, 320, 240);
 
-        bool phys_ok = frame.has_physical_addr();
-        uint64_t phys_addr = 0;
-        if (phys_ok) {
-            phys_addr = frame.physical_addr();
-        }
+    EXPECT_EQ(frame.width(), 320);
+    EXPECT_EQ(frame.height(), 240);
+}
 
-        suite.add_result("VPSS physical address mode",
-                         phys_ok && phys_addr != 0,
-                         timer.elapsed_ms(),
-                         phys_ok ? "Zero-copy enabled" : "No physical address");
+TEST(VpssProcessorTest, PhysicalAddressAfterResize) {
+    require_cvi_ready();
+
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(640, 480);
+    Frame frame(mat);
+
+    processor.resize(frame, 320, 240);
+
+    EXPECT_TRUE(frame.has_physical_addr());
+    if (frame.has_physical_addr()) {
+        EXPECT_NE(frame.physical_addr(), 0u);
+    }
+}
+
+TEST(VpssProcessorTest, ChainedOperations) {
+    require_cvi_ready();
+
+    CviVpssProcessor processor;
+    uint32_t test_width = 1920;
+    uint32_t test_height = 1080;
+    VB_POOL vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        test_width = 1280;
+        test_height = 720;
+        vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
+    }
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
 
-    // Test 4.7: Multiple operations chaining
-    {
-        uint32_t test_width = 1920;
-        uint32_t test_height = 1080;
-        VB_POOL vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
-        if (vb_pool == VB_INVALID_POOLID) {
-            test_width = 1280;
-            test_height = 720;
-            vb_pool = find_suitable_vb_pool(test_width, test_height, PIXEL_FORMAT_BGR_888);
-        }
+    cv::Mat mat = create_test_image(test_width, test_height);
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
 
-        if (vb_pool == VB_INVALID_POOLID) {
-            suite.add_result("VPSS chained operations", false, 0,
-                           "No suitable VB pool for chained test");
-            return;
-        }
+    processor.resize(frame, 640, 640);
+    processor.cvtColor(frame, ColorConversion::BGR2RGB);
+    processor.crop(frame, 50, 50, 540, 540);
 
-        cv::Mat mat = create_test_image(test_width, test_height);
+    EXPECT_EQ(frame.width(), 540);
+    EXPECT_EQ(frame.height(), 540);
+}
 
-        const int iterations = 3;
-        std::vector<double> times;
+TEST(VpssProcessorTest, LetterboxLandscape) {
+    require_cvi_ready();
 
-        for (int i = 0; i < iterations; ++i) {
-            VB_BLK vb_block;
-            VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
-            Frame frame(video_frame, 0, 0);
+    const int in_w = 1280;
+    const int in_h = 720;
+    const int out_w = 640;
+    const int out_h = 640;
+    const uint8_t pad_value = 114;
 
-            timer.start();
-            processor.resize(frame, 640, 640);
-            processor.cvtColor(frame, ColorConversion::BGR2RGB);
-            processor.crop(frame, 50, 50, 540, 540);
-            times.push_back(timer.elapsed_ms());
-
-            CVI_VB_ReleaseBlock(vb_block);
-        }
-
-        double min_time = *std::min_element(times.begin(), times.end());
-
-        suite.add_result("VPSS chained operations", true,
-                       min_time,
-                       "Best of " + std::to_string(iterations) + " iterations");
+    VB_POOL vb_pool = find_suitable_vb_pool(in_w, in_h, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
     }
+
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(in_w, in_h);
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
+
+    CviVpssProcessor::LetterboxMeta meta;
+    processor.letterbox(frame, out_w, out_h, pad_value, &meta);
+
+    EXPECT_EQ(frame.width(), out_w);
+    EXPECT_EQ(frame.height(), out_h);
+    EXPECT_EQ(frame.pixel_format(), PixelFormat::RGB_PLANAR);
+
+    const float scale = std::min(static_cast<float>(out_w) / in_w,
+                                 static_cast<float>(out_h) / in_h);
+    const int new_w = static_cast<int>(in_w * scale + 0.5f);
+    const int new_h = static_cast<int>(in_h * scale + 0.5f);
+    EXPECT_NEAR(meta.scale, scale, 0.01f);
+    EXPECT_EQ(meta.pad_x, (out_w - new_w) / 2);
+    EXPECT_EQ(meta.pad_y, (out_h - new_h) / 2);
+    EXPECT_EQ(meta.ori_w, in_w);
+    EXPECT_EQ(meta.ori_h, in_h);
+
+    const VIDEO_FRAME_INFO_S* out_frame = frame.video_frame();
+    ASSERT_NE(out_frame, nullptr);
+    EXPECT_EQ(read_plane_byte(*out_frame, 0), pad_value);
+    EXPECT_EQ(read_plane_byte(*out_frame, 1), pad_value);
+    EXPECT_EQ(read_plane_byte(*out_frame, 2), pad_value);
+}
+
+TEST(VpssProcessorTest, LetterboxPortrait) {
+    require_cvi_ready();
+
+    const int in_w = 480;
+    const int in_h = 640;
+    const int out_w = 640;
+    const int out_h = 640;
+    const uint8_t pad_value = 114;
+
+    VB_POOL vb_pool = find_suitable_vb_pool(in_w, in_h, PIXEL_FORMAT_BGR_888);
+    if (vb_pool == VB_INVALID_POOLID) {
+        GTEST_SKIP() << "No suitable VB pool";
+    }
+
+    CviVpssProcessor processor;
+    cv::Mat mat = create_test_image(in_w, in_h);
+    VB_BLK vb_block;
+    VIDEO_FRAME_INFO_S video_frame = processor.mat_to_video_frame(mat, vb_block, vb_pool);
+    VbBlockGuard vb_guard(vb_block);
+    Frame frame(video_frame, false);
+
+    CviVpssProcessor::LetterboxMeta meta;
+    processor.letterbox(frame, out_w, out_h, pad_value, &meta);
+
+    EXPECT_EQ(frame.width(), out_w);
+    EXPECT_EQ(frame.height(), out_h);
+    EXPECT_EQ(frame.pixel_format(), PixelFormat::RGB_PLANAR);
+
+    const float scale = std::min(static_cast<float>(out_w) / in_w,
+                                 static_cast<float>(out_h) / in_h);
+    const int new_w = static_cast<int>(in_w * scale + 0.5f);
+    const int new_h = static_cast<int>(in_h * scale + 0.5f);
+    EXPECT_NEAR(meta.scale, scale, 0.01f);
+    EXPECT_EQ(meta.pad_x, (out_w - new_w) / 2);
+    EXPECT_EQ(meta.pad_y, (out_h - new_h) / 2);
+    EXPECT_EQ(meta.ori_w, in_w);
+    EXPECT_EQ(meta.ori_h, in_h);
+
+    const VIDEO_FRAME_INFO_S* out_frame = frame.video_frame();
+    ASSERT_NE(out_frame, nullptr);
+    EXPECT_EQ(read_plane_byte(*out_frame, 0), pad_value);
+    EXPECT_EQ(read_plane_byte(*out_frame, 1), pad_value);
+    EXPECT_EQ(read_plane_byte(*out_frame, 2), pad_value);
 }
 
 #else
 
-void run_vpss_tests(TestSuite& suite) {
-    std::cout << "\n[Test 4] CviVpssProcessor Hardware Acceleration" << std::endl;
-    std::cout << "  ⊘  VPSS tests skipped (USE_CVI_MPI not defined)" << std::endl;
+TEST(VpssProcessorTest, Skipped) {
+    GTEST_SKIP() << "USE_CVI_MPI not defined";
 }
 
 #endif

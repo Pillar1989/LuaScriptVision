@@ -10,6 +10,8 @@
 #include <cstring>
 #include <sstream>
 #include <unistd.h>
+#include <fstream>
+#include <chrono>
 #include "mmf_context.h"
 #endif
 
@@ -24,11 +26,61 @@ HwJpegDecoder::~HwJpegDecoder() {
 }
 
 #ifdef USE_CVI_MPI
+namespace {
+void dump_proc_file(const char* path, size_t max_bytes) {
+    std::ifstream file(path);
+    if (!file) {
+        std::cerr << "[WARN] HwJpegDecoder: cannot read " << path << std::endl;
+        return;
+    }
+
+    std::ostringstream oss;
+    std::string line;
+    size_t total = 0;
+    while (std::getline(file, line)) {
+        if (total + line.size() + 1 > max_bytes) {
+            line.resize(max_bytes - total);
+        }
+        oss << line << "\n";
+        total += line.size() + 1;
+        if (total >= max_bytes) {
+            break;
+        }
+    }
+    std::cerr << "[INFO] " << path << "\n" << oss.str() << std::endl;
+}
+
+void log_vdec_status(VDEC_CHN chn) {
+    VDEC_CHN_STATUS_S status{};
+    CVI_S32 rc = CVI_VDEC_QueryStatus(chn, &status);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] HwJpegDecoder: CVI_VDEC_QueryStatus failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+    } else {
+        std::cerr << "[INFO] VDEC status chn=" << chn
+                  << " left_bytes=" << status.u32LeftStreamBytes
+                  << " left_frames=" << status.u32LeftStreamFrames
+                  << " left_pics=" << status.u32LeftPics
+                  << " recv=" << status.u32RecvStreamFrames
+                  << " decoded=" << status.u32DecodeStreamFrames
+                  << " size=" << status.u32Width << "x" << status.u32Height
+                  << " err_picbuf=" << status.stVdecDecErr.s32PicBufSizeErrSet
+                  << " err_stream=" << status.stVdecDecErr.s32StreamUnsprt
+                  << std::endl;
+    }
+}
+}  // namespace
+
 bool HwJpegDecoder::init(uint32_t max_width, uint32_t max_height) {
     if (initialized_) {
         return true;
     }
     if (!MmfContext::instance().is_initialized()) {
+        return false;
+    }
+    if (!MmfContext::is_supported_image_size(max_width, max_height)) {
+        std::cerr << "[ERROR] HwJpegDecoder: unsupported image resolution "
+                  << max_width << "x" << max_height << std::endl;
         return false;
     }
 
@@ -84,15 +136,15 @@ VIDEO_FRAME_INFO_S HwJpegDecoder::decode_sync(const uint8_t* data, size_t size) 
         throw std::runtime_error("HwJpegDecoder::decode_sync - decoder not initialized");
     }
 
-    size_t start = 0;
-    size_t end = 0;
-    if (!find_jpeg_range(data, size, start, end)) {
+    size_t jpeg_start = 0;
+    size_t jpeg_end = 0;
+    if (!find_jpeg_range(data, size, jpeg_start, jpeg_end)) {
         throw std::runtime_error("HwJpegDecoder::decode_sync - invalid JPEG data");
     }
 
     VDEC_STREAM_S stream{};
-    stream.pu8Addr = const_cast<CVI_U8*>(reinterpret_cast<const CVI_U8*>(data + start));
-    stream.u32Len = static_cast<CVI_U32>(end - start);
+    stream.pu8Addr = const_cast<CVI_U8*>(reinterpret_cast<const CVI_U8*>(data + jpeg_start));
+    stream.u32Len = static_cast<CVI_U32>(jpeg_end - jpeg_start);
     stream.u64PTS = 0;
     stream.bEndOfFrame = CVI_TRUE;
     stream.bEndOfStream = CVI_FALSE;
@@ -100,14 +152,21 @@ VIDEO_FRAME_INFO_S HwJpegDecoder::decode_sync(const uint8_t* data, size_t size) 
 
     CVI_S32 rc = CVI_SUCCESS;
     const int send_attempts = 3;
+    const int send_timeout_ms = 200;
     for (int attempt = 0; attempt < send_attempts; ++attempt) {
-        rc = CVI_VDEC_SendStream(chn_, &stream, -1);
+        rc = CVI_VDEC_SendStream(chn_, &stream, send_timeout_ms);
         if (rc == CVI_SUCCESS) {
+            break;
+        }
+        if (rc != CVI_ERR_VDEC_BUF_FULL && rc != CVI_ERR_VDEC_BUSY) {
             break;
         }
         usleep(2000);
     }
     if (rc != CVI_SUCCESS) {
+        log_vdec_status(chn_);
+        dump_proc_file("/proc/cvitek/vdec", 4096);
+        dump_proc_file("/proc/cvitek/vb", 4096);
         std::ostringstream oss;
         oss << "HwJpegDecoder::decode_sync - CVI_VDEC_SendStream failed: 0x"
             << std::hex << rc;
@@ -115,12 +174,32 @@ VIDEO_FRAME_INFO_S HwJpegDecoder::decode_sync(const uint8_t* data, size_t size) 
     }
 
     VIDEO_FRAME_INFO_S frame{};
-    rc = CVI_VDEC_GetFrame(chn_, &frame, -1);
-    if (rc != CVI_SUCCESS) {
-        std::ostringstream oss;
-        oss << "HwJpegDecoder::decode_sync - CVI_VDEC_GetFrame failed: 0x"
-            << std::hex << rc;
-        throw std::runtime_error(oss.str());
+    const int get_timeout_ms = 200;
+    const int64_t max_wait_ms = 5000;
+    auto start_time = std::chrono::steady_clock::now();
+    while (true) {
+        rc = CVI_VDEC_GetFrame(chn_, &frame, get_timeout_ms);
+        if (rc == CVI_SUCCESS) {
+            break;
+        }
+        if (rc != CVI_ERR_VDEC_BUF_EMPTY && rc != CVI_ERR_VDEC_BUSY) {
+            log_vdec_status(chn_);
+            dump_proc_file("/proc/cvitek/vdec", 4096);
+            dump_proc_file("/proc/cvitek/vb", 4096);
+            std::ostringstream oss;
+            oss << "HwJpegDecoder::decode_sync - CVI_VDEC_GetFrame failed: 0x"
+                << std::hex << rc;
+            throw std::runtime_error(oss.str());
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >=
+            max_wait_ms) {
+            log_vdec_status(chn_);
+            dump_proc_file("/proc/cvitek/vdec", 4096);
+            dump_proc_file("/proc/cvitek/vb", 4096);
+            throw std::runtime_error("HwJpegDecoder::decode_sync - timeout waiting for frame");
+        }
     }
 
     return frame;
@@ -170,7 +249,7 @@ bool HwJpegDecoder::configure_channel(uint32_t max_width, uint32_t max_height) {
     attr.u32FrameBufSize = VDEC_GetPicBufferSize(PT_JPEG, max_width, max_height,
                                                  PIXEL_FORMAT_NV21, DATA_BITWIDTH_8,
                                                  COMPRESS_MODE_NONE);
-    attr.u32FrameBufCnt = 1;
+    attr.u32FrameBufCnt = 2;
 
     CVI_S32 rc = CVI_VDEC_CreateChn(chn_, &attr);
     if (rc != CVI_SUCCESS) {

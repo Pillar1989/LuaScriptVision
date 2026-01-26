@@ -52,22 +52,26 @@ VIDEO_FRAME_INFO_S IonImageLoader::load_from_memory(const uint8_t* data, size_t 
 
     release_last_frame();
 
-    if (is_jpeg_format(data, size) && hw_decoder_) {
-        uint32_t jpeg_width = 0;
-        uint32_t jpeg_height = 0;
-        if (get_jpeg_dimensions(data, size, jpeg_width, jpeg_height) &&
-            hw_decoder_->ensure_initialized(jpeg_width, jpeg_height)) {
-            last_hw_frame_ = hw_decoder_->decode_sync(data, size);
-            has_hw_frame_ = true;
-            return last_hw_frame_;
-        }
+    if (!is_jpeg_format(data, size)) {
+        throw std::runtime_error("IonImageLoader::load_from_memory - only JPEG supported");
     }
 
-    if (!decode_with_opencv(data, size)) {
-        throw std::runtime_error("IonImageLoader::load_from_memory - decode failed");
+    if (!hw_decoder_) {
+        throw std::runtime_error("IonImageLoader::load_from_memory - hardware decoder unavailable");
     }
 
-    return last_frame_;
+    uint32_t jpeg_width = 0;
+    uint32_t jpeg_height = 0;
+    if (!get_jpeg_dimensions(data, size, jpeg_width, jpeg_height)) {
+        throw std::runtime_error("IonImageLoader::load_from_memory - failed to parse JPEG header");
+    }
+    if (!hw_decoder_->ensure_initialized(jpeg_width, jpeg_height)) {
+        throw std::runtime_error("IonImageLoader::load_from_memory - VDEC init failed");
+    }
+
+    last_hw_frame_ = hw_decoder_->decode_sync(data, size);
+    has_hw_frame_ = true;
+    return last_hw_frame_;
 }
 
 VIDEO_FRAME_INFO_S IonImageLoader::load_from_memory_fast(const uint8_t* data, size_t size) {
@@ -81,32 +85,32 @@ VIDEO_FRAME_INFO_S IonImageLoader::load_from_memory_fast(const uint8_t* data, si
 
     release_last_frame();
 
-    if (is_jpeg_format(data, size) && hw_decoder_) {
-        if (!hw_decoder_->is_initialized()) {
-            hw_decoder_->init(prealloc_width_, prealloc_height_);
+    if (!is_jpeg_format(data, size)) {
+        throw std::runtime_error("IonImageLoader::load_from_memory_fast - only JPEG supported");
+    }
+
+    if (!hw_decoder_) {
+        throw std::runtime_error("IonImageLoader::load_from_memory_fast - hardware decoder unavailable");
+    }
+
+    uint32_t jpeg_width = 0;
+    uint32_t jpeg_height = 0;
+    if (!get_jpeg_dimensions(data, size, jpeg_width, jpeg_height)) {
+        throw std::runtime_error("IonImageLoader::load_from_memory_fast - failed to parse JPEG header");
+    }
+    if (jpeg_width != prealloc_width_ || jpeg_height != prealloc_height_) {
+        throw std::runtime_error("IonImageLoader::load_from_memory_fast - JPEG size mismatch with preallocated buffer");
+    }
+
+    if (!hw_decoder_->is_initialized()) {
+        if (!hw_decoder_->init(prealloc_width_, prealloc_height_)) {
+            throw std::runtime_error("IonImageLoader::load_from_memory_fast - VDEC init failed");
         }
-        if (hw_decoder_->is_initialized()) {
-            last_hw_frame_ = hw_decoder_->decode_sync(data, size);
-            has_hw_frame_ = true;
-            return last_hw_frame_;
-        }
     }
 
-    cv::Mat mat = cv::imdecode(cv::_InputArray(data, static_cast<int>(size)), cv::IMREAD_COLOR);
-    if (mat.empty()) {
-        throw std::runtime_error("IonImageLoader::load_from_memory_fast - imdecode failed");
-    }
-    if (static_cast<uint32_t>(mat.cols) != prealloc_width_ ||
-        static_cast<uint32_t>(mat.rows) != prealloc_height_ ||
-        static_cast<uint32_t>(mat.channels()) != prealloc_channels_) {
-        throw std::runtime_error("IonImageLoader::load_from_memory_fast - size mismatch with preallocated buffer");
-    }
-
-    if (!decode_into_vb(mat)) {
-        throw std::runtime_error("IonImageLoader::load_from_memory_fast - VB decode failed");
-    }
-
-    return last_frame_;
+    last_hw_frame_ = hw_decoder_->decode_sync(data, size);
+    has_hw_frame_ = true;
+    return last_hw_frame_;
 }
 
 bool IonImageLoader::preallocate(uint32_t width, uint32_t height, uint32_t channels) {

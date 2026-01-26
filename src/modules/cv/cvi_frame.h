@@ -63,6 +63,7 @@ public:
     VIDEO_FRAME_INFO_S* video_frame();
     void set_vpss_owner(int vpss_grp, int vpss_chn);
     void set_vb_owner(VB_BLK vb_block);
+    void set_vdec_owner(int vdec_chn);
 #endif
 
 private:
@@ -81,8 +82,10 @@ private:
     VIDEO_FRAME_INFO_S cvi_frame_{};
     bool owns_vpss_frame_ = false;
     bool owns_vb_block_ = false;
+    bool owns_vdec_frame_ = false;
     int vpss_grp_ = -1;
     int vpss_chn_ = -1;
+    int vdec_chn_ = -1;
     VB_BLK vb_block_ = VB_INVALID_HANDLE;
 #endif
 };

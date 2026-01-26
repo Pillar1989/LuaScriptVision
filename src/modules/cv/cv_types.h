@@ -19,6 +19,7 @@ enum class DeviceType {
 enum class PixelFormat {
     BGR = 0,
     RGB,
+    RGB_PLANAR,
     NV12,
     NV21,
     GRAY,

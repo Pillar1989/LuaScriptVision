@@ -1,10 +1,9 @@
 #include <iostream>
 #include <string>
-#include <chrono>
 #include <iomanip>
+#include <fstream>
 #include <opencv2/opencv.hpp>
 #include "LuaIntf.h"
-#include "main_util.h"
 
 // 模块头文件
 #include "modules/lua_cv.h"
@@ -40,16 +39,12 @@ void print_usage(const char* prog_name) {
     std::cout << "  1. Inference mode: " << prog_name << " <script.lua> <model.onnx> <input> [options]\n";
     std::cout << "  2. Test mode:      " << prog_name << " <test_script.lua>\n";
     std::cout << "\n=== Inference Mode ===\n";
-    std::cout << "Input: image file (.jpg, .png) or video file (.mp4, .avi, .mov)\n";
+    std::cout << "Input: image file (.jpg, .png)\n";
     std::cout << "\nOptions:\n";
     std::cout << "  show          - Display window during processing\n";
-    std::cout << "  save=OUTPUT   - Save output (for video, e.g., save=output.mp4)\n";
-    std::cout << "  frames=N      - Process only first N frames (video only)\n";
-    std::cout << "  skip=N        - Process every Nth frame (video only, default: 1)\n";
+    std::cout << "  save=OUTPUT   - Save output image\n";
     std::cout << "\nInference Examples:\n";
     std::cout << "  " << prog_name << " scripts/yolo11_detector.lua models/yolo11n.onnx images/zidane.jpg show\n";
-    std::cout << "  " << prog_name << " scripts/yolo11_seg.lua models/yolo11n-seg.onnx images/person.mp4 show\n";
-    std::cout << "  " << prog_name << " scripts/yolo11_seg.lua models/yolo11n-seg.onnx video.mp4 save=out.mp4 frames=100\n";
     std::cout << "\n=== Test Mode ===\n";
     std::cout << "Test Examples:\n";
     std::cout << "  " << prog_name << " tests/run_all_tests.lua\n";
@@ -360,8 +355,6 @@ int main(int argc, char* argv[]) {
 
     bool show_result = false;
     std::string save_path = "";
-    int max_frames = -1;
-    int skip_frames = 1;
 
     // 解析可选参数
     for (int i = 4; i < argc; ++i) {
@@ -370,10 +363,6 @@ int main(int argc, char* argv[]) {
             show_result = true;
         } else if (arg.find("save=") == 0) {
             save_path = arg.substr(5);
-        } else if (arg.find("frames=") == 0) {
-            max_frames = std::stoi(arg.substr(7));
-        } else if (arg.find("skip=") == 0) {
-            skip_frames = std::stoi(arg.substr(5));
         }
     }
 
@@ -381,185 +370,40 @@ int main(int argc, char* argv[]) {
         // 初始化推理上下文（共用）
         auto ctx = init_inference(script_path, model_path);
 
-        // 判断是视频还是图片
-        if (is_video_file(input_path)) {
-#ifdef HAVE_OPENCV_VIDEOIO
-            // ========== 视频推理模式 ==========
-            cv::VideoCapture cap(input_path);
-            if (!cap.isOpened()) {
-                throw std::runtime_error("Failed to open video: " + input_path);
-            }
+        // ========== 图片推理模式 ==========
+        std::cout << "Loading image: " << input_path << "\n";
+        auto img = lua_cv::imread(input_path);
+        std::cout << "Image size: " << img.width() << "x" << img.height() << "\n\n";
 
-            int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-            double fps = cap.get(cv::CAP_PROP_FPS);
-            int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-            int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        std::cout << "Preprocessing...\n";
+        std::cout << "Running inference...\n";
+        std::cout << "Postprocessing...\n";
 
-            std::cout << "\n=== Video Info ===\n";
-            std::cout << "Resolution: " << width << "x" << height << "\n";
-            std::cout << "Total frames: " << total_frames << "\n";
-            std::cout << "FPS: " << fps << "\n";
-            std::cout << "Process: every " << skip_frames << " frame(s)\n";
-            if (max_frames > 0) std::cout << "Limit: " << max_frames << " frames\n";
-            std::cout << "\n";
+        LuaIntf::LuaRef detections = run_inference(ctx.get(), img);
 
-            // 设置视频输出
-            cv::VideoWriter writer;
+        print_results(detections);
+
+        if (show_result || !save_path.empty()) {
+            cv::Mat draw_img = cv::imread(input_path);
+            draw_detections(draw_img, detections);
+
             if (!save_path.empty()) {
-                int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-                writer.open(save_path, fourcc, fps / skip_frames, cv::Size(width, height));
-                if (!writer.isOpened()) {
-                    std::cerr << "Warning: Failed to open video writer\n";
-                } else {
-                    std::cout << "Output: " << save_path << "\n\n";
-                }
+                cv::imwrite(save_path, draw_img);
+                std::cout << "\nResult saved to: " << save_path << "\n";
             }
-
-            // 内存监控初始化
-            MemoryInfo mem_start, mem_current, mem_peak;
-            mem_start.update();
-            mem_peak = mem_start;
-
-            std::cout << std::string(70, '=') << "\n";
-            std::cout << "Starting video inference...\n";
-            std::cout << "Initial memory: " << mem_start.to_string() << "\n";
-            std::cout << std::string(70, '=') << "\n\n";
-
-            // 处理视频帧
-            int frame_count = 0, processed_count = 0;
-            auto start_time = std::chrono::high_resolution_clock::now();
-            auto last_print_time = start_time;
-
-            cv::Mat frame;
-            while (cap.read(frame)) {
-                frame_count++;
-                if (frame_count % skip_frames != 0) continue;
-                processed_count++;
-                if (max_frames > 0 && processed_count > max_frames) break;
-
-                // 推理
-                auto img = lua_cv::Image(frame.clone());
-                LuaIntf::LuaRef detections = run_inference(ctx.get(), img);
-
-                // 绘制结果
-                draw_detections(frame, detections);
-
-                if (writer.isOpened()) writer.write(frame);
-                if (show_result) {
-                    cv::imshow("Video Inference", frame);
-                    if (cv::waitKey(1) == 27) break;
-                }
-
-                // 更新内存
-                mem_current.update();
-                if (mem_current.vm_rss_kb > mem_peak.vm_rss_kb) mem_peak = mem_current;
-
-                // 进度显示
-                auto now = std::chrono::high_resolution_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print_time).count() >= 1000 || processed_count == 1) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-                    double current_fps = processed_count * 1000.0 / elapsed;
-
-                    std::cout << "\rFrame " << std::setw(5) << processed_count
-                             << " (" << frame_count << ")"
-                             << " | FPS: " << std::fixed << std::setprecision(1) << std::setw(5) << current_fps
-                             << " | Det: " << std::setw(2) << detections.len()
-                             << " | " << mem_current.to_string() << "     " << std::flush;
-                    last_print_time = now;
-                }
-            }
-
-            // 结果统计
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-            // 获取最终内存状态
-            mem_current.update();
-            if (mem_current.vm_rss_kb > mem_peak.vm_rss_kb) mem_peak = mem_current;
-
-            std::cout << "\n\n" << std::string(70, '=') << "\n";
-            std::cout << "=== Processing Complete ===\n";
-            std::cout << "Processed: " << processed_count << " frames (total: " << frame_count << ")\n";
-            std::cout << "Time: " << std::fixed << std::setprecision(2) << (total_time / 1000.0) << " s\n";
-            std::cout << "Average FPS: " << std::fixed << std::setprecision(2)
-                     << (processed_count * 1000.0 / total_time) << "\n";
-            std::cout << "Per frame: " << std::fixed << std::setprecision(1)
-                     << (total_time / (double)processed_count) << " ms\n";
-
-            std::cout << "\n=== Memory Summary ===\n";
-            std::cout << "Initial:  " << mem_start.to_string() << "\n";
-            std::cout << "Final:    " << mem_current.to_string() << "\n";
-            std::cout << "Peak:     " << mem_peak.to_string() << "\n";
-
-            long mem_increase = (long)mem_current.vm_rss_kb - (long)mem_start.vm_rss_kb;
-            std::cout << "Increase: " << std::fixed << std::setprecision(1)
-                     << (mem_increase / 1024.0) << " MB\n";
-
-            if (processed_count > 100) {
-                double leak_per_frame = mem_increase / (double)processed_count;
-                std::cout << "Per frame: " << std::fixed << std::setprecision(2)
-                         << leak_per_frame << " KB\n";
-
-                if (leak_per_frame > 10) {
-                    std::cout << "\n⚠️  WARNING: Potential memory leak!\n";
-                    std::cout << "   " << leak_per_frame << " KB/frame\n";
-                } else if (leak_per_frame > 1) {
-                    std::cout << "\n⚠️  NOTICE: Minor memory growth\n";
-                } else {
-                    std::cout << "\n✅ Memory stable - no leaks detected\n";
-                }
-            }
-            std::cout << std::string(70, '=') << "\n";
-
-            cap.release();
-            if (writer.isOpened()) {
-                writer.release();
-                std::cout << "\nOutput saved: " << save_path << "\n";
-            }
-            if (show_result) cv::destroyAllWindows();
-
-#else  // !HAVE_OPENCV_VIDEOIO
-            std::cerr << "Error: Video mode not supported (OpenCV built without videoio module)\n";
-            std::cerr << "Please use image input or rebuild OpenCV with videoio support.\n";
-            return 1;
-#endif  // HAVE_OPENCV_VIDEOIO
-
-        } else {
-            // ========== 图片推理模式 ==========
-            std::cout << "Loading image: " << input_path << "\n";
-            auto img = lua_cv::imread(input_path);
-            std::cout << "Image size: " << img.width() << "x" << img.height() << "\n\n";
-
-            std::cout << "Preprocessing...\n";
-            std::cout << "Running inference...\n";
-            std::cout << "Postprocessing...\n";
-
-            LuaIntf::LuaRef detections = run_inference(ctx.get(), img);
-
-            print_results(detections);
-
-            if (show_result || !save_path.empty()) {
-                cv::Mat draw_img = cv::imread(input_path);
-                draw_detections(draw_img, detections);
-
-                if (!save_path.empty()) {
-                    cv::imwrite(save_path, draw_img);
-                    std::cout << "\nResult saved to: " << save_path << "\n";
-                }
 
 #ifdef HAVE_OPENCV_VIDEOIO
-                if (show_result) {
-                    cv::imshow("Result", draw_img);
-                    std::cout << "Press any key to exit...\n";
-                    cv::waitKey(0);
-                    cv::destroyAllWindows();
-                }
-#else
-                if (show_result) {
-                    std::cerr << "Warning: Display mode not supported (OpenCV built without videoio/highgui)\n";
-                }
-#endif
+            if (show_result) {
+                cv::imshow("Result", draw_img);
+                std::cout << "Press any key to exit...\n";
+                cv::waitKey(0);
+                cv::destroyAllWindows();
             }
+#else
+            if (show_result) {
+                std::cerr << "Warning: Display mode not supported (OpenCV built without videoio/highgui)\n";
+            }
+#endif
         }
 
     } catch (const std::exception& e) {

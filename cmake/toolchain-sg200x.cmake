@@ -51,6 +51,8 @@ message(STATUS "Using C++ compiler: ${CMAKE_CXX_COMPILER}")
 set(RISCV_FLAGS "-mcpu=c906fdv -march=rv64gcv0p7_zfh_xthead -mabi=lp64d")
 set(CMAKE_C_FLAGS_INIT "${RISCV_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${RISCV_FLAGS}")
+set(CMAKE_ASM_FLAGS_INIT "${RISCV_FLAGS}")
+set(CMAKE_ASM_FLAGS "${RISCV_FLAGS}" CACHE STRING "RISC-V ASM flags" FORCE)
 
 # Release optimization (required for TPU performance)
 set(CMAKE_C_FLAGS_RELEASE_INIT "-O3 -DNDEBUG -flto")

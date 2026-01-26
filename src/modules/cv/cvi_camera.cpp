@@ -1,11 +1,16 @@
 #include "cvi_camera.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <fstream>
+#include <sstream>
 #include <unistd.h>
 #include <chrono>
+
+#include "mmf_context.h"
 
 #ifdef USE_CVI_CAMERA
 #include <cvi_buffer.h>
@@ -28,9 +33,374 @@ namespace lua_cv {
 #ifdef USE_CVI_CAMERA
 namespace {
 constexpr int kIspWarmupDelayUs = 300000;
+constexpr int kVpssWarmupFrames = 3;
+constexpr int kVpssWarmupTimeoutMs = 1000;
 constexpr int kGetFrameTimeoutMs = 2000;
 constexpr int kReadyPollTimeoutMs = 200;
 constexpr int kReadyPollSleepUs = 20000;
+constexpr int kVpssPoolTraceMax = 4;
+constexpr int kCameraVpssDepth = 3;
+constexpr size_t kProcDumpBytes = 8192;
+constexpr size_t kProcDumpBytesLarge = 16384;
+
+enum DumpReason : uint32_t {
+    kDumpReadyTimeout = 1u << 0,
+    kDumpGetFrameFail = 1u << 1,
+    kDumpGetFrameNoBuf = 1u << 2,
+};
+
+void dump_proc_file(const char* path, size_t max_bytes) {
+    std::ifstream file(path);
+    if (!file) {
+        std::cerr << "[WARN] CviCamera: cannot read " << path << std::endl;
+        return;
+    }
+
+    std::ostringstream oss;
+    std::string line;
+    size_t total = 0;
+    while (std::getline(file, line)) {
+        if (total + line.size() + 1 > max_bytes) {
+            line.resize(max_bytes - total);
+        }
+        oss << line << "\n";
+        total += line.size() + 1;
+        if (total >= max_bytes) {
+            break;
+        }
+    }
+    std::cerr << "[INFO] " << path << "\n" << oss.str() << std::endl;
+}
+
+void dump_vi_status(VI_PIPE pipe, VI_CHN chn) {
+    VI_CHN_STATUS_S status{};
+    CVI_S32 rc = CVI_VI_QueryChnStatus(pipe, chn, &status);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VI_QueryChnStatus failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VI CHN status"
+              << " enable=" << status.bEnable
+              << " fps=" << status.u32FrameRate
+              << " recv=" << status.u32RecvPic
+              << " lost=" << status.u32LostFrame
+              << " vb_fail=" << status.u32VbFail
+              << " int_cnt=" << status.u32IntCnt
+              << " size=" << status.stSize.u32Width
+              << "x" << status.stSize.u32Height
+              << std::endl;
+}
+
+void dump_vi_pipe_status(VI_PIPE pipe) {
+    VI_PIPE_STATUS_S status{};
+    CVI_S32 rc = CVI_VI_QueryPipeStatus(pipe, &status);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VI_QueryPipeStatus failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VI PIPE status"
+              << " enable=" << status.bEnable
+              << " fps=" << status.u32FrameRate
+              << " lost=" << status.u32LostFrame
+              << " vb_fail=" << status.u32VbFail
+              << " int_cnt=" << status.u32IntCnt
+              << " size=" << status.stSize.u32Width
+              << "x" << status.stSize.u32Height
+              << std::endl;
+}
+
+void dump_vi_pipe_attr(VI_PIPE pipe) {
+    VI_PIPE_ATTR_S attr{};
+    CVI_S32 rc = CVI_VI_GetPipeAttr(pipe, &attr);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VI_GetPipeAttr failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VI PIPE attr"
+              << " max=" << attr.u32MaxW << "x" << attr.u32MaxH
+              << " pixfmt=" << attr.enPixFmt
+              << " bitwidth=" << attr.enBitWidth
+              << " compress=" << attr.enCompressMode
+              << " isp_bypass=" << attr.bIspBypass
+              << " yuv_skip=" << attr.bYuvSkip
+              << std::endl;
+}
+
+void dump_vi_chn_attr(VI_PIPE pipe, VI_CHN chn) {
+    VI_CHN_ATTR_S attr{};
+    CVI_S32 rc = CVI_VI_GetChnAttr(pipe, chn, &attr);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VI_GetChnAttr failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VI CHN attr"
+              << " size=" << attr.stSize.u32Width
+              << "x" << attr.stSize.u32Height
+              << " pixfmt=" << attr.enPixelFormat
+              << " depth=" << attr.u32Depth
+              << " bind_pool=" << attr.u32BindVbPool
+              << std::endl;
+}
+
+void dump_sys_modes(VI_PIPE pipe) {
+    VI_VPSS_MODE_S vi_vpss{};
+    CVI_S32 rc = CVI_SYS_GetVIVPSSMode(&vi_vpss);
+    if (rc == CVI_SUCCESS) {
+        std::cerr << "[INFO] SYS VIVPSS mode pipe=" << pipe
+                  << " mode=" << vi_vpss.aenMode[pipe] << std::endl;
+    } else {
+        std::cerr << "[WARN] CviCamera: CVI_SYS_GetVIVPSSMode failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+    }
+
+    VPSS_MODE_E vpss_mode = CVI_SYS_GetVPSSMode();
+    std::cerr << "[INFO] SYS VPSS mode=" << vpss_mode << std::endl;
+
+    VPSS_MODE_S vpss_mode_ex{};
+    rc = CVI_SYS_GetVPSSModeEx(&vpss_mode_ex);
+    if (rc == CVI_SUCCESS) {
+        std::cerr << "[INFO] SYS VPSS mode ex"
+                  << " mode=" << vpss_mode_ex.enMode
+                  << " dev0_input=" << vpss_mode_ex.aenInput[0]
+                  << " dev0_pipe=" << vpss_mode_ex.ViPipe[0]
+                  << " dev1_input=" << vpss_mode_ex.aenInput[1]
+                  << " dev1_pipe=" << vpss_mode_ex.ViPipe[1]
+                  << std::endl;
+    } else {
+        std::cerr << "[WARN] CviCamera: CVI_SYS_GetVPSSModeEx failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+    }
+}
+
+void dump_vpss_grp_attr(VPSS_GRP grp) {
+    VPSS_GRP_ATTR_S attr{};
+    CVI_S32 rc = CVI_VPSS_GetGrpAttr(grp, &attr);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VPSS_GetGrpAttr failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VPSS GRP attr"
+              << " grp=" << grp
+              << " max=" << attr.u32MaxW << "x" << attr.u32MaxH
+              << " pixfmt=" << attr.enPixelFormat
+              << " dev=" << static_cast<int>(attr.u8VpssDev)
+              << std::endl;
+}
+
+void dump_vpss_chn_attr(VPSS_GRP grp, VPSS_CHN chn) {
+    VPSS_CHN_ATTR_S attr{};
+    CVI_S32 rc = CVI_VPSS_GetChnAttr(grp, chn, &attr);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VPSS_GetChnAttr failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VPSS CHN attr"
+              << " grp=" << grp
+              << " chn=" << chn
+              << " size=" << attr.u32Width << "x" << attr.u32Height
+              << " pixfmt=" << attr.enPixelFormat
+              << " depth=" << attr.u32Depth
+              << " mirror=" << attr.bMirror
+              << " flip=" << attr.bFlip
+              << std::endl;
+}
+
+void dump_vpss_chn_crop(VPSS_GRP grp, VPSS_CHN chn) {
+    VPSS_CROP_INFO_S crop{};
+    CVI_S32 rc = CVI_VPSS_GetChnCrop(grp, chn, &crop);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VPSS_GetChnCrop failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+
+    std::cerr << "[INFO] VPSS CHN crop"
+              << " grp=" << grp
+              << " chn=" << chn
+              << " enable=" << crop.bEnable
+              << " rect=" << crop.stCropRect.s32X
+              << "," << crop.stCropRect.s32Y
+              << " " << crop.stCropRect.u32Width
+              << "x" << crop.stCropRect.u32Height
+              << std::endl;
+}
+
+void dump_vpss_chn_rotation(VPSS_GRP grp, VPSS_CHN chn) {
+    ROTATION_E rotation = ROTATION_0;
+    CVI_S32 rc = CVI_VPSS_GetChnRotation(grp, chn, &rotation);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[WARN] CviCamera: CVI_VPSS_GetChnRotation failed: 0x"
+                  << std::hex << rc << std::dec << std::endl;
+        return;
+    }
+    std::cerr << "[INFO] VPSS CHN rotation"
+              << " grp=" << grp
+              << " chn=" << chn
+              << " rot=" << rotation
+              << std::endl;
+}
+
+bool vb_trace_enabled() {
+    static int enabled = -1;
+    if (enabled >= 0) {
+        return enabled == 1;
+    }
+    const char* env = std::getenv("LUA_VB_TRACE");
+    enabled = (env && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+    return enabled == 1;
+}
+
+bool should_trace_vpss_pool() {
+    static int count = 0;
+    if (!vb_trace_enabled()) {
+        return false;
+    }
+    if (count >= kVpssPoolTraceMax) {
+        return false;
+    }
+    ++count;
+    return true;
+}
+
+VB_POOL resolve_vpss_trace_pool(VB_POOL pool_hint) {
+    if (pool_hint != VB_INVALID_POOLID) {
+        return pool_hint;
+    }
+    int plan_pool = MmfContext::camera_vpss_pool();
+    if (plan_pool >= 0) {
+        return static_cast<VB_POOL>(plan_pool);
+    }
+    return VB_INVALID_POOLID;
+}
+
+void trace_vpss_pool_usage(VB_POOL pool, const char* stage) {
+    if (pool == VB_INVALID_POOLID) {
+        std::cerr << "[WARN] CviCamera: " << stage << " pool invalid" << std::endl;
+        return;
+    }
+    std::cerr << "[VBTRACE] CviCamera: " << stage << " pool=" << pool << std::endl;
+    CVI_VB_PrintPool(pool);
+}
+
+void log_vb_plan_pool(const VbPoolPlan& plan, VB_POOL pool, const char* tag) {
+    if (pool == VB_INVALID_POOLID) {
+        std::cerr << "[WARN] CviCamera: " << tag << " invalid pool" << std::endl;
+        return;
+    }
+    const auto& pools = plan.pools();
+    size_t index = static_cast<size_t>(pool);
+    if (index >= pools.size()) {
+        std::cerr << "[WARN] CviCamera: " << tag << " pool out of range: " << pool
+                  << " total=" << pools.size() << std::endl;
+        return;
+    }
+    const auto& info = pools[index];
+    std::cerr << "[INFO] CviCamera: " << tag
+              << " pool=" << pool
+              << " size=" << info.width << "x" << info.height
+              << " fmt=" << pixel_format_name(info.format)
+              << " blk_size=" << info.block_size
+              << " blk_count=" << info.block_count
+              << std::endl;
+}
+
+void log_vpss_pool_selection(const VbPoolPlan& plan,
+                             uint32_t width,
+                             uint32_t height,
+                             PixelFormat format,
+                             VB_POOL pool,
+                             const char* reason) {
+    std::cerr << "[INFO] CviCamera: VPSS pool select reason=" << reason
+              << " req=" << width << "x" << height
+              << " fmt=" << pixel_format_name(format)
+              << " pool=" << pool << std::endl;
+    if (vb_trace_enabled()) {
+        log_vb_plan_pool(plan, pool, "VPSS output");
+        CVI_VB_PrintPool(pool);
+    }
+}
+
+void warmup_vpss_frames(VPSS_GRP grp, VPSS_CHN chn, VB_POOL pool_hint) {
+    int dropped = 0;
+    CVI_S32 last_rc = CVI_SUCCESS;
+    for (int i = 0; i < kVpssWarmupFrames; ++i) {
+        VIDEO_FRAME_INFO_S frame{};
+        bool trace_pool = should_trace_vpss_pool();
+        VB_POOL pool = resolve_vpss_trace_pool(pool_hint);
+        if (trace_pool) {
+            trace_vpss_pool_usage(pool, "before warmup GetChnFrame");
+        }
+        CVI_S32 rc = CVI_VPSS_GetChnFrame(grp, chn, &frame, kVpssWarmupTimeoutMs);
+        if (trace_pool) {
+            trace_vpss_pool_usage(pool, "after warmup GetChnFrame");
+        }
+        if (rc == CVI_SUCCESS) {
+            CVI_VPSS_ReleaseChnFrame(grp, chn, &frame);
+            ++dropped;
+            continue;
+        }
+        last_rc = rc;
+        if (rc != CVI_ERR_VPSS_NOBUF && rc != CVI_ERR_VPSS_BUF_EMPTY) {
+            std::cerr << "[WARN] CviCamera: warmup CVI_VPSS_GetChnFrame failed: 0x"
+                      << std::hex << rc << std::dec << std::endl;
+        }
+        usleep(kReadyPollSleepUs);
+    }
+
+    if (dropped == 0) {
+        std::cerr << "[WARN] CviCamera: warmup captured 0/" << kVpssWarmupFrames;
+        if (last_rc != CVI_SUCCESS) {
+            std::cerr << " (last rc=0x" << std::hex << last_rc << std::dec << ")";
+        }
+        std::cerr << std::endl;
+        return;
+    }
+
+    std::cout << "[INFO] CviCamera: warmup dropped " << dropped
+              << "/" << kVpssWarmupFrames << " frames" << std::endl;
+}
+
+void dump_camera_proc_once(const char* tag, uint32_t reason, VI_PIPE pipe, VI_CHN chn,
+                           VPSS_GRP grp, VPSS_CHN vpss_chn) {
+    static uint32_t dumped_mask = 0;
+    if (dumped_mask & reason) {
+        return;
+    }
+    dumped_mask |= reason;
+    if (tag && tag[0] != '\0') {
+        std::cerr << "[WARN] CviCamera: " << tag << std::endl;
+    }
+    dump_sys_modes(pipe);
+    dump_vi_pipe_attr(pipe);
+    dump_vi_pipe_status(pipe);
+    dump_vi_chn_attr(pipe, chn);
+    dump_vi_status(pipe, chn);
+    dump_vpss_grp_attr(grp);
+    dump_vpss_chn_attr(grp, vpss_chn);
+    dump_vpss_chn_crop(grp, vpss_chn);
+    dump_vpss_chn_rotation(grp, vpss_chn);
+    if (vb_trace_enabled()) {
+        log_vb_plan_pool(MmfContext::instance().vb_plan(),
+                         static_cast<VB_POOL>(MmfContext::camera_vpss_pool()),
+                         "camera vpss plan");
+    }
+    dump_proc_file("/proc/cvitek/vi", kProcDumpBytes);
+    dump_proc_file("/proc/cvitek/vpss", kProcDumpBytes);
+    dump_proc_file("/proc/cvitek/sys", kProcDumpBytes);
+    dump_proc_file("/proc/cvitek/vb", kProcDumpBytesLarge);
+}
 
 VI_DEV_ATTR_S make_vi_dev_attr_base() {
     VI_DEV_ATTR_S attr{};
@@ -124,16 +494,13 @@ bool check_rc(CVI_S32 rc, const char* what) {
     return true;
 }
 
-CVI_U8 get_vpss_dev_for_input(VPSS_INPUT_E input_type) {
-    VPSS_MODE_S mode{};
-    if (CVI_SYS_GetVPSSModeEx(&mode) == CVI_SUCCESS && mode.enMode == VPSS_MODE_DUAL) {
-        for (int i = 0; i < VPSS_IP_NUM; ++i) {
-            if (mode.aenInput[i] == input_type) {
-                return static_cast<CVI_U8>(i);
-            }
-        }
+int select_vpss_group_for_isp(const CviCamera::Config& config) {
+    if (config.vpss_grp >= 0) {
+        return config.vpss_grp;
     }
-    return 0;
+
+    int grp = MmfContext::vpss_group_for_camera();
+    return grp >= 0 ? grp : 0;
 }
 
 const char* pq_bin_path_for_sensor(const CviSensor::Profile* profile) {
@@ -225,6 +592,14 @@ bool CviCamera::open() {
     height_ = (config_.height > 0) ? config_.height : sensor_.get_height();
     fps_ = (config_.fps > 0.0) ? config_.fps : static_cast<double>(sensor_.get_fps());
 
+    if (!MmfContext::is_supported_camera_size(static_cast<uint32_t>(width_),
+                                              static_cast<uint32_t>(height_))) {
+        std::cerr << "[ERROR] CviCamera: unsupported camera resolution "
+                  << width_ << "x" << height_ << std::endl;
+        cleanup();
+        return false;
+    }
+
     if (!init_system()) {
         cleanup();
         return false;
@@ -248,6 +623,7 @@ bool CviCamera::open() {
     std::cout << "[INFO] CviCamera: Sensor " << get_sensor_name()
               << " " << width_ << "x" << height_ << " @ " << fps_ << " fps" << std::endl;
     usleep(kIspWarmupDelayUs);
+    warmup_vpss_frames(vpss_grp_, vpss_chn_, vpss_pool_);
 
     opened_ = true;
     return true;
@@ -280,6 +656,8 @@ bool CviCamera::wait_for_ready(int timeout_ms) {
         if (elapsed_ms >= timeout_ms) {
             std::cerr << "[WARN] CviCamera::wait_for_ready - timeout after "
                       << elapsed_ms << " ms" << std::endl;
+            dump_camera_proc_once("wait_for_ready timeout", kDumpReadyTimeout,
+                                  vi_pipe_, vi_chn_, vpss_grp_, vpss_chn_);
             return false;
         }
         usleep(kReadyPollSleepUs);
@@ -295,11 +673,28 @@ bool CviCamera::read_internal(Frame& frame, int timeout_ms, bool log_error) {
     }
 
     VIDEO_FRAME_INFO_S cvi_frame{};
+    bool trace_pool = should_trace_vpss_pool();
+    VB_POOL trace_pool_id = resolve_vpss_trace_pool(vpss_pool_);
+    if (trace_pool) {
+        trace_vpss_pool_usage(trace_pool_id, "before GetChnFrame");
+    }
     CVI_S32 rc = CVI_VPSS_GetChnFrame(vpss_grp_, vpss_chn_, &cvi_frame, timeout_ms);
+    if (trace_pool) {
+        trace_vpss_pool_usage(trace_pool_id, "after GetChnFrame");
+    }
     if (rc != CVI_SUCCESS) {
         if (log_error) {
             std::cerr << "[ERROR] CviCamera::read - CVI_VPSS_GetChnFrame failed: 0x"
                       << std::hex << rc << std::dec << std::endl;
+            if (rc == CVI_ERR_VPSS_NOBUF || rc == CVI_ERR_VPSS_BUF_EMPTY) {
+                dump_camera_proc_once("CVI_VPSS_GetChnFrame NOBUF/EMPTY",
+                                      kDumpGetFrameNoBuf, vi_pipe_, vi_chn_,
+                                      vpss_grp_, vpss_chn_);
+            } else {
+                dump_camera_proc_once("CVI_VPSS_GetChnFrame failed",
+                                      kDumpGetFrameFail, vi_pipe_, vi_chn_,
+                                      vpss_grp_, vpss_chn_);
+            }
         }
         return false;
     }
@@ -345,6 +740,8 @@ bool CviCamera::init_system() {
         return false;
     }
 
+    vi_pipe_ = static_cast<VI_PIPE>(MmfContext::camera_vi_pipe());
+
     VI_VPSS_MODE_S vi_vpss_mode{};
     if (!check_rc(CVI_SYS_GetVIVPSSMode(&vi_vpss_mode), "CVI_SYS_GetVIVPSSMode")) {
         return false;
@@ -358,23 +755,48 @@ bool CviCamera::init_system() {
     if (!check_rc(CVI_SYS_GetVPSSModeEx(&vpss_mode), "CVI_SYS_GetVPSSModeEx")) {
         return false;
     }
-    if (vpss_mode.enMode != VPSS_MODE_DUAL) {
-        std::cerr << "[ERROR] CviCamera: VPSS mode must be DUAL (ISP + MEM)" << std::endl;
+    if (vpss_mode.enMode != VPSS_MODE_DUAL && vpss_mode.enMode != VPSS_MODE_SINGLE) {
+        std::cerr << "[ERROR] CviCamera: VPSS mode must be SINGLE or DUAL" << std::endl;
         return false;
     }
 
-    bool has_isp_input = false;
-    for (int i = 0; i < VPSS_IP_NUM; ++i) {
-        if (vpss_mode.aenInput[i] == VPSS_INPUT_ISP) {
-            has_isp_input = true;
-            break;
+    const int isp_dev = MmfContext::vpss_dev_for_camera();
+    if (isp_dev < 0 || isp_dev >= VPSS_IP_NUM) {
+        std::cerr << "[ERROR] CviCamera: invalid VPSS dev for ISP input" << std::endl;
+        return false;
+    }
+    if (vpss_mode.enMode == VPSS_MODE_SINGLE && isp_dev != 0) {
+        std::cerr << "[ERROR] CviCamera: VPSS SINGLE mode requires ISP on dev0" << std::endl;
+        return false;
+    }
+    if (vpss_mode.aenInput[isp_dev] != VPSS_INPUT_ISP) {
+        std::cerr << "[ERROR] CviCamera: VPSS mode must map ISP to dev"
+                  << isp_dev << std::endl;
+        return false;
+    }
+
+    vpss_grp_ = static_cast<VPSS_GRP>(select_vpss_group_for_isp(config_));
+    int stream_chn = MmfContext::vpss_channel_for_camera_stream();
+    if (stream_chn < 0) {
+        std::cerr << "[ERROR] CviCamera: invalid VPSS stream channel for camera" << std::endl;
+        return false;
+    }
+    vpss_stream_chn_ = static_cast<VPSS_CHN>(stream_chn);
+
+    if (config_.enable_infer) {
+        int vpss_chn = MmfContext::vpss_channel_for_camera();
+        if (vpss_chn < 0) {
+            std::cerr << "[ERROR] CviCamera: invalid VPSS channel for camera" << std::endl;
+            return false;
         }
+        vpss_chn_ = static_cast<VPSS_CHN>(vpss_chn);
+        if (vpss_stream_chn_ == vpss_chn_) {
+            std::cerr << "[ERROR] CviCamera: VPSS stream/infer channels must differ" << std::endl;
+            return false;
+        }
+    } else {
+        vpss_chn_ = vpss_stream_chn_;
     }
-    if (!has_isp_input) {
-        std::cerr << "[ERROR] CviCamera: VPSS mode must include ISP input" << std::endl;
-        return false;
-    }
-
     return true;
 }
 
@@ -747,10 +1169,23 @@ bool CviCamera::start_vi_channel() {
     VI_CHN_ATTR_S chn_attr = make_vi_chn_attr_base();
     chn_attr.stSize.u32Width = static_cast<CVI_U32>(width_);
     chn_attr.stSize.u32Height = static_cast<CVI_U32>(height_);
-    chn_attr.enCompressMode = COMPRESS_MODE_NONE;
+    chn_attr.enCompressMode = COMPRESS_MODE_TILE;
 
     chn_attr.enPixelFormat = PIXEL_FORMAT_NV21;
-    chn_attr.u32Depth = 3;
+    chn_attr.u32Depth = kCameraVpssDepth;
+    VB_POOL pool = static_cast<VB_POOL>(MmfContext::camera_vi_pool());
+    if (pool == VB_INVALID_POOLID) {
+        pool = MmfContext::instance().vb_plan().find_pool(
+            static_cast<CVI_U32>(width_),
+            static_cast<CVI_U32>(height_),
+            PixelFormat::NV21);
+    }
+    if (pool == VB_INVALID_POOLID) {
+        std::cerr << "[ERROR] CviCamera: no VB pool for "
+                  << width_ << "x" << height_ << " NV21" << std::endl;
+        return false;
+    }
+    chn_attr.u32BindVbPool = static_cast<CVI_U32>(pool);
 
     if (sensor_profile_) {
         chn_attr.bMirror = (sensor_profile_->orientation & ISP_SNS_MIRROR) != 0;
@@ -771,22 +1206,48 @@ bool CviCamera::start_vi_channel() {
     }
     vi_chn_enabled_ = true;
 
+    CVI_S32 rc = CVI_VI_AttachVbPool(vi_pipe_, vi_chn_, pool);
+    if (rc != CVI_SUCCESS) {
+        std::cerr << "[ERROR] CviCamera: CVI_VI_AttachVbPool failed: 0x"
+                  << std::hex << rc << std::dec
+                  << " pool=" << pool << std::endl;
+        return false;
+    }
+    vi_pool_attached_ = true;
+    vi_pool_ = pool;
+
     CVI_VI_SetChnFlipMirror(vi_pipe_, vi_chn_, chn_attr.bFlip, chn_attr.bMirror);
     return true;
 }
 
 bool CviCamera::init_vpss() {
+    const uint32_t max_width = MmfContext::vpss_max_width_for_camera();
+    const uint32_t max_height = MmfContext::vpss_max_height_for_camera();
+    if ((max_width > 0 && static_cast<uint32_t>(width_) > max_width) ||
+        (max_height > 0 && static_cast<uint32_t>(height_) > max_height)) {
+        std::cerr << "[ERROR] CviCamera: camera size exceeds VPSS max "
+                  << max_width << "x" << max_height
+                  << " (got " << width_ << "x" << height_ << ")" << std::endl;
+        return false;
+    }
+
     VPSS_GRP_ATTR_S grp_attr{};
     grp_attr.u32MaxW = static_cast<CVI_U32>(width_);
     grp_attr.u32MaxH = static_cast<CVI_U32>(height_);
     grp_attr.enPixelFormat = PIXEL_FORMAT_NV21;
     grp_attr.stFrameRate.s32SrcFrameRate = -1;
     grp_attr.stFrameRate.s32DstFrameRate = -1;
-    grp_attr.u8VpssDev = get_vpss_dev_for_input(VPSS_INPUT_ISP);
+    int vpss_dev = MmfContext::vpss_dev_for_camera();
+    if (vpss_dev < 0) {
+        std::cerr << "[ERROR] CviCamera: invalid VPSS dev for ISP input" << std::endl;
+        return false;
+    }
+    grp_attr.u8VpssDev = static_cast<CVI_U8>(vpss_dev);
 
     CVI_S32 rc = CVI_VPSS_CreateGrp(vpss_grp_, &grp_attr);
     if (rc == CVI_ERR_VPSS_EXIST) {
         CVI_VPSS_DisableChn(vpss_grp_, vpss_chn_);
+        CVI_VPSS_DisableChn(vpss_grp_, vpss_stream_chn_);
         CVI_VPSS_StopGrp(vpss_grp_);
         CVI_VPSS_DestroyGrp(vpss_grp_);
         rc = CVI_VPSS_CreateGrp(vpss_grp_, &grp_attr);
@@ -800,30 +1261,145 @@ bool CviCamera::init_vpss() {
         return false;
     }
 
-    VPSS_CHN_ATTR_S chn_attr{};
-    chn_attr.u32Width = static_cast<CVI_U32>(width_);
-    chn_attr.u32Height = static_cast<CVI_U32>(height_);
-    chn_attr.enVideoFormat = VIDEO_FORMAT_LINEAR;
-    chn_attr.enPixelFormat = to_cvi_pixel_format(config_.format);
-    if (chn_attr.enPixelFormat == PIXEL_FORMAT_MAX) {
+    const VbPoolPlan& vb_plan = MmfContext::instance().vb_plan();
+    const uint32_t stream_w = MmfContext::camera_stream_width();
+    const uint32_t stream_h = MmfContext::camera_stream_height();
+    const uint32_t infer_w = MmfContext::camera_infer_width();
+    const uint32_t infer_h = MmfContext::camera_infer_height();
+    if (stream_w == 0 || stream_h == 0) {
+        std::cerr << "[ERROR] CviCamera: missing camera stream sizing" << std::endl;
+        return false;
+    }
+    if (config_.enable_infer && (infer_w == 0 || infer_h == 0)) {
+        std::cerr << "[ERROR] CviCamera: missing camera infer sizing" << std::endl;
+        return false;
+    }
+    if (stream_w > max_width || stream_h > max_height ||
+        (config_.enable_infer && (infer_w > max_width || infer_h > max_height))) {
+        std::cerr << "[ERROR] CviCamera: camera output exceeds VPSS max "
+                  << max_width << "x" << max_height << std::endl;
+        return false;
+    }
+
+    PixelFormat stream_format = MmfContext::camera_stream_format();
+    PixelFormat infer_format = PixelFormat::UNKNOWN;
+    if (config_.enable_infer) {
+        infer_format = (config_.format == PixelFormat::UNKNOWN)
+            ? MmfContext::camera_infer_format()
+            : config_.format;
+    }
+    if (stream_format == PixelFormat::UNKNOWN ||
+        (config_.enable_infer && infer_format == PixelFormat::UNKNOWN)) {
         std::cerr << "[ERROR] CviCamera: invalid VPSS output format" << std::endl;
         return false;
     }
-    chn_attr.stFrameRate.s32SrcFrameRate = -1;
-    chn_attr.stFrameRate.s32DstFrameRate = -1;
-    chn_attr.u32Depth = 3;
-    chn_attr.bMirror = CVI_FALSE;
-    chn_attr.bFlip = CVI_FALSE;
-    chn_attr.stAspectRatio.enMode = ASPECT_RATIO_AUTO;
 
-    if (!check_rc(CVI_VPSS_SetChnAttr(vpss_grp_, vpss_chn_, &chn_attr), "CVI_VPSS_SetChnAttr")) {
+    uint32_t stream_depth = MmfContext::camera_stream_depth();
+    uint32_t infer_depth = MmfContext::camera_infer_depth();
+    if (stream_depth == 0) {
+        stream_depth = 3;
+    }
+    if (infer_depth == 0) {
+        infer_depth = 3;
+    }
+
+    auto setup_channel = [&](VPSS_CHN chn,
+                             uint32_t out_w,
+                             uint32_t out_h,
+                             PixelFormat out_fmt,
+                             uint32_t depth,
+                             VB_POOL preferred_pool,
+                             const char* tag,
+                             VB_POOL* out_pool,
+                             bool* enabled,
+                             bool* attached) -> bool {
+        VPSS_CHN_ATTR_S chn_attr{};
+        chn_attr.u32Width = static_cast<CVI_U32>(out_w);
+        chn_attr.u32Height = static_cast<CVI_U32>(out_h);
+        chn_attr.enVideoFormat = VIDEO_FORMAT_LINEAR;
+        chn_attr.enPixelFormat = to_cvi_pixel_format(out_fmt);
+        if (chn_attr.enPixelFormat == PIXEL_FORMAT_MAX) {
+            std::cerr << "[ERROR] CviCamera: invalid VPSS output format for "
+                      << tag << std::endl;
+            return false;
+        }
+        chn_attr.stFrameRate.s32SrcFrameRate = -1;
+        chn_attr.stFrameRate.s32DstFrameRate = -1;
+        chn_attr.u32Depth = depth;
+        chn_attr.bMirror = CVI_FALSE;
+        chn_attr.bFlip = CVI_FALSE;
+        chn_attr.stAspectRatio.enMode = ASPECT_RATIO_AUTO;
+
+        if (!check_rc(CVI_VPSS_SetChnAttr(vpss_grp_, chn, &chn_attr), "CVI_VPSS_SetChnAttr")) {
+            return false;
+        }
+        if (!check_rc(CVI_VPSS_EnableChn(vpss_grp_, chn), "CVI_VPSS_EnableChn")) {
+            return false;
+        }
+        *enabled = true;
+
+        VB_POOL pool = preferred_pool;
+        if (pool != VB_INVALID_POOLID) {
+            log_vpss_pool_selection(vb_plan, out_w, out_h, out_fmt, pool, tag);
+        } else {
+            pool = vb_plan.find_pool(out_w, out_h, out_fmt);
+            if (pool != VB_INVALID_POOLID) {
+                log_vpss_pool_selection(vb_plan, out_w, out_h, out_fmt, pool, tag);
+            }
+        }
+        if (pool == VB_INVALID_POOLID) {
+            std::cerr << "[ERROR] CviCamera: no VB pool for VPSS output "
+                      << out_w << "x" << out_h << " "
+                      << pixel_format_name(out_fmt)
+                      << " tag=" << tag << std::endl;
+            return false;
+        }
+        CVI_S32 attach_rc = CVI_VPSS_AttachVbPool(vpss_grp_, chn, pool);
+        if (attach_rc != CVI_SUCCESS) {
+            std::cerr << "[ERROR] CviCamera: CVI_VPSS_AttachVbPool failed: 0x"
+                      << std::hex << attach_rc << std::dec
+                      << " pool=" << pool
+                      << " tag=" << tag << std::endl;
+            if (vb_trace_enabled()) {
+                log_vb_plan_pool(vb_plan, pool, "VPSS attach failure");
+                CVI_VB_PrintPool(pool);
+            }
+            return false;
+        }
+        *attached = true;
+        *out_pool = pool;
+        if (vb_trace_enabled()) {
+            std::cerr << "[INFO] CviCamera: VPSS chn attach grp=" << vpss_grp_
+                      << " chn=" << chn
+                      << " pool=" << pool
+                      << " tag=" << tag << std::endl;
+            log_vb_plan_pool(vb_plan, pool, "VPSS attached");
+            CVI_VB_PrintPool(pool);
+        }
+        return true;
+    };
+
+    VB_POOL stream_pool_hint = VB_INVALID_POOLID;
+    int plan_pool = MmfContext::camera_vpss_pool();
+    if (plan_pool >= 0) {
+        stream_pool_hint = static_cast<VB_POOL>(plan_pool);
+    }
+    if (!setup_channel(vpss_stream_chn_, stream_w, stream_h, stream_format,
+                       stream_depth, stream_pool_hint, "camera_stream",
+                       &vpss_stream_pool_, &vpss_stream_chn_enabled_,
+                       &vpss_stream_pool_attached_)) {
         return false;
     }
 
-    if (!check_rc(CVI_VPSS_EnableChn(vpss_grp_, vpss_chn_), "CVI_VPSS_EnableChn")) {
-        return false;
+    if (config_.enable_infer) {
+        if (!setup_channel(vpss_chn_, infer_w, infer_h, infer_format,
+                           infer_depth, VB_INVALID_POOLID, "camera_infer",
+                           &vpss_pool_, &vpss_chn_enabled_, &vpss_pool_attached_)) {
+            return false;
+        }
+    } else {
+        vpss_chn_ = vpss_stream_chn_;
     }
-    vpss_chn_enabled_ = true;
 
     if (!check_rc(CVI_VPSS_StartGrp(vpss_grp_), "CVI_VPSS_StartGrp")) {
         return false;
@@ -865,9 +1441,30 @@ void CviCamera::cleanup() {
         vi_vpss_bound_ = false;
     }
 
+    if (vpss_pool_attached_) {
+        CVI_VPSS_DetachVbPool(vpss_grp_, vpss_chn_);
+        vpss_pool_attached_ = false;
+        vpss_pool_ = VB_INVALID_POOLID;
+    }
+    if (vpss_stream_pool_attached_) {
+        CVI_VPSS_DetachVbPool(vpss_grp_, vpss_stream_chn_);
+        vpss_stream_pool_attached_ = false;
+        vpss_stream_pool_ = VB_INVALID_POOLID;
+    }
+
+    if (vi_pool_attached_) {
+        CVI_VI_DetachVbPool(vi_pipe_, vi_chn_);
+        vi_pool_attached_ = false;
+        vi_pool_ = VB_INVALID_POOLID;
+    }
+
     if (vpss_chn_enabled_) {
         CVI_VPSS_DisableChn(vpss_grp_, vpss_chn_);
         vpss_chn_enabled_ = false;
+    }
+    if (vpss_stream_chn_enabled_) {
+        CVI_VPSS_DisableChn(vpss_grp_, vpss_stream_chn_);
+        vpss_stream_chn_enabled_ = false;
     }
     if (vpss_started_) {
         CVI_VPSS_StopGrp(vpss_grp_);

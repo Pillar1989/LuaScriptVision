@@ -56,6 +56,31 @@ public:
     };
 
     static MmfContext& instance();
+    static bool build_default_config(Config* config);
+    static bool is_supported_camera_size(uint32_t width, uint32_t height);
+    static bool is_supported_image_size(uint32_t width, uint32_t height);
+    static int camera_vi_pipe();
+    static int camera_vi_pool();
+    static int camera_vpss_pool();
+    static int vpss_group_for_camera();
+    static int vpss_group_for_mem();
+    static int vpss_channel_for_camera();
+    static int vpss_channel_for_camera_stream();
+    static int vpss_channel_for_mem();
+    static uint32_t camera_stream_width();
+    static uint32_t camera_stream_height();
+    static PixelFormat camera_stream_format();
+    static uint32_t camera_stream_depth();
+    static uint32_t camera_infer_width();
+    static uint32_t camera_infer_height();
+    static PixelFormat camera_infer_format();
+    static uint32_t camera_infer_depth();
+    static uint32_t vpss_max_width_for_camera();
+    static uint32_t vpss_max_height_for_camera();
+    static uint32_t vpss_max_width_for_mem();
+    static uint32_t vpss_max_height_for_mem();
+    static int vpss_dev_for_camera();
+    static int vpss_dev_for_mem();
 
     bool init(const Config& config);
     void shutdown();
@@ -68,10 +93,14 @@ public:
 
 private:
     MmfContext() = default;
+    void resolve_vpss_groups();
 
     bool initialized_ = false;
     VbPoolPlan vb_plan_;
     ModePlan mode_plan_;
+    int resolved_mem_group_ = -1;
+    int resolved_isp_group_ = -1;
+    bool groups_resolved_ = false;
 };
 #endif
 

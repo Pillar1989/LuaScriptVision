@@ -18,6 +18,11 @@ public:
                                                 size_t size_bytes,
                                                 bool cached,
                                                 bool take_ownership);
+    static std::shared_ptr<VbMemory> allocate(size_t size_bytes, bool cached = true);
+    static std::shared_ptr<VbMemory> allocate_frame(uint32_t width,
+                                                    uint32_t height,
+                                                    PIXEL_FORMAT_E format,
+                                                    bool cached = true);
 
     ~VbMemory() override;
 
@@ -27,7 +32,7 @@ public:
     void* data() override;
     const void* data() const override;
     size_t size_bytes() const override { return size_bytes_; }
-    DeviceType device() const override { return DeviceType::TPU; }
+    DeviceType device() const override { return DeviceType::VB; }
     size_t alignment() const override { return alignment_; }
     bool owns_memory() const override { return owns_block_; }
 
@@ -41,6 +46,8 @@ public:
 
     uint64_t physical_address() const { return phys_addr_; }
     VB_BLK block() const { return block_; }
+    void flush_cache();
+    void invalidate_cache();
 
 private:
     VbMemory(VB_BLK block, uint64_t phys_addr, size_t size_bytes, bool cached, bool owns_block);

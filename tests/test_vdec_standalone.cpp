@@ -10,8 +10,11 @@
 #include <vector>
 #include <cstring>
 #include <iomanip>
+#include <cstdlib>
+#include <string>
 #include <pthread.h>
 #include <unistd.h>
+#include <gtest/gtest.h>
 
 #ifdef USE_CVI_MPI
 
@@ -704,128 +707,143 @@ static bool decode_jpeg_file_sequential(VDEC_CHN vdec_chn, const std::string& fi
     return false;
 }
 
-int main(int argc, char* argv[]) {
-    std::cout << "========================================" << std::endl;
-    std::cout << "  VDEC Standalone Test" << std::endl;
-    std::cout << "  Built: " << __DATE__ << " " << __TIME__ << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << std::endl;
-
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <jpeg_file> [options]" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Arguments:" << std::endl;
-        std::cerr << "  jpeg_file       Input JPEG file path" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Options:" << std::endl;
-        std::cerr << "  --mode MODE     Execution mode (default: thread)" << std::endl;
-        std::cerr << "                   thread   : Use threads (like SDK sample)" << std::endl;
-        std::cerr << "                   sequential: Sequential execution (simplified)" << std::endl;
-        std::cerr << "  -o OUTPUT       YUV output file path (optional)" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Examples:" << std::endl;
-        std::cerr << "  " << argv[0] << " input.jpg" << std::endl;
-        std::cerr << "  " << argv[0] << " input.jpg --mode thread" << std::endl;
-        std::cerr << "  " << argv[0] << " input.jpg --mode sequential -o output.yuv" << std::endl;
-        return 1;
-    }
-
-    // Parse command line arguments
+struct VdecTestConfig {
     std::string jpeg_file;
-    ExecutionMode mode = MODE_THREAD;  // Default: thread mode
-    const char* output_file = nullptr;
+    ExecutionMode mode = MODE_THREAD;
+    std::string output_file;
+};
 
-    for (int i = 1; i < argc; i++) {
+namespace {
+VdecTestConfig g_vdec_config;
+
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " <jpeg_file> [options]" << std::endl;
+    std::cout << "Options:" << std::endl;
+    std::cout << "  --mode MODE     Execution mode (default: thread)" << std::endl;
+    std::cout << "                   thread   : Use threads (like SDK sample)" << std::endl;
+    std::cout << "                   sequential: Sequential execution (simplified)" << std::endl;
+    std::cout << "  -o OUTPUT       YUV output file path (optional)" << std::endl;
+    std::cout << "  --jpeg FILE     Input JPEG file path" << std::endl;
+}
+
+void parse_args(int* argc, char** argv) {
+    std::vector<char*> keep;
+    keep.reserve(static_cast<size_t>(*argc));
+    keep.push_back(argv[0]);
+
+    for (int i = 1; i < *argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "--mode" && i + 1 < argc) {
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+        if (arg == "--mode" && i + 1 < *argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "thread" || mode_str == "t") {
-                mode = MODE_THREAD;
+                g_vdec_config.mode = MODE_THREAD;
             } else if (mode_str == "sequential" || mode_str == "s") {
-                mode = MODE_SEQUENTIAL;
+                g_vdec_config.mode = MODE_SEQUENTIAL;
             } else {
                 std::cerr << "[ERROR] Invalid mode: " << mode_str << std::endl;
-                std::cerr << "Valid modes: thread, sequential" << std::endl;
-                return 1;
+                std::exit(1);
             }
-        } else if (arg == "-o" && i + 1 < argc) {
-            output_file = argv[++i];
-        } else if (arg[0] != '-') {
-            // Positional argument: JPEG file
-            if (jpeg_file.empty()) {
-                jpeg_file = arg;
-            } else {
-                std::cerr << "[ERROR] Multiple JPEG files specified" << std::endl;
-                return 1;
-            }
-        } else {
-            std::cerr << "[ERROR] Unknown option: " << arg << std::endl;
-            return 1;
+            continue;
         }
+        if ((arg == "-o" || arg == "--output") && i + 1 < *argc) {
+            g_vdec_config.output_file = argv[++i];
+            continue;
+        }
+        if (arg == "--jpeg" && i + 1 < *argc) {
+            g_vdec_config.jpeg_file = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--jpeg=", 0) == 0) {
+            g_vdec_config.jpeg_file = arg.substr(7);
+            continue;
+        }
+        if (!arg.empty() && arg[0] != '-') {
+            if (g_vdec_config.jpeg_file.empty()) {
+                g_vdec_config.jpeg_file = arg;
+                continue;
+            }
+        }
+
+        keep.push_back(argv[i]);
     }
 
-    if (jpeg_file.empty()) {
-        std::cerr << "[ERROR] No JPEG file specified" << std::endl;
-        return 1;
+    int out_argc = 0;
+    for (char* arg : keep) {
+        argv[out_argc++] = arg;
+    }
+    *argc = out_argc;
+}
+}  // namespace
+
+static bool run_vdec_test(const VdecTestConfig& config) {
+    if (config.jpeg_file.empty()) {
+        return false;
     }
 
-    // Display mode
     std::cout << "[CONFIG] Execution mode: "
-              << (mode == MODE_THREAD ? "THREAD (parallel)" : "SEQUENTIAL (simplified)")
+              << (config.mode == MODE_THREAD ? "THREAD (parallel)" : "SEQUENTIAL (simplified)")
               << std::endl;
-    std::cout << "[CONFIG] Input file: " << jpeg_file << std::endl;
-    if (output_file) {
-        std::cout << "[CONFIG] Output file: " << output_file << std::endl;
+    std::cout << "[CONFIG] Input file: " << config.jpeg_file << std::endl;
+    if (!config.output_file.empty()) {
+        std::cout << "[CONFIG] Output file: " << config.output_file << std::endl;
     }
-    std::cout << std::endl;
+
     const VDEC_CHN vdec_chn = 0;
     const uint32_t max_width = 1920;
     const uint32_t max_height = 1080;
 
-    // Initialize SYS (no VB pool creation needed in COMMON mode)
     if (!init_vb_and_sys_for_vdec(max_width, max_height)) {
-        return 1;
+        return false;
     }
 
-    // Initialize VDEC channel (COMMON mode - uses system VB pools)
     if (!init_vdec_channel(vdec_chn, max_width, max_height)) {
         cleanup_vb_and_sys();
-        return 1;
+        return false;
     }
 
-    // Decode JPEG file using selected mode
-    bool success;
-    if (mode == MODE_SEQUENTIAL) {
-        success = decode_jpeg_file_sequential(vdec_chn, jpeg_file, output_file);
+    bool success = false;
+    if (config.mode == MODE_SEQUENTIAL) {
+        success = decode_jpeg_file_sequential(vdec_chn, config.jpeg_file,
+                                              config.output_file.empty() ? nullptr : config.output_file.c_str());
     } else {
-        success = decode_jpeg_file(vdec_chn, jpeg_file, output_file);
+        success = decode_jpeg_file(vdec_chn, config.jpeg_file,
+                                   config.output_file.empty() ? nullptr : config.output_file.c_str());
     }
 
-    // Cleanup
     cleanup_vdec_channel(vdec_chn);
     cleanup_vb_and_sys();
+    return success;
+}
 
-    if (success) {
-        std::cout << std::endl;
-        std::cout << "========================================" << std::endl;
-        std::cout << "  TEST PASSED" << std::endl;
-        std::cout << "========================================" << std::endl;
-        return 0;
-    } else {
-        std::cout << std::endl;
-        std::cout << "========================================" << std::endl;
-        std::cout << "  TEST FAILED" << std::endl;
-        std::cout << "========================================" << std::endl;
-        return 1;
+TEST(VdecStandaloneTest, Decode) {
+    if (g_vdec_config.jpeg_file.empty()) {
+        GTEST_SKIP() << "No JPEG file provided. Use --jpeg <path> or positional arg.";
     }
+
+    bool ok = run_vdec_test(g_vdec_config);
+    EXPECT_TRUE(ok);
+}
+
+int main(int argc, char* argv[]) {
+    parse_args(&argc, argv);
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }
 
 #else
 
-int main() {
-    std::cerr << "This test requires USE_CVI_MPI to be defined" << std::endl;
-    return 1;
+TEST(VdecStandaloneTest, Skipped) {
+    GTEST_SKIP() << "USE_CVI_MPI not defined";
+}
+
+int main(int argc, char* argv[]) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
 }
 
 #endif // USE_CVI_MPI

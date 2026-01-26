@@ -537,12 +537,11 @@ void draw_detections(cv::Mat& frame, const std::vector<Detection>& detections) {
 // ============ Utilities ============
 
 void print_usage(const char* prog) {
-    std::cout << "Usage: " << prog << " <model.onnx|model.cvimodel> <input> [show] [save=output.mp4] [frames=N]\n";
-    std::cout << "\nInput: image (.jpg, .png) or video (.mp4, .avi)\n";
+    std::cout << "Usage: " << prog << " <model.onnx|model.cvimodel> <input> [show] [save=output.png]\n";
+    std::cout << "\nInput: image (.jpg, .png)\n";
     std::cout << "Options:\n";
     std::cout << "  show         - Display results\n";
-    std::cout << "  save=FILE    - Save output video\n";
-    std::cout << "  frames=N     - Process first N frames only\n";
+    std::cout << "  save=FILE    - Save output image\n";
     std::cout << "  profile      - Print detailed timing breakdown\n";
     std::cout << "\nModel expectations:\n";
     std::cout << "  .cvimodel: YOLOv8 head outputs (6 tensors: 3 reg + 3 cls)\n";
@@ -562,7 +561,6 @@ int main(int argc, char* argv[]) {
 
     bool show_result = false;
     std::string save_path = "";
-    int max_frames = -1;
     bool profile = false;
     float conf_thres = CONF_THRES;
     float iou_thres = IOU_THRES;
@@ -576,8 +574,6 @@ int main(int argc, char* argv[]) {
             profile = true;
         } else if (arg.find("save=") == 0) {
             save_path = arg.substr(5);
-        } else if (arg.find("frames=") == 0) {
-            max_frames = std::stoi(arg.substr(7));
         }
     }
 
@@ -706,192 +702,50 @@ int main(int argc, char* argv[]) {
             return results;
         };
 
-        if (is_video_file(input_path)) {
-#if defined(USE_CVI_TPU)
-            throw std::runtime_error("Video input not supported on SG200X SDK (no OpenCV videoio)");
-#else
-            // ========== Video inference ==========
-            cv::VideoCapture cap(input_path);
-            if (!cap.isOpened()) {
-                throw std::runtime_error("Failed to open video: " + input_path);
+        // ========== Image inference ==========
+        std::cout << "Loading image: " << input_path << "\n";
+        cv::Mat img = cv::imread(input_path);
+        if (img.empty()) {
+            throw std::runtime_error("Failed to load image");
+        }
+        std::cout << "Image size: " << img.cols << "x" << img.rows << "\n\n";
+
+        TimingBreakdown timing;
+        auto results = infer_func(img, &timing);
+        double total_ms = timing.preprocess_ms + timing.inference_ms + timing.postprocess_ms;
+        std::cout << "Timing (ms): preprocess=" << std::fixed << std::setprecision(2)
+                  << timing.preprocess_ms << ", inference=" << timing.inference_ms
+                  << ", postprocess=" << timing.postprocess_ms
+                  << ", total=" << total_ms << "\n";
+        if (profile) {
+            std::cout << "  preprocess detail (ms): resize=" << timing.resize_ms
+                      << ", blob=" << timing.blob_ms << "\n";
+#ifdef USE_CVI_TPU
+            if (model_kind == ModelKind::YoloV8Head) {
+                std::cout << "  cvi detail (ms): input=" << timing.cvi_input_ms
+                          << ", forward=" << timing.cvi_forward_ms
+                          << ", output=" << timing.cvi_output_ms << "\n";
             }
+#endif
+        }
 
-            int fps = cap.get(cv::CAP_PROP_FPS);
-            int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
-            int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-            int total_frames = cap.get(cv::CAP_PROP_FRAME_COUNT);
+        print_results(results);
 
-            std::cout << "\n=== Video Info ===\n";
-            std::cout << "Resolution: " << width << "x" << height << "\n";
-            std::cout << "FPS: " << fps << "\n";
-            std::cout << "Total frames: " << total_frames << "\n";
-            if (max_frames > 0) std::cout << "Limit: " << max_frames << " frames\n";
-            std::cout << "\n";
+        if (show_result || !save_path.empty()) {
+            draw_detections(img, results);
 
-            cv::VideoWriter writer;
             if (!save_path.empty()) {
-                int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-                writer.open(save_path, fourcc, fps, cv::Size(width, height));
-                if (writer.isOpened()) {
-                    std::cout << "Output: " << save_path << "\n\n";
-                }
+                cv::imwrite(save_path, img);
+                std::cout << "\nResult saved: " << save_path << "\n";
             }
-
-            // Pre-allocate buffers for video processing (avoid per-frame allocation)
-            cv::Mat padded_buffer;
-            std::vector<float> blob_buffer(3 * input_h * input_w);
-
-            // Optimized video inference lambda (uses pre-allocated buffers + cached config)
-            auto video_infer_func = [&](const cv::Mat& frame) -> std::vector<Detection> {
-                // 1. Preprocess (reuse buffers)
-                auto meta = letterbox_resize(frame, padded_buffer, input_w, input_h, STRIDE,
-                                             static_cast<uint8_t>(preprocess_params.pad_value));
-                hwc_to_blob(padded_buffer, blob_buffer, input_layout, preprocess_params, true);
-
-                std::vector<Detection> results;
-                if (model_kind == ModelKind::YoloV8Head) {
-#ifdef USE_CVI_TPU
-                    std::vector<std::vector<float>> outputs;
-                    std::vector<std::vector<int64_t>> shapes;
-                    cvi_session->run_all(blob_buffer.data(), run_shape, &outputs, &shapes);
-                    auto heads = collect_yolov8_heads(outputs, shapes, input_w, input_h, yolo_params);
-                    results = postprocess_yolov8_heads(
-                        heads, yolo_params, input_w, input_h, meta, conf_thres, iou_thres);
-#else
-                    throw std::runtime_error("CVI model requires TPU backend");
-#endif
-                } else {
-                    auto out_pair = session->run(blob_buffer.data(), run_shape);
-                    results = postprocess_yolov8_fused(
-                        out_pair.first, out_pair.second, meta, conf_thres, iou_thres);
-                }
-
-                return results;
-            };
-
-            std::cout << "Processing video...\n\n";
-
-            // Memory monitoring
-            MemoryInfo mem_start, mem_current, mem_peak;
-            mem_start.update();
-            mem_current = mem_start;
-            mem_peak = mem_start;
-
-            int frame_count = 0;
-            auto start_time = std::chrono::high_resolution_clock::now();
-
-            cv::Mat frame;
-            while (cap.read(frame)) {
-                frame_count++;
-                if (max_frames > 0 && frame_count > max_frames) break;
-
-                auto results = video_infer_func(frame);
-                draw_detections(frame, results);
-
-                if (writer.isOpened()) writer.write(frame);
-                if (show_result) {
-                    cv::imshow("Inference", frame);
-                    if (cv::waitKey(1) == 27) break;  // ESC to exit
-                }
-
-                // Update memory tracking
-                mem_current.update();
-                if (mem_current.vm_rss_kb > mem_peak.vm_rss_kb) {
-                    mem_peak = mem_current;
-                }
-
-                // Print progress (every 30 frames or first frame)
-                if (frame_count % 30 == 0 || frame_count == 1) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-                    double current_fps = frame_count * 1000.0 / elapsed_ms;
-                    std::cout << "\rFrame: " << frame_count
-                             << " | FPS: " << std::fixed << std::setprecision(1) << current_fps
-                             << " | Det: " << results.size()
-                             << " | " << mem_current.to_string() << "     " << std::flush;
-                }
-            }
-
-            auto end_time = std::chrono::high_resolution_clock::now();
-            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-
-            std::cout << "\n\n=== Performance Summary ===\n";
-            std::cout << "Processed: " << frame_count << " frames\n";
-            std::cout << "Time: " << std::fixed << std::setprecision(2) << (total_ms / 1000.0) << " s\n";
-            std::cout << "Average FPS: " << std::fixed << std::setprecision(2)
-                     << (frame_count * 1000.0 / total_ms) << "\n";
-
-            // Memory summary
-            std::cout << "\n=== Memory Summary ===\n";
-            std::cout << "Initial:  " << mem_start.to_string() << "\n";
-            std::cout << "Final:    " << mem_current.to_string() << "\n";
-            std::cout << "Peak:     " << mem_peak.to_string() << "\n";
-
-            // Memory leak detection
-            long mem_increase_kb = static_cast<long>(mem_current.vm_rss_kb) - static_cast<long>(mem_start.vm_rss_kb);
-            double mem_per_frame_kb = frame_count > 0 ? static_cast<double>(mem_increase_kb) / frame_count : 0.0;
-            std::cout << "Increase: " << std::fixed << std::setprecision(1)
-                     << (mem_increase_kb / 1024.0) << " MB total, "
-                     << mem_per_frame_kb << " KB/frame\n";
-
-            if (frame_count > 100 && mem_per_frame_kb > 10.0) {
-                std::cout << "\n⚠️  Warning: Memory leak detected (>" << mem_per_frame_kb << " KB/frame)\n";
-            }
-
-            cap.release();
-            if (writer.isOpened()) {
-                writer.release();
-                std::cout << "\nOutput saved: " << save_path << "\n";
-            }
-            if (show_result) cv::destroyAllWindows();
-#endif
-
-        } else {
-            // ========== Image inference ==========
-            std::cout << "Loading image: " << input_path << "\n";
-            cv::Mat img = cv::imread(input_path);
-            if (img.empty()) {
-                throw std::runtime_error("Failed to load image");
-            }
-            std::cout << "Image size: " << img.cols << "x" << img.rows << "\n\n";
-
-            TimingBreakdown timing;
-            auto results = infer_func(img, &timing);
-            double total_ms = timing.preprocess_ms + timing.inference_ms + timing.postprocess_ms;
-            std::cout << "Timing (ms): preprocess=" << std::fixed << std::setprecision(2)
-                      << timing.preprocess_ms << ", inference=" << timing.inference_ms
-                      << ", postprocess=" << timing.postprocess_ms
-                      << ", total=" << total_ms << "\n";
-            if (profile) {
-                std::cout << "  preprocess detail (ms): resize=" << timing.resize_ms
-                          << ", blob=" << timing.blob_ms << "\n";
-#ifdef USE_CVI_TPU
-                if (model_kind == ModelKind::YoloV8Head) {
-                    std::cout << "  cvi detail (ms): input=" << timing.cvi_input_ms
-                              << ", forward=" << timing.cvi_forward_ms
-                              << ", output=" << timing.cvi_output_ms << "\n";
-                }
-#endif
-            }
-
-            print_results(results);
-
-            if (show_result || !save_path.empty()) {
-                draw_detections(img, results);
-
-                if (!save_path.empty()) {
-                    cv::imwrite(save_path, img);
-                    std::cout << "\nResult saved: " << save_path << "\n";
-                }
 
 #if !defined(USE_CVI_TPU)
-                if (show_result) {
-                    cv::imshow("Result", img);
-                    std::cout << "Press any key to exit...\n";
-                    cv::waitKey(0);
-                }
-#endif
+            if (show_result) {
+                cv::imshow("Result", img);
+                std::cout << "Press any key to exit...\n";
+                cv::waitKey(0);
             }
+#endif
         }
 
     } catch (const std::exception& e) {

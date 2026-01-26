@@ -3,68 +3,25 @@
  */
 
 #include "test_common.h"
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 // ============================================================
-// TestSuite Implementation
+// Test Config
 // ============================================================
 
-void TestSuite::add_result(const std::string& name, bool passed, double time_ms,
-                          const std::string& message) {
-    results_.push_back({name, passed, time_ms, message});
-
-    std::cout << (passed ? "  ✓ " : "  ✗ ")
-              << std::left << std::setw(55) << name;
-
-    if (time_ms > 0) {
-        std::cout << std::right << std::fixed << std::setprecision(3)
-                  << std::setw(10) << time_ms << " ms";
-    }
-
-    if (!message.empty()) {
-        std::cout << "  (" << message << ")";
-    }
-
-    std::cout << std::endl;
+TestConfig& TestConfig::instance() {
+    static TestConfig config;
+    return config;
 }
 
-void TestSuite::print_summary() const {
-    std::cout << "\n========== Test Summary ==========" << std::endl;
-
-    int passed = 0;
-    int failed = 0;
-    double total_time = 0.0;
-
-    for (const auto& r : results_) {
-        if (r.passed) passed++;
-        else failed++;
-        total_time += r.time_ms;
-    }
-
-    std::cout << "Tests passed: " << passed << "/" << (passed + failed) << std::endl;
-
-    if (failed > 0) {
-        std::cout << "\nFailed tests:" << std::endl;
-        for (const auto& r : results_) {
-            if (!r.passed) {
-                std::cout << "  - " << r.name;
-                if (!r.message.empty()) {
-                    std::cout << ": " << r.message;
-                }
-                std::cout << std::endl;
-            }
-        }
-    }
-
-    std::cout << "\nTotal time: " << std::fixed << std::setprecision(3)
-              << total_time << " ms" << std::endl;
-    std::cout << "==================================\n" << std::endl;
+void set_test_image_path(const std::string& path) {
+    TestConfig::instance().image_path = path;
 }
 
-bool TestSuite::all_passed() const {
-    for (const auto& r : results_) {
-        if (!r.passed) return false;
-    }
-    return true;
+const std::string& test_image_path() {
+    return TestConfig::instance().image_path;
 }
 
 // ============================================================
@@ -166,6 +123,81 @@ cv::Mat create_test_image(int width, int height) {
 #include "cv/cvi_sensor.h"
 #endif
 
+namespace {
+bool g_cvi_ready = false;
+
+bool vb_trace_enabled() {
+    static int cached = -1;
+    if (cached != -1) {
+        return cached == 1;
+    }
+    const char* env = std::getenv("LUA_VB_TRACE");
+    if (!env || env[0] == '\0') {
+        cached = 1;
+        return true;
+    }
+    if (env[0] == '0' || env[0] == 'n' || env[0] == 'N') {
+        cached = 0;
+        return false;
+    }
+    if (std::strcmp(env, "false") == 0 || std::strcmp(env, "FALSE") == 0) {
+        cached = 0;
+        return false;
+    }
+    cached = 1;
+    return true;
+}
+
+void dump_vb_proc(const std::string& tag) {
+    if (!vb_trace_enabled()) {
+        return;
+    }
+    std::ifstream file("/proc/cvitek/vb");
+    if (!file) {
+        std::cerr << "[VBTRACE] " << tag << " (cannot open /proc/cvitek/vb)" << std::endl;
+        return;
+    }
+
+    std::ostringstream oss;
+    std::string line;
+    size_t total = 0;
+    const size_t max_bytes = 4096;
+    while (std::getline(file, line)) {
+        if (total + line.size() + 1 > max_bytes) {
+            line.resize(max_bytes - total);
+        }
+        oss << line << "\n";
+        total += line.size() + 1;
+        if (total >= max_bytes) {
+            break;
+        }
+    }
+    std::cerr << "[VBTRACE] " << tag << "\n" << oss.str() << std::endl;
+}
+}
+
+class VbTraceListener : public ::testing::EmptyTestEventListener {
+public:
+    void OnTestStart(const ::testing::TestInfo& info) override {
+        if (!vb_trace_enabled() || !g_cvi_ready) {
+            return;
+        }
+        std::ostringstream tag;
+        tag << "START " << info.test_suite_name() << "." << info.name();
+        dump_vb_proc(tag.str());
+    }
+
+    void OnTestEnd(const ::testing::TestInfo& info) override {
+        if (!vb_trace_enabled() || !g_cvi_ready) {
+            return;
+        }
+        std::ostringstream tag;
+        tag << "END " << info.test_suite_name() << "." << info.name()
+            << " (" << (info.result()->Passed() ? "PASS" : "FAIL") << ")";
+        dump_vb_proc(tag.str());
+    }
+};
+
 // Helper to find suitable pool for a given frame size
 VB_POOL find_suitable_vb_pool(uint32_t width, uint32_t height, PIXEL_FORMAT_E fmt) {
     uint32_t needed_size = COMMON_GetPicBufferSize(width, height, fmt,
@@ -215,28 +247,17 @@ bool init_cvi_system() {
     }
 #endif
 
-    lua_cv::VbPoolPlan vb_plan;
-    vb_plan.add_pool(sensor_width, sensor_height, lua_cv::PixelFormat::NV21, 3, VB_REMAP_MODE_CACHED);
-    if (sensor_width != 1280 || sensor_height != 720) {
-        vb_plan.add_pool(1280, 720, lua_cv::PixelFormat::NV21, 3, VB_REMAP_MODE_CACHED);
+    if (!lua_cv::MmfContext::is_supported_camera_size(sensor_width, sensor_height)) {
+        std::cerr << "[ERROR] Unsupported camera resolution " << sensor_width
+                  << "x" << sensor_height << std::endl;
+        return false;
     }
-    vb_plan.add_pool(1280, 720, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
-    vb_plan.add_pool(640, 640, lua_cv::PixelFormat::BGR, 3, VB_REMAP_MODE_CACHED);
-    vb_plan.add_pool(640, 480, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
-    vb_plan.add_pool(320, 240, lua_cv::PixelFormat::BGR, 2, VB_REMAP_MODE_CACHED);
 
     lua_cv::MmfContext::Config config;
-    config.vb_plan = vb_plan;
     config.force_reset = true;
-
-    for (int i = 0; i < VI_MAX_PIPE_NUM; ++i) {
-        config.mode_plan.vi_vpss_mode.aenMode[i] = VI_OFFLINE_VPSS_ONLINE;
-    }
-
-    config.mode_plan.vpss_mode.enMode = VPSS_MODE_DUAL;
-    for (int i = 0; i < VPSS_IP_NUM; ++i) {
-        config.mode_plan.vpss_mode.aenInput[i] = (i == 0) ? VPSS_INPUT_MEM : VPSS_INPUT_ISP;
-        config.mode_plan.vpss_mode.ViPipe[i] = 0;
+    if (!lua_cv::MmfContext::build_default_config(&config)) {
+        std::cerr << "[ERROR] Failed to build MMF default config" << std::endl;
+        return false;
     }
 
     if (!lua_cv::MmfContext::instance().init(config)) {
@@ -251,5 +272,35 @@ bool init_cvi_system() {
 void cleanup_cvi_system() {
     std::cout << "\n[CLEANUP] Shutting down CVI VB and SYS modules..." << std::endl;
     lua_cv::MmfContext::instance().shutdown();
+}
+
+bool is_cvi_ready() {
+    return g_cvi_ready;
+}
+
+class CviTestEnvironment : public ::testing::Environment {
+public:
+    void SetUp() override {
+        g_cvi_ready = init_cvi_system();
+        if (!g_cvi_ready) {
+            std::cerr << "[WARN] CVI init failed; CVI-dependent tests will be skipped."
+                      << std::endl;
+        }
+    }
+
+    void TearDown() override {
+        if (g_cvi_ready) {
+            cleanup_cvi_system();
+            g_cvi_ready = false;
+        }
+    }
+};
+
+void register_cvi_environment() {
+    ::testing::AddGlobalTestEnvironment(new CviTestEnvironment());
+    if (vb_trace_enabled()) {
+        ::testing::TestEventListeners& listeners = ::testing::UnitTest::GetInstance()->listeners();
+        listeners.Append(new VbTraceListener());
+    }
 }
 #endif

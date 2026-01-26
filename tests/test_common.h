@@ -2,7 +2,7 @@
  * test_common.h - Common test infrastructure for CV module tests
  *
  * Provides:
- * - TestSuite and TestResult for test management
+ * - gtest configuration helpers
  * - Timer and benchmark utilities
  * - Test image generation helpers
  * - Shared includes and forward declarations
@@ -19,6 +19,7 @@
 #include <cstring>
 #include <functional>
 
+#include <gtest/gtest.h>
 #include <opencv2/opencv.hpp>
 
 // CV module headers
@@ -38,29 +39,14 @@
 
 using namespace lua_cv;
 
-// ============================================================
-// Test Infrastructure
-// ============================================================
+struct TestConfig {
+    std::string image_path;
 
-struct TestResult {
-    std::string name;
-    bool passed;
-    double time_ms;
-    std::string message;
+    static TestConfig& instance();
 };
 
-class TestSuite {
-public:
-    void add_result(const std::string& name, bool passed, double time_ms = 0.0,
-                    const std::string& message = "");
-
-    void print_summary() const;
-
-    bool all_passed() const;
-
-private:
-    std::vector<TestResult> results_;
-};
+void set_test_image_path(const std::string& path);
+const std::string& test_image_path();
 
 // ============================================================
 // Performance Measurement
@@ -104,4 +90,48 @@ cv::Mat create_test_image(int width, int height);
 bool init_cvi_system();
 void cleanup_cvi_system();
 VB_POOL find_suitable_vb_pool(uint32_t width, uint32_t height, PIXEL_FORMAT_E fmt);
+bool is_cvi_ready();
+void register_cvi_environment();
+
+class VbBlockGuard {
+public:
+    explicit VbBlockGuard(VB_BLK block = VB_INVALID_HANDLE) : block_(block) {}
+    ~VbBlockGuard() { reset(); }
+
+    VbBlockGuard(const VbBlockGuard&) = delete;
+    VbBlockGuard& operator=(const VbBlockGuard&) = delete;
+
+    VbBlockGuard(VbBlockGuard&& other) noexcept : block_(other.block_) {
+        other.block_ = VB_INVALID_HANDLE;
+    }
+    VbBlockGuard& operator=(VbBlockGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            block_ = other.block_;
+            other.block_ = VB_INVALID_HANDLE;
+        }
+        return *this;
+    }
+
+    void reset(VB_BLK block = VB_INVALID_HANDLE) {
+        if (block_ != VB_INVALID_HANDLE) {
+            CVI_S32 rc = CVI_VB_ReleaseBlock(block_);
+            if (rc != CVI_SUCCESS) {
+                std::cerr << "[WARN] VbBlockGuard: CVI_VB_ReleaseBlock failed: 0x"
+                          << std::hex << rc << std::dec << std::endl;
+            }
+        }
+        block_ = block;
+    }
+
+    VB_BLK get() const { return block_; }
+    VB_BLK release() {
+        VB_BLK tmp = block_;
+        block_ = VB_INVALID_HANDLE;
+        return tmp;
+    }
+
+private:
+    VB_BLK block_ = VB_INVALID_HANDLE;
+};
 #endif

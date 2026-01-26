@@ -7,6 +7,7 @@
 
 #ifdef USE_CVI_CAMERA
 #include <pthread.h>
+#include <cvi_comm_vb.h>
 #include <linux/cvi_comm_vpss.h>
 #include <linux/cvi_comm_vi.h>
 #include <linux/cvi_comm_video.h>
@@ -21,7 +22,9 @@ public:
         int width = 0;
         int height = 0;
         double fps = 30.0;
-        PixelFormat format = PixelFormat::NV21;
+        PixelFormat format = PixelFormat::BGR;
+        int vpss_grp = -1;
+        bool enable_infer = true;
     };
 
     CviCamera();
@@ -78,6 +81,7 @@ private:
     bool vpss_created_ = false;
     bool vpss_started_ = false;
     bool vpss_chn_enabled_ = false;
+    bool vpss_stream_chn_enabled_ = false;
     bool vi_vpss_bound_ = false;
     bool isp_inited_ = false;
     bool isp_thread_running_ = false;
@@ -87,9 +91,17 @@ private:
 
     VPSS_GRP vpss_grp_ = 0;
     VPSS_CHN vpss_chn_ = 0;
+    VPSS_CHN vpss_stream_chn_ = 0;
     VI_DEV vi_dev_ = 0;
     VI_PIPE vi_pipe_ = 0;
     VI_CHN vi_chn_ = 0;
+
+    VB_POOL vi_pool_ = VB_INVALID_POOLID;
+    VB_POOL vpss_pool_ = VB_INVALID_POOLID;
+    bool vi_pool_attached_ = false;
+    bool vpss_pool_attached_ = false;
+    VB_POOL vpss_stream_pool_ = VB_INVALID_POOLID;
+    bool vpss_stream_pool_attached_ = false;
 
     pthread_t isp_thread_{};
 };

@@ -24,6 +24,7 @@ public:
     bool ensure_initialized(uint32_t width, uint32_t height);
     void cleanup();
     bool is_initialized() const { return initialized_; }
+    int channel() const { return static_cast<int>(chn_); }
 
     VIDEO_FRAME_INFO_S decode(const uint8_t* data, size_t size);
     VIDEO_FRAME_INFO_S decode_sync(const uint8_t* data, size_t size);

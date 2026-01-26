@@ -7,6 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include <unistd.h>
+#include <fstream>
 
 #ifdef USE_CVI_MPI
 #include <cvi_sys.h>
@@ -15,8 +16,90 @@
 #endif
 
 namespace lua_cv {
+#ifdef USE_CVI_MPI
+namespace {
+int select_vpss_group_for_mem() {
+    return MmfContext::vpss_group_for_mem();
+}
+
+void dump_vb_proc(const char* tag) {
+    std::ifstream file("/proc/cvitek/vb");
+    if (!file) {
+        std::cerr << "[VBTRACE] " << tag << " (cannot open /proc/cvitek/vb)" << std::endl;
+        return;
+    }
+
+    std::ostringstream oss;
+    std::string line;
+    size_t total = 0;
+    const size_t max_bytes = 4096;
+    while (std::getline(file, line)) {
+        if (total + line.size() + 1 > max_bytes) {
+            line.resize(max_bytes - total);
+        }
+        oss << line << "\n";
+        total += line.size() + 1;
+        if (total >= max_bytes) {
+            break;
+        }
+    }
+    std::cerr << "[VBTRACE] " << tag << "\n" << oss.str() << std::endl;
+}
+
+void log_vpss_create_context(const VPSS_GRP_ATTR_S& grp_attr,
+                             PixelFormat input_format,
+                             VPSS_GRP grp,
+                             CVI_S32 rc) {
+    std::cerr << "[ERROR] CviVpssProcessor: CVI_VPSS_CreateGrp failed: 0x"
+              << std::hex << rc << std::dec
+              << " grp=" << grp
+              << " vpss_dev=" << static_cast<int>(grp_attr.u8VpssDev)
+              << " input=" << pixel_format_name(input_format)
+              << "(" << static_cast<int>(grp_attr.enPixelFormat) << ")"
+              << " max=" << grp_attr.u32MaxW << "x" << grp_attr.u32MaxH
+              << std::endl;
+    VPSS_GRP avail_grp = CVI_VPSS_GetAvailableGrp();
+    std::cerr << "[ERROR] CviVpssProcessor: VPSS available grp=" << avail_grp << std::endl;
+
+    VPSS_MODE_S vpss_mode{};
+    CVI_S32 mode_rc = CVI_SYS_GetVPSSModeEx(&vpss_mode);
+    if (mode_rc == CVI_SUCCESS) {
+        std::ostringstream oss;
+        oss << "[ERROR] CviVpssProcessor: VPSS mode ex enMode=" << vpss_mode.enMode;
+        for (int i = 0; i < VPSS_IP_NUM; ++i) {
+            oss << " input" << i << "=" << vpss_mode.aenInput[i]
+                << " viPipe" << i << "=" << vpss_mode.ViPipe[i];
+        }
+        std::cerr << oss.str() << std::endl;
+    } else {
+        std::cerr << "[WARN] CviVpssProcessor: CVI_SYS_GetVPSSModeEx failed: 0x"
+                  << std::hex << mode_rc << std::dec << std::endl;
+    }
+
+    VI_VPSS_MODE_S vi_vpss{};
+    CVI_S32 vi_mode_rc = CVI_SYS_GetVIVPSSMode(&vi_vpss);
+    if (vi_mode_rc == CVI_SUCCESS) {
+        std::ostringstream oss;
+        oss << "[ERROR] CviVpssProcessor: VI-VPSS mode";
+        for (int i = 0; i < VI_MAX_PIPE_NUM; ++i) {
+            oss << " pipe" << i << "=" << vi_vpss.aenMode[i];
+            if (i >= 3) {
+                break;
+            }
+        }
+        std::cerr << oss.str() << std::endl;
+    } else {
+        std::cerr << "[WARN] CviVpssProcessor: CVI_SYS_GetVIVPSSMode failed: 0x"
+                  << std::hex << vi_mode_rc << std::dec << std::endl;
+    }
+}
+}  // namespace
+#endif
 
 CviVpssProcessor::CviVpssProcessor() {
+#ifdef USE_CVI_MPI
+    chn_ = static_cast<VPSS_CHN>(MmfContext::vpss_channel_for_mem());
+#endif
 }
 
 CviVpssProcessor::~CviVpssProcessor() {
@@ -34,13 +117,16 @@ void CviVpssProcessor::resize(Frame& frame, int width, int height) {
         throw std::invalid_argument("CviVpssProcessor::resize - invalid dimensions");
     }
 
+    const int ori_w = frame.width();
+    const int ori_h = frame.height();
+
     PixelFormat input_format = frame.pixel_format();
     if (input_format == PixelFormat::UNKNOWN) {
         input_format = PixelFormat::BGR;
     }
 
     process_frame(frame, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-                  input_format, false, 0, 0, 0, 0);
+                  input_format, false, 0, 0, 0, 0, false, 0);
 #else
     (void)frame;
     (void)width;
@@ -80,7 +166,7 @@ void CviVpssProcessor::cvtColor(Frame& frame, ColorConversion code) {
 
     process_frame(frame, static_cast<uint32_t>(frame.width()),
                   static_cast<uint32_t>(frame.height()), output_format,
-                  false, 0, 0, 0, 0);
+                  false, 0, 0, 0, 0, false, 0);
 #else
     (void)frame;
     (void)code;
@@ -104,13 +190,52 @@ void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
     }
 
     process_frame(frame, static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-                  input_format, true, x, y, w, h);
+                  input_format, true, x, y, w, h, false, 0);
 #else
     (void)frame;
     (void)x;
     (void)y;
     (void)w;
     (void)h;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
+}
+
+void CviVpssProcessor::letterbox(Frame& frame, int width, int height, uint8_t pad_value,
+                                 LetterboxMeta* meta) {
+#ifdef USE_CVI_MPI
+    if (frame.empty()) {
+        throw std::invalid_argument("CviVpssProcessor::letterbox - frame is empty");
+    }
+    if (width <= 0 || height <= 0) {
+        throw std::invalid_argument("CviVpssProcessor::letterbox - invalid dimensions");
+    }
+
+    const int ori_w = frame.width();
+    const int ori_h = frame.height();
+
+    PixelFormat output_format = PixelFormat::RGB_PLANAR;
+
+    process_frame(frame, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                  output_format, false, 0, 0, 0, 0, true, pad_value);
+
+    if (meta) {
+        const float scale_w = static_cast<float>(width) / static_cast<float>(ori_w);
+        const float scale_h = static_cast<float>(height) / static_cast<float>(ori_h);
+        meta->scale = std::min(scale_w, scale_h);
+        const int new_w = static_cast<int>(ori_w * meta->scale + 0.5f);
+        const int new_h = static_cast<int>(ori_h * meta->scale + 0.5f);
+        meta->pad_x = (width - new_w) / 2;
+        meta->pad_y = (height - new_h) / 2;
+        meta->ori_w = ori_w;
+        meta->ori_h = ori_h;
+    }
+#else
+    (void)frame;
+    (void)width;
+    (void)height;
+    (void)pad_value;
+    (void)meta;
     throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
 #endif
 }
@@ -191,12 +316,14 @@ VIDEO_FRAME_INFO_S CviVpssProcessor::mat_to_video_frame(const cv::Mat& mat, VB_B
         }
     }
     if (vb_block == VB_INVALID_HANDLE) {
+        dump_vb_proc("mat_to_video_frame - CVI_VB_GetBlock failed");
         throw std::runtime_error("mat_to_video_frame - CVI_VB_GetBlock failed");
     }
 
     CVI_U64 phys = CVI_VB_Handle2PhysAddr(vb_block);
     void* virt = CVI_SYS_MmapCache(phys, alloc_size);
     if (!virt) {
+        dump_vb_proc("mat_to_video_frame - CVI_SYS_MmapCache failed");
         CVI_VB_ReleaseBlock(vb_block);
         throw std::runtime_error("mat_to_video_frame - CVI_SYS_MmapCache failed");
     }
@@ -251,6 +378,17 @@ void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height,
         throw std::runtime_error("CviVpssProcessor - MmfContext not initialized");
     }
 
+    const uint32_t max_width = MmfContext::vpss_max_width_for_mem();
+    const uint32_t max_height = MmfContext::vpss_max_height_for_mem();
+    if ((max_width > 0 && input_width > max_width) ||
+        (max_height > 0 && input_height > max_height)) {
+        std::ostringstream oss;
+        oss << "CviVpssProcessor - input size exceeds mem VPSS max "
+            << max_width << "x" << max_height
+            << " (got " << input_width << "x" << input_height << ")";
+        throw std::runtime_error(oss.str());
+    }
+
     if (group_created_ && input_width == max_width_ && input_height == max_height_
         && input_format == input_format_) {
         return;
@@ -262,30 +400,36 @@ void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height,
     grp_attr.u32MaxW = input_width;
     grp_attr.u32MaxH = input_height;
     grp_attr.enPixelFormat = to_cvi_pixel_format(input_format);
+    if (grp_attr.enPixelFormat == PIXEL_FORMAT_MAX) {
+        throw std::runtime_error("CviVpssProcessor - unsupported input pixel format");
+    }
     grp_attr.stFrameRate.s32SrcFrameRate = -1;
     grp_attr.stFrameRate.s32DstFrameRate = -1;
-    CVI_U8 vpss_dev = 0;
-    const auto& mode = MmfContext::instance().mode_plan().vpss_mode;
-    if (mode.enMode == VPSS_MODE_DUAL) {
-        for (int i = 0; i < VPSS_IP_NUM; ++i) {
-            if (mode.aenInput[i] == VPSS_INPUT_MEM) {
-                vpss_dev = static_cast<CVI_U8>(i);
-                break;
-            }
-        }
+    int vpss_dev = MmfContext::vpss_dev_for_mem();
+    if (vpss_dev < 0) {
+        throw std::runtime_error("CviVpssProcessor - invalid VPSS dev for MEM input");
     }
-    grp_attr.u8VpssDev = vpss_dev;
+    grp_attr.u8VpssDev = static_cast<CVI_U8>(vpss_dev);
 
     if (grp_ < 0) {
-        grp_ = CVI_VPSS_GetAvailableGrp();
+        grp_ = select_vpss_group_for_mem();
         if (grp_ < 0) {
             throw std::runtime_error("CviVpssProcessor - no available VPSS group");
         }
     }
 
     CVI_S32 rc = CVI_VPSS_CreateGrp(grp_, &grp_attr);
-    if (rc == CVI_ERR_VPSS_EXIST) {
-        std::cerr << "[WARN] CviVpssProcessor: VPSS group exists, destroying and retrying" << std::endl;
+    bool grp_exists = (rc == CVI_ERR_VPSS_EXIST);
+    if (!grp_exists && rc != CVI_SUCCESS) {
+        log_vpss_create_context(grp_attr, input_format, grp_, rc);
+        VPSS_GRP_ATTR_S existing{};
+        CVI_S32 get_rc = CVI_VPSS_GetGrpAttr(grp_, &existing);
+        if (get_rc == CVI_SUCCESS) {
+            grp_exists = true;
+        }
+    }
+    if (grp_exists) {
+        std::cerr << "[WARN] CviVpssProcessor: VPSS group exists, reconfiguring" << std::endl;
         CVI_S32 cleanup_rc = CVI_VPSS_DisableChn(grp_, chn_);
         if (cleanup_rc != CVI_SUCCESS) {
             std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_DisableChn failed: 0x"
@@ -296,23 +440,30 @@ void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height,
             std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_StopGrp failed: 0x"
                       << std::hex << cleanup_rc << std::dec << std::endl;
         }
-        cleanup_rc = CVI_VPSS_DestroyGrp(grp_);
+        cleanup_rc = CVI_VPSS_SetGrpAttr(grp_, &grp_attr);
         if (cleanup_rc != CVI_SUCCESS) {
-            std::cerr << "[WARN] CviVpssProcessor: CVI_VPSS_DestroyGrp failed: 0x"
-                      << std::hex << cleanup_rc << std::dec << std::endl;
+            std::ostringstream oss;
+            oss << "CviVpssProcessor - CVI_VPSS_SetGrpAttr failed: 0x" << std::hex << cleanup_rc;
+            throw std::runtime_error(oss.str());
         }
-        rc = CVI_VPSS_CreateGrp(grp_, &grp_attr);
-    }
-    if (rc != CVI_SUCCESS) {
-        std::ostringstream oss;
-        oss << "CviVpssProcessor - CVI_VPSS_CreateGrp failed: 0x" << std::hex << rc;
-        throw std::runtime_error(oss.str());
-    }
+        rc = CVI_VPSS_ResetGrp(grp_);
+        if (rc != CVI_SUCCESS) {
+            std::ostringstream oss;
+            oss << "CviVpssProcessor - CVI_VPSS_ResetGrp failed: 0x" << std::hex << rc;
+            throw std::runtime_error(oss.str());
+        }
+    } else {
+        if (rc != CVI_SUCCESS) {
+            std::ostringstream oss;
+            oss << "CviVpssProcessor - CVI_VPSS_CreateGrp failed: 0x" << std::hex << rc;
+            throw std::runtime_error(oss.str());
+        }
 
-    rc = CVI_VPSS_ResetGrp(grp_);
-    if (rc != CVI_SUCCESS) {
-        CVI_VPSS_DestroyGrp(grp_);
-        throw std::runtime_error("CviVpssProcessor - CVI_VPSS_ResetGrp failed");
+        rc = CVI_VPSS_ResetGrp(grp_);
+        if (rc != CVI_SUCCESS) {
+            CVI_VPSS_DestroyGrp(grp_);
+            throw std::runtime_error("CviVpssProcessor - CVI_VPSS_ResetGrp failed");
+        }
     }
 
     group_created_ = true;
@@ -322,12 +473,15 @@ void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height,
     input_format_ = input_format;
 }
 
-void CviVpssProcessor::ensure_channel(uint32_t out_width, uint32_t out_height, PixelFormat out_format) {
+void CviVpssProcessor::ensure_channel(uint32_t out_width, uint32_t out_height, PixelFormat out_format,
+                                      bool letterbox, uint8_t pad_value) {
     if (!group_created_) {
         throw std::runtime_error("CviVpssProcessor - VPSS group not created");
     }
 
-    bool need_reconfig = (!group_started_ || out_width_ != out_width || out_height_ != out_height || out_format_ != out_format);
+    bool need_reconfig = (!group_started_ || out_width_ != out_width || out_height_ != out_height ||
+                          out_format_ != out_format || letterbox_enabled_ != letterbox ||
+                          pad_value_ != pad_value);
 
     if (!need_reconfig) {
         return;
@@ -345,6 +499,18 @@ void CviVpssProcessor::ensure_channel(uint32_t out_width, uint32_t out_height, P
     chn_attr.stFrameRate.s32SrcFrameRate = -1;
     chn_attr.stFrameRate.s32DstFrameRate = -1;
     chn_attr.u32Depth = 1;
+    if (letterbox) {
+        chn_attr.stAspectRatio.enMode = ASPECT_RATIO_AUTO;
+        chn_attr.stAspectRatio.bEnableBgColor = CVI_TRUE;
+        chn_attr.stAspectRatio.u32BgColor =
+            (static_cast<CVI_U32>(pad_value) << 16) |
+            (static_cast<CVI_U32>(pad_value) << 8) |
+            static_cast<CVI_U32>(pad_value);
+    } else {
+        chn_attr.stAspectRatio.enMode = ASPECT_RATIO_NONE;
+        chn_attr.stAspectRatio.bEnableBgColor = CVI_FALSE;
+        chn_attr.stAspectRatio.u32BgColor = 0;
+    }
 
     CVI_S32 rc = CVI_VPSS_SetChnAttr(grp_, chn_, &chn_attr);
     if (rc != CVI_SUCCESS) {
@@ -383,18 +549,21 @@ void CviVpssProcessor::ensure_channel(uint32_t out_width, uint32_t out_height, P
     out_width_ = out_width;
     out_height_ = out_height;
     out_format_ = out_format;
+    letterbox_enabled_ = letterbox;
+    pad_value_ = pad_value;
 }
 
 void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t out_height,
                                      PixelFormat out_format, bool use_crop,
-                                     int crop_x, int crop_y, int crop_w, int crop_h) {
+                                     int crop_x, int crop_y, int crop_w, int crop_h,
+                                     bool letterbox, uint8_t pad_value) {
     PixelFormat input_format = frame.pixel_format();
     if (input_format == PixelFormat::UNKNOWN) {
         input_format = PixelFormat::BGR;
     }
 
     ensure_group(static_cast<uint32_t>(frame.width()), static_cast<uint32_t>(frame.height()), input_format);
-    ensure_channel(out_width, out_height, out_format);
+    ensure_channel(out_width, out_height, out_format, letterbox, pad_value);
 
     VPSS_CROP_INFO_S crop_info{};
     if (use_crop) {
@@ -423,8 +592,9 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
 
     CVI_S32 rc = CVI_SUCCESS;
     const int send_attempts = 3;
+    const int send_timeout_ms = 200;
     for (int attempt = 0; attempt < send_attempts; ++attempt) {
-        rc = CVI_VPSS_SendFrame(grp_, &input_frame, -1);
+        rc = CVI_VPSS_SendFrame(grp_, &input_frame, send_timeout_ms);
         if (rc == CVI_SUCCESS) {
             break;
         }
@@ -542,6 +712,8 @@ void CviVpssProcessor::destroy_group() {
     out_width_ = 0;
     out_height_ = 0;
     out_format_ = PixelFormat::UNKNOWN;
+    letterbox_enabled_ = false;
+    pad_value_ = 0;
 }
 #endif
 

@@ -8,6 +8,7 @@ namespace tensor {
  */
 enum class DeviceType {
     CPU,    // CPU 内存
+    VB,     // CVI VB pool memory
     NPU,    // Rockchip NPU (RKNN)
     TPU,    // Sophgo TPU (BMRuntime)
 };
@@ -18,6 +19,7 @@ enum class DeviceType {
 inline const char* device_type_to_string(DeviceType device) {
     switch (device) {
         case DeviceType::CPU: return "CPU";
+        case DeviceType::VB: return "VB";
         case DeviceType::NPU: return "NPU";
         case DeviceType::TPU: return "TPU";
         default: return "Unknown";

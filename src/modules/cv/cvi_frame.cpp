@@ -5,6 +5,7 @@
 
 #ifdef USE_CVI_MPI
 #include <cvi_sys.h>
+#include <cvi_vdec.h>
 #endif
 
 namespace lua_cv {
@@ -92,14 +93,18 @@ Frame& Frame::operator=(Frame&& other) noexcept {
     cvi_frame_ = other.cvi_frame_;
     owns_vpss_frame_ = other.owns_vpss_frame_;
     owns_vb_block_ = other.owns_vb_block_;
+    owns_vdec_frame_ = other.owns_vdec_frame_;
     vpss_grp_ = other.vpss_grp_;
     vpss_chn_ = other.vpss_chn_;
+    vdec_chn_ = other.vdec_chn_;
     vb_block_ = other.vb_block_;
 
     other.owns_vpss_frame_ = false;
     other.owns_vb_block_ = false;
+    other.owns_vdec_frame_ = false;
     other.vpss_grp_ = -1;
     other.vpss_chn_ = -1;
+    other.vdec_chn_ = -1;
     other.vb_block_ = VB_INVALID_HANDLE;
 #endif
 
@@ -250,6 +255,13 @@ Frame Frame::clone() const {
 
 void Frame::release() {
 #ifdef USE_CVI_MPI
+    if (owns_vdec_frame_) {
+        if (vdec_chn_ >= 0) {
+            CVI_VDEC_ReleaseFrame(static_cast<VDEC_CHN>(vdec_chn_), &cvi_frame_);
+        }
+        owns_vdec_frame_ = false;
+    }
+
     if (owns_vpss_frame_) {
         if (vpss_grp_ >= 0 && vpss_chn_ >= 0) {
             CVI_VPSS_ReleaseChnFrame(static_cast<VPSS_GRP>(vpss_grp_),
@@ -289,11 +301,30 @@ void Frame::set_vpss_owner(int vpss_grp, int vpss_chn) {
     vpss_grp_ = vpss_grp;
     vpss_chn_ = vpss_chn;
     owns_vpss_frame_ = true;
+    owns_vb_block_ = false;
+    vb_block_ = VB_INVALID_HANDLE;
+    owns_vdec_frame_ = false;
+    vdec_chn_ = -1;
 }
 
 void Frame::set_vb_owner(VB_BLK vb_block) {
     vb_block_ = vb_block;
     owns_vb_block_ = true;
+    owns_vpss_frame_ = false;
+    vpss_grp_ = -1;
+    vpss_chn_ = -1;
+    owns_vdec_frame_ = false;
+    vdec_chn_ = -1;
+}
+
+void Frame::set_vdec_owner(int vdec_chn) {
+    vdec_chn_ = vdec_chn;
+    owns_vdec_frame_ = true;
+    owns_vpss_frame_ = false;
+    vpss_grp_ = -1;
+    vpss_chn_ = -1;
+    owns_vb_block_ = false;
+    vb_block_ = VB_INVALID_HANDLE;
 }
 #endif
 
@@ -307,9 +338,11 @@ void Frame::reset() {
     std::memset(&cvi_frame_, 0, sizeof(cvi_frame_));
     vpss_grp_ = -1;
     vpss_chn_ = -1;
+    vdec_chn_ = -1;
     vb_block_ = VB_INVALID_HANDLE;
     owns_vpss_frame_ = false;
     owns_vb_block_ = false;
+    owns_vdec_frame_ = false;
 #endif
 }
 

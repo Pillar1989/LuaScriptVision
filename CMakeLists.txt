@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(ModelInfer LANGUAGES C CXX)
+project(ModelInfer LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -121,6 +121,16 @@ file(GLOB TENSOR_SOURCES "src/modules/tensor/*.cpp")
 file(GLOB CV_SOURCES "src/modules/cv/*.cpp")
 file(GLOB BINDING_SOURCES "src/bindings/*.cpp")
 file(GLOB INFERENCE_SOURCES "src/inference/*.cpp")
+
+# SG200X RVV optimized assembly files (only for cross-compilation)
+if(NOT USE_ONNX_RUNTIME)
+    set(INFERENCE_ASM_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/inference/shl_c906_u8_to_f32.S"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/inference/shl_c906_i8_to_f32.S"
+    )
+    list(APPEND INFERENCE_SOURCES ${INFERENCE_ASM_SOURCES})
+    message(STATUS "RVV optimized dequantization enabled")
+endif()
 
 # 条件排除 CVI/VPSS 后端（无 SDK 时）
 if(USE_ONNX_RUNTIME)
@@ -304,7 +314,10 @@ else()
     target_sources(cpp_infer PRIVATE
         src/modules/tensor/cvi_tpu_memory.cpp
     )
-    target_include_directories(cpp_infer PRIVATE ${TPU_INCLUDE_DIR})
+    target_include_directories(cpp_infer PRIVATE
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+    )
     target_link_directories(cpp_infer PRIVATE ${TPU_LIB_DIR})
     target_link_libraries(cpp_infer PRIVATE
         -static
@@ -330,6 +343,14 @@ message(STATUS "cpp_infer: inference benchmark enabled")
 # 6. Test Programs for SG200X
 # ==========================================================
 if(NOT USE_ONNX_RUNTIME)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/googletest/CMakeLists.txt")
+        add_subdirectory(third_party/googletest)
+    else()
+        message(FATAL_ERROR "googletest not found at third_party/googletest")
+    endif()
+
     # Test 1: TPU Memory Management
     add_executable(test_tpu_memory
         tests/test_tpu_memory.cpp
@@ -342,6 +363,7 @@ if(NOT USE_ONNX_RUNTIME)
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
         ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
     )
 
     target_link_directories(test_tpu_memory PRIVATE
@@ -355,6 +377,7 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        gtest_main
         z
         m
         pthread
@@ -362,6 +385,71 @@ if(NOT USE_ONNX_RUNTIME)
     )
 
     message(STATUS "test_tpu_memory: TPU memory test enabled (static build)")
+
+    # Test 1.1: VB Pool Manager Test
+    add_executable(test_vb_pool
+        tests/test_vb_pool.cpp
+        src/modules/tensor/vb_pool_manager.cpp
+        src/modules/tensor/vb_memory.cpp
+        src/modules/tensor/device_buffer.cpp
+        src/modules/tensor/cpu_memory.cpp
+        src/modules/tensor/sync_handle.cpp
+    )
+
+    if(NOT USE_ONNX_RUNTIME)
+        target_sources(test_vb_pool PRIVATE
+            src/modules/tensor/cvi_tpu_memory.cpp
+        )
+    endif()
+
+    target_include_directories(test_vb_pool PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
+        ${CVI_MPI_INCLUDE_DIR}
+    )
+
+    if(NOT USE_ONNX_RUNTIME)
+        target_include_directories(test_vb_pool PRIVATE
+            ${TPU_INCLUDE_DIR}
+        )
+    endif()
+
+    target_link_directories(test_vb_pool PRIVATE
+        ${CVI_MPI_LIB_DIR}
+    )
+
+    if(NOT USE_ONNX_RUNTIME)
+        target_link_directories(test_vb_pool PRIVATE
+            ${TPU_LIB_DIR}
+        )
+    endif()
+
+    set(_VB_POOL_TPU_LIBS "")
+    if(NOT USE_ONNX_RUNTIME)
+        list(APPEND _VB_POOL_TPU_LIBS
+            ${TPU_LIB_DIR}/libcviruntime-static.a
+            ${TPU_LIB_DIR}/libcvikernel-static.a
+            ${TPU_LIB_DIR}/libcvimath-static.a
+            ${TPU_LIB_DIR}/libflatbuffers.a
+        )
+    endif()
+
+    target_link_libraries(test_vb_pool PRIVATE
+        -static
+        ${_VB_POOL_TPU_LIBS}
+        gtest_main
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        -Wl,--end-group
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    message(STATUS "test_vb_pool: VB pool manager test enabled (static build)")
 
     # Test 2: CV Module Comprehensive Test
     add_executable(test_cv_func
@@ -376,6 +464,9 @@ if(NOT USE_ONNX_RUNTIME)
         tests/test_vpss_performance.cpp
         tests/test_ion_loader.cpp
         tests/test_camera_capture.cpp
+        tests/test_input_source_image.cpp
+        tests/test_input_source_camera.cpp
+        tests/test_vi_vpss_link.cpp
         src/modules/cv/cvi_vpss_processor.cpp
         src/modules/cv/ion_image_loader.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
@@ -385,6 +476,8 @@ if(NOT USE_ONNX_RUNTIME)
         src/modules/cv/cv_types.cpp
         src/modules/cv/device_buffer.cpp
         src/modules/cv/image.cpp
+        src/modules/cv/image_source.cpp
+        src/modules/cv/camera_source.cpp
         src/modules/cv/mmf_context.cpp
         ${TENSOR_SOURCES}
     )
@@ -414,6 +507,7 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        gtest
         -Wl,--start-group
         ${CVI_MPI_LIB_DIR}/libsys.a
         ${CVI_MPI_LIB_DIR}/libvpss.a
@@ -429,6 +523,62 @@ if(NOT USE_ONNX_RUNTIME)
     )
 
     message(STATUS "test_cv_func: CV module comprehensive test enabled (static build)")
+
+    # Test 2.1: CviSession VB Input Test
+    add_executable(test_cvi_session_vb
+        tests/test_cvi_session_vb.cpp
+        tests/test_common.cpp
+        src/inference/cvi_session.cpp
+        src/inference/shl_c906_u8_to_f32.S
+        src/inference/shl_c906_i8_to_f32.S
+        src/modules/tensor/cvi_tpu_memory.cpp
+        src/modules/tensor/vb_memory.cpp
+        src/modules/tensor/vb_pool_manager.cpp
+        src/modules/tensor/device_buffer.cpp
+        src/modules/tensor/cpu_memory.cpp
+        src/modules/tensor/sync_handle.cpp
+        src/modules/cv/mmf_context.cpp
+        src/modules/cv/cv_types.cpp
+    )
+
+    target_include_directories(test_cvi_session_vb PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/inference"
+        ${OpenCV_INCLUDE_DIRS}
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+    )
+
+    target_link_directories(test_cvi_session_vb PRIVATE
+        ${TPU_LIB_DIR}
+        ${CVI_MPI_LIB_DIR}
+    )
+
+    target_link_libraries(test_cvi_session_vb PRIVATE
+        -static
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        gtest
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        ${CVI_MPI_LIB_DIR}/libvpss.a
+        ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
+        ${OpenCV_LIBS}
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    message(STATUS "test_cvi_session_vb: CviSession VB input test enabled (static build)")
 
     # Add camera sources and ISP libraries when ENABLE_CVI_CAMERA is ON
     if(ENABLE_CVI_CAMERA)
@@ -497,6 +647,7 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        gtest
         ${CVI_MPI_LIB_DIR}/3rd/libini.a
         z
         m

@@ -14,6 +14,17 @@
 #include <stdexcept>
 
 #include "modules/tensor/cvi_tpu_memory.h"
+#if defined(USE_CVI_MPI)
+#include "modules/tensor/vb_memory.h"
+#endif
+
+// RVV optimized dequantization functions (C906 assembly)
+extern "C" {
+void shl_c906_u8_to_f32(const uint8_t *input, float *output,
+                        int32_t offset, float *scale, uint32_t length);
+void shl_c906_i8_to_f32(const int8_t *input, float *output,
+                        int32_t offset, float *scale, uint32_t length);
+}
 
 namespace inference {
 namespace {
@@ -158,6 +169,163 @@ float dequantize_value(T value, float scale, int zero_point) {
     return (static_cast<double>(value) - static_cast<double>(zero_point)) *
            static_cast<double>(scale);
 }
+
+struct VbInputLayout {
+    PIXEL_FORMAT_E pixel_format = PIXEL_FORMAT_MAX;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int32_t channels = 0;
+};
+
+bool is_supported_vb_format(CVI_NN_PIXEL_FORMAT_E fmt) {
+    switch (fmt) {
+        case CVI_NN_PIXEL_RGB_PACKED:
+        case CVI_NN_PIXEL_BGR_PACKED:
+        case CVI_NN_PIXEL_RGB_PLANAR:
+        case CVI_NN_PIXEL_BGR_PLANAR:
+        case CVI_NN_PIXEL_PLANAR:
+        case CVI_NN_PIXEL_PACKED:
+        case CVI_NN_PIXEL_GRAYSCALE:
+        case CVI_NN_PIXEL_TENSOR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+PIXEL_FORMAT_E to_vb_pixel_format(CVI_NN_PIXEL_FORMAT_E fmt, int32_t channels) {
+    switch (fmt) {
+        case CVI_NN_PIXEL_RGB_PACKED:
+            return PIXEL_FORMAT_RGB_888;
+        case CVI_NN_PIXEL_BGR_PACKED:
+            return PIXEL_FORMAT_BGR_888;
+        case CVI_NN_PIXEL_RGB_PLANAR:
+            return PIXEL_FORMAT_RGB_888_PLANAR;
+        case CVI_NN_PIXEL_BGR_PLANAR:
+            return PIXEL_FORMAT_BGR_888_PLANAR;
+        case CVI_NN_PIXEL_PLANAR:
+            return PIXEL_FORMAT_RGB_888_PLANAR;
+        case CVI_NN_PIXEL_PACKED:
+            return PIXEL_FORMAT_RGB_888;
+        case CVI_NN_PIXEL_GRAYSCALE:
+            return PIXEL_FORMAT_YUV_400;
+        case CVI_NN_PIXEL_TENSOR:
+            if (channels == 3) {
+                return PIXEL_FORMAT_RGB_888_PLANAR;
+            }
+            if (channels == 1) {
+                return PIXEL_FORMAT_YUV_400;
+            }
+            return PIXEL_FORMAT_MAX;
+        default:
+            return PIXEL_FORMAT_MAX;
+    }
+}
+
+bool parse_vb_input_layout(const CVI_TENSOR* tensor,
+                           VbInputLayout* layout,
+                           std::string* reason) {
+    if (!tensor || !layout) {
+        if (reason) {
+            *reason = "input tensor is null";
+        }
+        return false;
+    }
+
+    if (tensor->fmt == CVI_FMT_FP32) {
+        if (reason) {
+            *reason = "input tensor is FP32";
+        }
+        return false;
+    }
+    if (tensor->fmt != CVI_FMT_INT8 && tensor->fmt != CVI_FMT_UINT8) {
+        if (reason) {
+            *reason = "input tensor format must be INT8 or UINT8";
+        }
+        return false;
+    }
+
+    CVI_SHAPE shape = CVI_NN_TensorShape(const_cast<CVI_TENSOR*>(tensor));
+    if (shape.dim_size != 4) {
+        if (reason) {
+            *reason = "input tensor must be 4D";
+        }
+        return false;
+    }
+
+    int32_t n = shape.dim[0];
+    if (n > 1) {
+        if (reason) {
+            *reason = "batch size must be 1";
+        }
+        return false;
+    }
+
+    bool nchw = (tensor->pixel_format == CVI_NN_PIXEL_TENSOR);
+    int32_t c = nchw ? shape.dim[1] : shape.dim[3];
+    int32_t h = nchw ? shape.dim[2] : shape.dim[1];
+    int32_t w = nchw ? shape.dim[3] : shape.dim[2];
+    if (c <= 0 || h <= 0 || w <= 0) {
+        if (reason) {
+            *reason = "input tensor shape is invalid";
+        }
+        return false;
+    }
+
+    if (!is_supported_vb_format(tensor->pixel_format)) {
+        if (reason) {
+            *reason = "input pixel format not supported for VB";
+        }
+        return false;
+    }
+
+    PIXEL_FORMAT_E vb_format = to_vb_pixel_format(tensor->pixel_format, c);
+    if (vb_format == PIXEL_FORMAT_MAX) {
+        if (reason) {
+            *reason = "unsupported channel count for pixel format";
+        }
+        return false;
+    }
+
+    if (vb_format == PIXEL_FORMAT_YUV_400 && c != 1) {
+        if (reason) {
+            *reason = "grayscale input expects 1 channel";
+        }
+        return false;
+    }
+    if ((vb_format == PIXEL_FORMAT_RGB_888 || vb_format == PIXEL_FORMAT_BGR_888 ||
+         vb_format == PIXEL_FORMAT_RGB_888_PLANAR || vb_format == PIXEL_FORMAT_BGR_888_PLANAR) &&
+        c != 3) {
+        if (reason) {
+            *reason = "RGB/BGR input expects 3 channels";
+        }
+        return false;
+    }
+
+    layout->pixel_format = vb_format;
+    layout->width = static_cast<uint32_t>(w);
+    layout->height = static_cast<uint32_t>(h);
+    layout->channels = c;
+    return true;
+}
+
+bool requires_normalization(const std::array<float, 3>& mean,
+                            const std::array<float, 3>& scale) {
+    const float eps = 1e-6f;
+    for (size_t i = 0; i < 3; ++i) {
+        if (std::fabs(mean[i]) > eps) {
+            return true;
+        }
+        if (std::fabs(scale[i] - 1.0f) > eps) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_aligned_64(uint64_t addr) {
+    return (addr & 0x3F) == 0;
+}
 } // namespace
 
 CviSession::CviSession(const std::string& model_path) {
@@ -184,6 +352,9 @@ CviSession::CviSession(const std::string& model_path) {
         char* name = CVI_NN_TensorName(&output_tensors_[i]);
         output_names_.push_back(name ? name : "");
     }
+
+    all_output_indices_.resize(static_cast<size_t>(output_num_));
+    std::iota(all_output_indices_.begin(), all_output_indices_.end(), 0);
 
     init_device_buffers();
     primary_output_index_ = select_primary_output_index();
@@ -348,6 +519,13 @@ CviSession::run(const float* input_data, const std::vector<int64_t>& input_shape
     copy_input_to_device(input_ptr, input_elements);
     auto t1 = std::chrono::high_resolution_clock::now();
 
+    if (input_buffers_.empty() || !input_buffers_[0]) {
+        throw std::runtime_error("CviSession::run - input buffer not initialized");
+    }
+    check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0],
+                                              input_buffers_[0]->physical_addr()),
+                 "CVI_NN_SetTensorPhysicalAddr(input)");
+
     check_cvi_rc(CVI_NN_Forward(model_, input_tensors_, input_num_,
                                 output_tensors_, output_num_),
                  "CVI_NN_Forward");
@@ -400,6 +578,13 @@ void CviSession::run_all(const float* input_data,
     copy_input_to_device(input_ptr, input_elements);
     auto t1 = std::chrono::high_resolution_clock::now();
 
+    if (input_buffers_.empty() || !input_buffers_[0]) {
+        throw std::runtime_error("CviSession::run_all - input buffer not initialized");
+    }
+    check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0],
+                                              input_buffers_[0]->physical_addr()),
+                 "CVI_NN_SetTensorPhysicalAddr(input)");
+
     check_cvi_rc(CVI_NN_Forward(model_, input_tensors_, input_num_,
                                 output_tensors_, output_num_),
                  "CVI_NN_Forward");
@@ -425,6 +610,278 @@ void CviSession::run_all(const float* input_data,
         std::chrono::duration<double, std::milli>(t2 - t1).count();
     last_run_stats_.output_ms =
         std::chrono::duration<double, std::milli>(t3 - t2).count();
+}
+
+void CviSession::run_all_selected(const float* input_data,
+                                  const std::vector<int64_t>& input_shape,
+                                  const std::vector<int32_t>& output_indices,
+                                  std::vector<std::vector<float>>* outputs,
+                                  std::vector<std::vector<int64_t>>* output_shapes) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (!outputs || !output_shapes) {
+        throw std::invalid_argument("CviSession::run_all_selected - outputs and output_shapes cannot be null");
+    }
+
+    std::vector<int64_t> actual_input_shape;
+    std::vector<float> padded_input;
+    const float* input_ptr = nullptr;
+
+    prepare_input(input_data, input_shape, &actual_input_shape, &padded_input, &input_ptr);
+
+    CVI_TENSOR* input_tensor = &input_tensors_[0];
+    size_t input_count = CVI_NN_TensorCount(input_tensor);
+    int64_t input_elements = element_count(actual_input_shape);
+    if (input_elements <= 0) {
+        throw std::runtime_error("CviSession::run_all_selected - input element count invalid");
+    }
+    if (input_count != static_cast<size_t>(input_elements)) {
+        throw std::runtime_error("CviSession::run_all_selected - input tensor size mismatch");
+    }
+
+    copy_input_to_device(input_ptr, input_elements);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    if (input_buffers_.empty() || !input_buffers_[0]) {
+        throw std::runtime_error("CviSession::run_all_selected - input buffer not initialized");
+    }
+    check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0],
+                                              input_buffers_[0]->physical_addr()),
+                 "CVI_NN_SetTensorPhysicalAddr(input)");
+
+    check_cvi_rc(CVI_NN_Forward(model_, input_tensors_, input_num_,
+                                output_tensors_, output_num_),
+                 "CVI_NN_Forward");
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    const std::vector<int32_t>* selected =
+        output_indices.empty() ? &all_output_indices_ : &output_indices;
+    collect_selected_outputs(*selected, outputs, output_shapes);
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+    last_run_stats_.input_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_run_stats_.forward_ms =
+        std::chrono::duration<double, std::milli>(t2 - t1).count();
+    last_run_stats_.output_ms =
+        std::chrono::duration<double, std::milli>(t3 - t2).count();
+}
+
+void CviSession::run_vb(uint64_t input_phys_addr,
+                        size_t input_size,
+                        std::vector<std::vector<float>>* outputs,
+                        std::vector<std::vector<int64_t>>* output_shapes) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (!outputs || !output_shapes) {
+        throw std::invalid_argument("CviSession::run_vb - outputs and output_shapes cannot be null");
+    }
+    if (input_num_ != 1 || !input_tensors_) {
+        throw std::runtime_error("CviSession::run_vb - only single-input models are supported");
+    }
+    if (output_num_ < 1 || !output_tensors_) {
+        throw std::runtime_error("CviSession::run_vb - no outputs available");
+    }
+    if (output_buffers_.size() != static_cast<size_t>(output_num_)) {
+        throw std::runtime_error("CviSession::run_vb - output buffers not initialized");
+    }
+    if (input_phys_addr == 0) {
+        throw std::invalid_argument("CviSession::run_vb - input physical address is zero");
+    }
+    if (!is_aligned_64(input_phys_addr)) {
+        throw std::invalid_argument("CviSession::run_vb - input physical address is not 64-byte aligned");
+    }
+    if (input_size == 0) {
+        throw std::invalid_argument("CviSession::run_vb - input size is zero");
+    }
+
+    VbInputLayout layout;
+    std::string reason;
+    if (!parse_vb_input_layout(&input_tensors_[0], &layout, &reason)) {
+        throw std::runtime_error("CviSession::run_vb - " + reason);
+    }
+
+    size_t expected_size = CVI_NN_TensorSize(&input_tensors_[0]);
+    if (expected_size == 0) {
+        throw std::runtime_error("CviSession::run_vb - input tensor size is zero");
+    }
+    if (input_size < expected_size) {
+        std::ostringstream oss;
+        oss << "CviSession::run_vb - input size " << input_size
+            << " is smaller than expected " << expected_size
+            << " (" << layout.width << "x" << layout.height
+            << "x" << layout.channels << ")";
+        throw std::runtime_error(oss.str());
+    }
+
+    uint64_t original_paddr = 0;
+    if (!input_buffers_.empty() && input_buffers_[0]) {
+        original_paddr = input_buffers_[0]->physical_addr();
+    }
+
+    check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0], input_phys_addr),
+                 "CVI_NN_SetTensorPhysicalAddr(input)");
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    check_cvi_rc(CVI_NN_Forward(model_, input_tensors_, input_num_,
+                                output_tensors_, output_num_),
+                 "CVI_NN_Forward");
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    outputs->clear();
+    output_shapes->clear();
+    outputs->reserve(static_cast<size_t>(output_num_));
+    output_shapes->reserve(static_cast<size_t>(output_num_));
+
+    for (int32_t i = 0; i < output_num_; ++i) {
+        if (output_buffers_[static_cast<size_t>(i)]) {
+            output_buffers_[static_cast<size_t>(i)]->invalidate_cache();
+        }
+        outputs->push_back(read_output_tensor(i));
+        output_shapes->push_back(get_output_shape(static_cast<size_t>(i)));
+    }
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+    last_run_stats_.input_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_run_stats_.forward_ms =
+        std::chrono::duration<double, std::milli>(t2 - t1).count();
+    last_run_stats_.output_ms =
+        std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    if (original_paddr != 0 && original_paddr != input_phys_addr) {
+        check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0], original_paddr),
+                     "CVI_NN_SetTensorPhysicalAddr(input restore)");
+    }
+}
+
+void CviSession::run_vb_selected(uint64_t input_phys_addr,
+                                 size_t input_size,
+                                 const std::vector<int32_t>& output_indices,
+                                 std::vector<std::vector<float>>* outputs,
+                                 std::vector<std::vector<int64_t>>* output_shapes) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (!outputs || !output_shapes) {
+        throw std::invalid_argument("CviSession::run_vb_selected - outputs and output_shapes cannot be null");
+    }
+    if (input_num_ != 1 || !input_tensors_) {
+        throw std::runtime_error("CviSession::run_vb_selected - only single-input models are supported");
+    }
+    if (output_num_ < 1 || !output_tensors_) {
+        throw std::runtime_error("CviSession::run_vb_selected - no outputs available");
+    }
+    if (output_buffers_.size() != static_cast<size_t>(output_num_)) {
+        throw std::runtime_error("CviSession::run_vb_selected - output buffers not initialized");
+    }
+    if (input_phys_addr == 0) {
+        throw std::invalid_argument("CviSession::run_vb_selected - input physical address is zero");
+    }
+    if (!is_aligned_64(input_phys_addr)) {
+        throw std::invalid_argument("CviSession::run_vb_selected - input physical address is not 64-byte aligned");
+    }
+    if (input_size == 0) {
+        throw std::invalid_argument("CviSession::run_vb_selected - input size is zero");
+    }
+
+    VbInputLayout layout;
+    std::string reason;
+    if (!parse_vb_input_layout(&input_tensors_[0], &layout, &reason)) {
+        throw std::runtime_error("CviSession::run_vb_selected - " + reason);
+    }
+
+    size_t expected_size = CVI_NN_TensorSize(&input_tensors_[0]);
+    if (expected_size == 0) {
+        throw std::runtime_error("CviSession::run_vb_selected - input tensor size is zero");
+    }
+    if (input_size < expected_size) {
+        std::ostringstream oss;
+        oss << "CviSession::run_vb_selected - input size " << input_size
+            << " is smaller than expected " << expected_size
+            << " (" << layout.width << "x" << layout.height
+            << "x" << layout.channels << ")";
+        throw std::runtime_error(oss.str());
+    }
+
+    uint64_t original_paddr = 0;
+    if (!input_buffers_.empty() && input_buffers_[0]) {
+        original_paddr = input_buffers_[0]->physical_addr();
+    }
+
+    check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0], input_phys_addr),
+                 "CVI_NN_SetTensorPhysicalAddr(input)");
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    check_cvi_rc(CVI_NN_Forward(model_, input_tensors_, input_num_,
+                                output_tensors_, output_num_),
+                 "CVI_NN_Forward");
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    const std::vector<int32_t>* selected =
+        output_indices.empty() ? &all_output_indices_ : &output_indices;
+    collect_selected_outputs(*selected, outputs, output_shapes);
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+    last_run_stats_.input_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_run_stats_.forward_ms =
+        std::chrono::duration<double, std::milli>(t2 - t1).count();
+    last_run_stats_.output_ms =
+        std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    if (original_paddr != 0 && original_paddr != input_phys_addr) {
+        check_cvi_rc(CVI_NN_SetTensorPhysicalAddr(&input_tensors_[0], original_paddr),
+                     "CVI_NN_SetTensorPhysicalAddr(input restore)");
+    }
+}
+
+#if defined(USE_CVI_MPI)
+void CviSession::run_vb(const std::shared_ptr<tensor::VbMemory>& input,
+                        std::vector<std::vector<float>>* outputs,
+                        std::vector<std::vector<int64_t>>* output_shapes) {
+    if (!input) {
+        throw std::invalid_argument("CviSession::run_vb - input is null");
+    }
+    run_vb(input->physical_address(), input->size_bytes(), outputs, output_shapes);
+}
+
+void CviSession::run_vb_selected(const std::shared_ptr<tensor::VbMemory>& input,
+                                 const std::vector<int32_t>& output_indices,
+                                 std::vector<std::vector<float>>* outputs,
+                                 std::vector<std::vector<int64_t>>* output_shapes) {
+    if (!input) {
+        throw std::invalid_argument("CviSession::run_vb_selected - input is null");
+    }
+    run_vb_selected(input->physical_address(), input->size_bytes(), output_indices,
+                    outputs, output_shapes);
+}
+#endif
+
+bool CviSession::supports_vb_input() const {
+    if (input_num_ != 1 || !input_tensors_) {
+        return false;
+    }
+    VbInputLayout layout;
+    std::string reason;
+    return parse_vb_input_layout(&input_tensors_[0], &layout, &reason);
+}
+
+CviSession::VbInputSpec CviSession::get_vb_input_spec() const {
+    if (input_num_ != 1 || !input_tensors_) {
+        throw std::runtime_error("CviSession::get_vb_input_spec - only single-input models are supported");
+    }
+
+    VbInputLayout layout;
+    std::string reason;
+    if (!parse_vb_input_layout(&input_tensors_[0], &layout, &reason)) {
+        throw std::runtime_error("CviSession::get_vb_input_spec - " + reason);
+    }
+
+    VbInputSpec spec;
+    spec.pixel_format = layout.pixel_format;
+    spec.width = layout.width;
+    spec.height = layout.height;
+    spec.mean = {input_tensors_[0].mean[0], input_tensors_[0].mean[1], input_tensors_[0].mean[2]};
+    spec.scale = {input_tensors_[0].scale[0], input_tensors_[0].scale[1], input_tensors_[0].scale[2]};
+    spec.normalized = requires_normalization(spec.mean, spec.scale);
+    return spec;
 }
 
 void CviSession::prepare_input(const float* input_data,
@@ -568,17 +1025,25 @@ std::vector<float> CviSession::read_output_tensor(int32_t output_index) const {
             break;
         }
         case CVI_FMT_INT8: {
-            const int8_t* src = static_cast<const int8_t*>(output_sys);
-            for (size_t i = 0; i < output_count; ++i) {
-                output_data[i] = dequantize_value<int8_t>(src[i], out_qscale, out_zero_point);
-            }
+            float scale_val = out_qscale;
+            shl_c906_i8_to_f32(
+                static_cast<const int8_t*>(output_sys),
+                output_data.data(),
+                out_zero_point,
+                &scale_val,
+                static_cast<uint32_t>(output_count)
+            );
             break;
         }
         case CVI_FMT_UINT8: {
-            const uint8_t* src = static_cast<const uint8_t*>(output_sys);
-            for (size_t i = 0; i < output_count; ++i) {
-                output_data[i] = dequantize_value<uint8_t>(src[i], out_qscale, out_zero_point);
-            }
+            float scale_val = out_qscale;
+            shl_c906_u8_to_f32(
+                static_cast<const uint8_t*>(output_sys),
+                output_data.data(),
+                out_zero_point,
+                &scale_val,
+                static_cast<uint32_t>(output_count)
+            );
             break;
         }
         case CVI_FMT_INT16: {
@@ -614,6 +1079,49 @@ std::vector<float> CviSession::read_output_tensor(int32_t output_index) const {
     }
 
     return output_data;
+}
+
+void CviSession::collect_selected_outputs(const std::vector<int32_t>& output_indices,
+                                          std::vector<std::vector<float>>* outputs,
+                                          std::vector<std::vector<int64_t>>* output_shapes) const {
+    if (!outputs || !output_shapes) {
+        throw std::invalid_argument("CviSession::collect_selected_outputs - outputs and output_shapes cannot be null");
+    }
+    const std::vector<int32_t>* selected =
+        output_indices.empty() ? &all_output_indices_ : &output_indices;
+    if (selected->empty()) {
+        throw std::runtime_error("CviSession::collect_selected_outputs - output indices are empty");
+    }
+    if (output_buffers_.size() != static_cast<size_t>(output_num_)) {
+        throw std::runtime_error("CviSession::collect_selected_outputs - output buffers not initialized");
+    }
+
+    std::vector<uint8_t> seen(static_cast<size_t>(output_num_), 0);
+    for (int32_t idx : *selected) {
+        if (idx < 0 || idx >= output_num_) {
+            throw std::out_of_range("CviSession::collect_selected_outputs - output index out of range");
+        }
+        size_t sidx = static_cast<size_t>(idx);
+        if (seen[sidx]) {
+            throw std::runtime_error("CviSession::collect_selected_outputs - duplicate output index");
+        }
+        seen[sidx] = 1;
+        if (!output_buffers_[sidx]) {
+            throw std::runtime_error("CviSession::collect_selected_outputs - output buffer not initialized");
+        }
+    }
+
+    outputs->clear();
+    output_shapes->clear();
+    outputs->reserve(selected->size());
+    output_shapes->reserve(selected->size());
+
+    for (int32_t idx : *selected) {
+        size_t sidx = static_cast<size_t>(idx);
+        output_buffers_[sidx]->invalidate_cache();
+        outputs->push_back(read_output_tensor(idx));
+        output_shapes->push_back(get_output_shape(sidx));
+    }
 }
 
 } // namespace inference

@@ -11,9 +11,13 @@
 #include "inference_session.h"
 #include <cviruntime.h>
 #include <cviruntime_context.h>
+#include <linux/cvi_comm_video.h>
 
 namespace tensor {
 class CviTpuMemory;
+#if defined(USE_CVI_MPI)
+class VbMemory;
+#endif
 }
 
 namespace inference {
@@ -37,6 +41,15 @@ public:
         std::array<float, 3> scale{};
     };
 
+    struct VbInputSpec {
+        PIXEL_FORMAT_E pixel_format = PIXEL_FORMAT_MAX;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool normalized = false;
+        std::array<float, 3> mean{};
+        std::array<float, 3> scale{};
+    };
+
     explicit CviSession(const std::string& model_path);
     ~CviSession() override;
 
@@ -47,6 +60,34 @@ public:
                  const std::vector<int64_t>& input_shape,
                  std::vector<std::vector<float>>* outputs,
                  std::vector<std::vector<int64_t>>* output_shapes);
+
+    void run_all_selected(const float* input_data,
+                          const std::vector<int64_t>& input_shape,
+                          const std::vector<int32_t>& output_indices,
+                          std::vector<std::vector<float>>* outputs,
+                          std::vector<std::vector<int64_t>>* output_shapes);
+
+    void run_vb(uint64_t input_phys_addr,
+                size_t input_size,
+                std::vector<std::vector<float>>* outputs,
+                std::vector<std::vector<int64_t>>* output_shapes);
+    void run_vb_selected(uint64_t input_phys_addr,
+                         size_t input_size,
+                         const std::vector<int32_t>& output_indices,
+                         std::vector<std::vector<float>>* outputs,
+                         std::vector<std::vector<int64_t>>* output_shapes);
+#if defined(USE_CVI_MPI)
+    void run_vb(const std::shared_ptr<tensor::VbMemory>& input,
+                std::vector<std::vector<float>>* outputs,
+                std::vector<std::vector<int64_t>>* output_shapes);
+    void run_vb_selected(const std::shared_ptr<tensor::VbMemory>& input,
+                         const std::vector<int32_t>& output_indices,
+                         std::vector<std::vector<float>>* outputs,
+                         std::vector<std::vector<int64_t>>* output_shapes);
+#endif
+
+    bool supports_vb_input() const;
+    VbInputSpec get_vb_input_spec() const;
 
     std::vector<int64_t> get_input_shape(size_t index = 0) const override;
     std::vector<int64_t> get_output_shape(size_t index = 0) const override;
@@ -74,6 +115,9 @@ private:
                        const float** input_ptr) const;
     void copy_input_to_device(const float* input_ptr, int64_t input_elements);
     std::vector<float> read_output_tensor(int32_t output_index) const;
+    void collect_selected_outputs(const std::vector<int32_t>& output_indices,
+                                  std::vector<std::vector<float>>* outputs,
+                                  std::vector<std::vector<int64_t>>* output_shapes) const;
 
     CVI_RT_HANDLE rt_handle_ = nullptr;
     CVI_MODEL_HANDLE model_ = nullptr;
@@ -88,6 +132,7 @@ private:
     std::vector<std::string> output_names_;
     std::vector<std::shared_ptr<tensor::CviTpuMemory>> input_buffers_;
     std::vector<std::shared_ptr<tensor::CviTpuMemory>> output_buffers_;
+    std::vector<int32_t> all_output_indices_;
 };
 
 } // namespace inference

@@ -42,11 +42,14 @@ Frame::Frame(cv::Mat&& mat, PixelFormat format) : mat_(std::move(mat)) {
 
 #ifdef USE_CVI_MPI
 Frame::Frame(const VIDEO_FRAME_INFO_S& frame, bool owns_memory)
-    : cvi_frame_(frame), owns_vb_block_(owns_memory) {
+    : cvi_frame_(frame) {
     storage_type_ = StorageType::CVI;
     format_ = from_cvi_pixel_format(frame.stVFrame.enPixelFormat);
-    if (owns_vb_block_) {
+    if (owns_memory) {
+        owner_ = FrameOwner::VB;
         vb_block_ = CVI_VB_PhysAddr2Handle(frame.stVFrame.u64PhyAddr[0]);
+    } else {
+        owner_ = FrameOwner::EXTERNAL;
     }
 }
 
@@ -56,7 +59,7 @@ Frame::Frame(const VIDEO_FRAME_INFO_S& frame, int vpss_grp, int vpss_chn)
     format_ = from_cvi_pixel_format(frame.stVFrame.enPixelFormat);
     vpss_grp_ = vpss_grp;
     vpss_chn_ = vpss_chn;
-    owns_vpss_frame_ = false;
+    owner_ = FrameOwner::EXTERNAL;  // Caller must explicitly call set_vpss_owner() to take ownership
 }
 #endif
 
@@ -87,30 +90,33 @@ Frame& Frame::operator=(Frame&& other) noexcept {
     mat_ = std::move(other.mat_);
     mat_cache_ = std::move(other.mat_cache_);
     mat_cache_valid_ = other.mat_cache_valid_;
+    mapped_view_ = std::move(other.mapped_view_);
+    mapped_ptr_ = other.mapped_ptr_;
+    mapped_size_ = other.mapped_size_;
     image_ = other.image_;
 
 #ifdef USE_CVI_MPI
     cvi_frame_ = other.cvi_frame_;
-    owns_vpss_frame_ = other.owns_vpss_frame_;
-    owns_vb_block_ = other.owns_vb_block_;
-    owns_vdec_frame_ = other.owns_vdec_frame_;
+    owner_ = other.owner_;
     vpss_grp_ = other.vpss_grp_;
     vpss_chn_ = other.vpss_chn_;
     vdec_chn_ = other.vdec_chn_;
     vb_block_ = other.vb_block_;
 
-    other.owns_vpss_frame_ = false;
-    other.owns_vb_block_ = false;
-    other.owns_vdec_frame_ = false;
+    // Transfer ownership - reset other's state
+    other.owner_ = FrameOwner::EXTERNAL;
     other.vpss_grp_ = -1;
     other.vpss_chn_ = -1;
     other.vdec_chn_ = -1;
     other.vb_block_ = VB_INVALID_HANDLE;
 #endif
 
+    // Reset other's common state
     other.storage_type_ = StorageType::NONE;
     other.format_ = PixelFormat::UNKNOWN;
     other.mat_cache_valid_ = false;
+    other.mapped_ptr_ = nullptr;
+    other.mapped_size_ = 0;
 
     return *this;
 }
@@ -180,6 +186,41 @@ uint64_t Frame::physical_addr() const {
     return 0;
 }
 
+const cv::Mat& Frame::to_mat_view() const {
+    if (storage_type_ == StorageType::OPENCV) {
+        return mat_;
+    }
+#ifdef USE_CVI_MPI
+    if (storage_type_ == StorageType::CVI) {
+        ensure_mapped();
+        return mapped_view_;
+    }
+#endif
+    // Return empty mat for NONE storage type
+    return mat_;
+}
+
+cv::Mat Frame::to_mat_copy() const {
+    if (storage_type_ == StorageType::OPENCV) {
+        return mat_.clone();
+    }
+#ifdef USE_CVI_MPI
+    if (storage_type_ == StorageType::CVI) {
+        ensure_mapped();
+        if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
+            // Convert YUV to BGR for copy
+            cv::Mat bgr;
+            int code = (format_ == PixelFormat::NV21) ? cv::COLOR_YUV2BGR_NV21
+                                                      : cv::COLOR_YUV2BGR_NV12;
+            cv::cvtColor(mapped_view_, bgr, code);
+            return bgr;
+        }
+        return mapped_view_.clone();
+    }
+#endif
+    return cv::Mat();
+}
+
 const cv::Mat& Frame::to_mat() const {
     return const_cast<Frame*>(this)->to_mat();
 }
@@ -193,48 +234,7 @@ cv::Mat& Frame::to_mat() {
         if (mat_cache_valid_) {
             return mat_cache_;
         }
-        if (cvi_frame_.stVFrame.u64PhyAddr[0] == 0) {
-            throw std::runtime_error("Frame::to_mat - CVI frame missing physical address");
-        }
-
-        size_t total_size = static_cast<size_t>(cvi_frame_.stVFrame.u32Length[0]) +
-                            static_cast<size_t>(cvi_frame_.stVFrame.u32Length[1]) +
-                            static_cast<size_t>(cvi_frame_.stVFrame.u32Length[2]);
-        if (total_size == 0) {
-            total_size = static_cast<size_t>(cvi_frame_.stVFrame.u32Stride[0]) *
-                         static_cast<size_t>(cvi_frame_.stVFrame.u32Height);
-        }
-
-        void* mapped = CVI_SYS_MmapCache(cvi_frame_.stVFrame.u64PhyAddr[0],
-                                         static_cast<CVI_U32>(total_size));
-        if (!mapped) {
-            throw std::runtime_error("Frame::to_mat - CVI_SYS_MmapCache failed");
-        }
-        CVI_SYS_IonInvalidateCache(cvi_frame_.stVFrame.u64PhyAddr[0], mapped,
-                                   static_cast<CVI_U32>(total_size));
-
-        uint8_t* base = static_cast<uint8_t*>(mapped);
-        int w = static_cast<int>(cvi_frame_.stVFrame.u32Width);
-        int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
-        int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
-
-        if (format_ == PixelFormat::BGR || format_ == PixelFormat::RGB) {
-            cv::Mat view(h, w, CV_8UC3, base, stride);
-            mat_cache_ = view.clone();
-        } else if (format_ == PixelFormat::GRAY) {
-            cv::Mat view(h, w, CV_8UC1, base, stride);
-            mat_cache_ = view.clone();
-        } else if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
-            cv::Mat yuv(h + h / 2, w, CV_8UC1, base, stride);
-            int code = (format_ == PixelFormat::NV21) ? cv::COLOR_YUV2BGR_NV21
-                                                      : cv::COLOR_YUV2BGR_NV12;
-            cv::cvtColor(yuv, mat_cache_, code);
-        } else {
-            CVI_SYS_Munmap(mapped, static_cast<CVI_U32>(total_size));
-            throw std::runtime_error("Frame::to_mat - unsupported CVI pixel format");
-        }
-
-        CVI_SYS_Munmap(mapped, static_cast<CVI_U32>(total_size));
+        mat_cache_ = to_mat_copy();
         mat_cache_valid_ = true;
         return mat_cache_;
     }
@@ -255,28 +255,29 @@ Frame Frame::clone() const {
 
 void Frame::release() {
 #ifdef USE_CVI_MPI
-    if (owns_vdec_frame_) {
-        if (vdec_chn_ >= 0) {
-            CVI_VDEC_ReleaseFrame(static_cast<VDEC_CHN>(vdec_chn_), &cvi_frame_);
-        }
-        owns_vdec_frame_ = false;
+    switch (owner_) {
+        case FrameOwner::VDEC:
+            if (vdec_chn_ >= 0) {
+                CVI_VDEC_ReleaseFrame(static_cast<VDEC_CHN>(vdec_chn_), &cvi_frame_);
+            }
+            break;
+        case FrameOwner::VPSS:
+            if (vpss_grp_ >= 0 && vpss_chn_ >= 0) {
+                CVI_VPSS_ReleaseChnFrame(static_cast<VPSS_GRP>(vpss_grp_),
+                                         static_cast<VPSS_CHN>(vpss_chn_),
+                                         &cvi_frame_);
+            }
+            break;
+        case FrameOwner::VB:
+            if (vb_block_ != VB_INVALID_HANDLE) {
+                CVI_VB_ReleaseBlock(vb_block_);
+            }
+            break;
+        case FrameOwner::EXTERNAL:
+            // Do not release - caller owns the resource
+            break;
     }
-
-    if (owns_vpss_frame_) {
-        if (vpss_grp_ >= 0 && vpss_chn_ >= 0) {
-            CVI_VPSS_ReleaseChnFrame(static_cast<VPSS_GRP>(vpss_grp_),
-                                     static_cast<VPSS_CHN>(vpss_chn_),
-                                     &cvi_frame_);
-        }
-        owns_vpss_frame_ = false;
-    }
-
-    if (owns_vb_block_) {
-        if (vb_block_ != VB_INVALID_HANDLE) {
-            CVI_VB_ReleaseBlock(vb_block_);
-        }
-        owns_vb_block_ = false;
-    }
+    owner_ = FrameOwner::EXTERNAL;
 #endif
 
     reset();
@@ -300,31 +301,124 @@ VIDEO_FRAME_INFO_S* Frame::video_frame() {
 void Frame::set_vpss_owner(int vpss_grp, int vpss_chn) {
     vpss_grp_ = vpss_grp;
     vpss_chn_ = vpss_chn;
-    owns_vpss_frame_ = true;
-    owns_vb_block_ = false;
+    owner_ = FrameOwner::VPSS;
     vb_block_ = VB_INVALID_HANDLE;
-    owns_vdec_frame_ = false;
     vdec_chn_ = -1;
 }
 
 void Frame::set_vb_owner(VB_BLK vb_block) {
     vb_block_ = vb_block;
-    owns_vb_block_ = true;
-    owns_vpss_frame_ = false;
+    owner_ = FrameOwner::VB;
     vpss_grp_ = -1;
     vpss_chn_ = -1;
-    owns_vdec_frame_ = false;
     vdec_chn_ = -1;
 }
 
 void Frame::set_vdec_owner(int vdec_chn) {
     vdec_chn_ = vdec_chn;
-    owns_vdec_frame_ = true;
-    owns_vpss_frame_ = false;
+    owner_ = FrameOwner::VDEC;
     vpss_grp_ = -1;
     vpss_chn_ = -1;
-    owns_vb_block_ = false;
     vb_block_ = VB_INVALID_HANDLE;
+}
+
+std::shared_ptr<tensor::VbMemory> Frame::as_vb_memory() const {
+    if (storage_type_ != StorageType::CVI) {
+        return nullptr;
+    }
+    if (cvi_frame_.stVFrame.u64PhyAddr[0] == 0) {
+        return nullptr;
+    }
+
+    // Calculate total frame size
+    size_t total_size = static_cast<size_t>(cvi_frame_.stVFrame.u32Length[0]) +
+                        static_cast<size_t>(cvi_frame_.stVFrame.u32Length[1]) +
+                        static_cast<size_t>(cvi_frame_.stVFrame.u32Length[2]);
+    if (total_size == 0) {
+        int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
+        int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
+        if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h + h / 2);
+        } else {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h);
+        }
+    }
+
+    // Get or create VB_BLK handle from physical address
+    VB_BLK block = vb_block_;
+    if (block == VB_INVALID_HANDLE) {
+        block = CVI_VB_PhysAddr2Handle(cvi_frame_.stVFrame.u64PhyAddr[0]);
+        if (block == VB_INVALID_HANDLE) {
+            return nullptr;
+        }
+    }
+
+    // Create VbMemory wrapper - does NOT take ownership (Frame still owns the resource)
+    return tensor::VbMemory::from_block(block, total_size, /*cached=*/true, /*take_ownership=*/false);
+}
+
+void Frame::ensure_mapped() const {
+    if (mapped_ptr_ != nullptr) {
+        return;  // Already mapped
+    }
+    if (storage_type_ != StorageType::CVI) {
+        return;
+    }
+    if (cvi_frame_.stVFrame.u64PhyAddr[0] == 0) {
+        throw std::runtime_error("Frame::ensure_mapped - CVI frame missing physical address");
+    }
+
+    size_t total_size = static_cast<size_t>(cvi_frame_.stVFrame.u32Length[0]) +
+                        static_cast<size_t>(cvi_frame_.stVFrame.u32Length[1]) +
+                        static_cast<size_t>(cvi_frame_.stVFrame.u32Length[2]);
+    if (total_size == 0) {
+        // Fallback calculation for planar formats
+        int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
+        int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
+        if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h + h / 2);
+        } else {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h);
+        }
+    }
+
+    void* mapped = CVI_SYS_MmapCache(cvi_frame_.stVFrame.u64PhyAddr[0],
+                                     static_cast<CVI_U32>(total_size));
+    if (!mapped) {
+        throw std::runtime_error("Frame::ensure_mapped - CVI_SYS_MmapCache failed");
+    }
+    CVI_SYS_IonInvalidateCache(cvi_frame_.stVFrame.u64PhyAddr[0], mapped,
+                               static_cast<CVI_U32>(total_size));
+
+    mapped_ptr_ = mapped;
+    mapped_size_ = total_size;
+
+    // Create view Mat based on format
+    uint8_t* base = static_cast<uint8_t*>(mapped);
+    int w = static_cast<int>(cvi_frame_.stVFrame.u32Width);
+    int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
+    int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
+
+    if (format_ == PixelFormat::BGR || format_ == PixelFormat::RGB) {
+        mapped_view_ = cv::Mat(h, w, CV_8UC3, base, stride);
+    } else if (format_ == PixelFormat::GRAY) {
+        mapped_view_ = cv::Mat(h, w, CV_8UC1, base, stride);
+    } else if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
+        // Return raw YUV data as single-channel (no conversion for view)
+        mapped_view_ = cv::Mat(h + h / 2, w, CV_8UC1, base, stride);
+    } else {
+        unmap();
+        throw std::runtime_error("Frame::ensure_mapped - unsupported CVI pixel format");
+    }
+}
+
+void Frame::unmap() const {
+    if (mapped_ptr_ != nullptr) {
+        CVI_SYS_Munmap(mapped_ptr_, static_cast<CVI_U32>(mapped_size_));
+        mapped_ptr_ = nullptr;
+        mapped_size_ = 0;
+        mapped_view_.release();
+    }
 }
 #endif
 
@@ -332,18 +426,17 @@ void Frame::reset() {
     mat_.release();
     mat_cache_.release();
     mat_cache_valid_ = false;
-    storage_type_ = StorageType::NONE;
-    format_ = PixelFormat::UNKNOWN;
 #ifdef USE_CVI_MPI
+    unmap();  // Unmap before resetting CVI frame
     std::memset(&cvi_frame_, 0, sizeof(cvi_frame_));
+    owner_ = FrameOwner::EXTERNAL;
     vpss_grp_ = -1;
     vpss_chn_ = -1;
     vdec_chn_ = -1;
     vb_block_ = VB_INVALID_HANDLE;
-    owns_vpss_frame_ = false;
-    owns_vb_block_ = false;
-    owns_vdec_frame_ = false;
 #endif
+    storage_type_ = StorageType::NONE;
+    format_ = PixelFormat::UNKNOWN;
 }
 
 } // namespace lua_cv

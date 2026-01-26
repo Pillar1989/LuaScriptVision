@@ -7,6 +7,7 @@
 #include "cv_types.h"
 #include "device_buffer.h"
 #include "image.h"
+#include "vb_memory.h"
 
 #ifdef USE_CVI_MPI
 #include <cvi_vb.h>
@@ -22,6 +23,14 @@ public:
         NONE = 0,
         OPENCV,
         CVI,
+    };
+
+    // Resource ownership - mutually exclusive (only one can be set)
+    enum class FrameOwner {
+        EXTERNAL,   // Does not own resources, do not release
+        VPSS,       // Release via CVI_VPSS_ReleaseChnFrame
+        VB,         // Release via CVI_VB_ReleaseBlock
+        VDEC        // Release via CVI_VDEC_ReleaseFrame
     };
 
     Frame();
@@ -52,6 +61,16 @@ public:
     uint64_t physical_addr() const;
     PixelFormat pixel_format() const { return format_; }
 
+    // Zero-copy view of CVI frame data (only valid while Frame is alive)
+    // Returns mmap'd view without copying. Caller must ensure Frame outlives usage.
+    // For NV12/NV21 formats, returns raw YUV data as single-channel Mat.
+    const cv::Mat& to_mat_view() const;
+
+    // Copy semantics - returns clone of frame data
+    // For NV12/NV21, converts to BGR format.
+    cv::Mat to_mat_copy() const;
+
+    // Legacy API - delegates to to_mat_copy() for compatibility
     const cv::Mat& to_mat() const;
     cv::Mat& to_mat();
 
@@ -64,10 +83,19 @@ public:
     void set_vpss_owner(int vpss_grp, int vpss_chn);
     void set_vb_owner(VB_BLK vb_block);
     void set_vdec_owner(int vdec_chn);
+
+    // Bridge to tensor module - returns VbMemory wrapping frame's VB_BLK
+    // Returns nullptr if frame is not CVI storage type or has no physical address.
+    // The returned VbMemory does NOT own the block (caller must keep Frame alive).
+    std::shared_ptr<tensor::VbMemory> as_vb_memory() const;
 #endif
 
 private:
     void reset();
+#ifdef USE_CVI_MPI
+    void ensure_mapped() const;
+    void unmap() const;
+#endif
 
     StorageType storage_type_ = StorageType::NONE;
     PixelFormat format_ = PixelFormat::UNKNOWN;
@@ -75,14 +103,15 @@ private:
     cv::Mat mat_;
     mutable cv::Mat mat_cache_;
     mutable bool mat_cache_valid_ = false;
+    mutable cv::Mat mapped_view_;      // Zero-copy view of mmap'd CVI memory
+    mutable void* mapped_ptr_ = nullptr;
+    mutable size_t mapped_size_ = 0;
 
     CvImage image_;
 
 #ifdef USE_CVI_MPI
     VIDEO_FRAME_INFO_S cvi_frame_{};
-    bool owns_vpss_frame_ = false;
-    bool owns_vb_block_ = false;
-    bool owns_vdec_frame_ = false;
+    FrameOwner owner_ = FrameOwner::EXTERNAL;
     int vpss_grp_ = -1;
     int vpss_chn_ = -1;
     int vdec_chn_ = -1;

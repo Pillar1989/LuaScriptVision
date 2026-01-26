@@ -507,7 +507,9 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
         gtest
+        -Wl,--no-whole-archive
         -Wl,--start-group
         ${CVI_MPI_LIB_DIR}/libsys.a
         ${CVI_MPI_LIB_DIR}/libvpss.a

@@ -27,6 +27,7 @@ public:
     void resize(Frame& frame, int width, int height) override;
     void cvtColor(Frame& frame, ColorConversion code) override;
     void crop(Frame& frame, int x, int y, int w, int h) override;
+    void convert_format(Frame& frame, PixelFormat output_format);
     void letterbox(Frame& frame, int width, int height, uint8_t pad_value,
                    LetterboxMeta* meta = nullptr);
 

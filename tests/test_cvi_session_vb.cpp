@@ -70,6 +70,20 @@ void fill_input_pattern(void* data, size_t size_bytes) {
     std::memset(data, 0x7f, size_bytes);
 }
 
+void fill_normalized_pattern(float* data, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        data[i] = static_cast<float>((i % 256)) / 255.0f;
+    }
+}
+
+void convert_float_to_uint8(const float* input, uint8_t* output, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        float scaled = input[i] * 255.0f;
+        scaled = std::max(0.0f, std::min(255.0f, scaled));
+        output[i] = static_cast<uint8_t>(scaled);
+    }
+}
+
 std::shared_ptr<tensor::VbMemory> allocate_vb_block(uint32_t width,
                                                     uint32_t height,
                                                     PIXEL_FORMAT_E fmt,
@@ -420,6 +434,129 @@ TEST(CviSessionVb, VbSteadyStateBenchmark) {
 
     ASSERT_FALSE(outputs.empty());
     EXPECT_GT(outputs[0].size(), 0u);
+}
+
+TEST(CviSessionVb, CompareVbVsCpuPerformance) {
+    std::string model_path;
+    std::string skip_reason;
+    if (!prepare_environment(&model_path, &skip_reason)) {
+        GTEST_SKIP() << skip_reason;
+    }
+    inference::CviSession session(model_path);
+
+    if (!session.supports_vb_input()) {
+        GTEST_SKIP() << "Model does not support VB input";
+    }
+
+    auto spec = session.get_vb_input_spec();
+    auto input_shape = session.get_input_shape(0);
+    int channels = channels_for_pixel_format(spec.pixel_format);
+    ASSERT_GT(channels, 0);
+    ASSERT_EQ(input_shape.size(), 4u);
+
+    size_t input_size = element_count(input_shape);
+    ASSERT_GT(input_size, 0u);
+
+    std::vector<float> cpu_input(input_size);
+    fill_normalized_pattern(cpu_input.data(), input_size);
+
+    size_t vb_size_bytes =
+        static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) * static_cast<size_t>(channels);
+    auto vb_input = allocate_vb_block(spec.width, spec.height, spec.pixel_format, vb_size_bytes, true);
+    if (!vb_input) {
+        GTEST_SKIP() << "No VB block available for input";
+    }
+
+    convert_float_to_uint8(cpu_input.data(), static_cast<uint8_t*>(vb_input->data()), input_size);
+    vb_input->flush_cache();
+
+    std::vector<std::vector<float>> outputs;
+    std::vector<std::vector<int64_t>> shapes;
+
+    const int iterations = 50;
+    const int warmup_count = 2;
+
+    double cpu_input_sum = 0.0;
+    double cpu_forward_sum = 0.0;
+    double cpu_output_sum = 0.0;
+    double cpu_total_sum = 0.0;
+    int cpu_stats_count = 0;
+
+    for (int i = 0; i < iterations; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        session.run_all(cpu_input.data(), input_shape, &outputs, &shapes);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        if (i >= warmup_count) {
+            const auto& stats = session.last_run_stats();
+            cpu_input_sum += stats.input_ms;
+            cpu_forward_sum += stats.forward_ms;
+            cpu_output_sum += stats.output_ms;
+            cpu_total_sum += std::chrono::duration<double, std::milli>(end - start).count();
+            ++cpu_stats_count;
+        }
+    }
+
+    double vb_input_sum = 0.0;
+    double vb_forward_sum = 0.0;
+    double vb_output_sum = 0.0;
+    double vb_total_sum = 0.0;
+    int vb_stats_count = 0;
+
+    for (int i = 0; i < iterations; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        session.run_vb(vb_input, &outputs, &shapes);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        if (i >= warmup_count) {
+            const auto& stats = session.last_run_stats();
+            vb_input_sum += stats.input_ms;
+            vb_forward_sum += stats.forward_ms;
+            vb_output_sum += stats.output_ms;
+            vb_total_sum += std::chrono::duration<double, std::milli>(end - start).count();
+            ++vb_stats_count;
+        }
+    }
+
+    ASSERT_GT(cpu_stats_count, 0);
+    ASSERT_GT(vb_stats_count, 0);
+
+    double cpu_avg_ms = cpu_total_sum / cpu_stats_count;
+    double cpu_input_avg = cpu_input_sum / cpu_stats_count;
+    double cpu_forward_avg = cpu_forward_sum / cpu_stats_count;
+    double cpu_output_avg = cpu_output_sum / cpu_stats_count;
+
+    double vb_avg_ms = vb_total_sum / vb_stats_count;
+    double vb_input_avg = vb_input_sum / vb_stats_count;
+    double vb_forward_avg = vb_forward_sum / vb_stats_count;
+    double vb_output_avg = vb_output_sum / vb_stats_count;
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "\n========== VB vs CPU Performance Comparison ==========\n";
+    std::cout << "CPU Path:\n";
+    std::cout << "  Total:   " << cpu_avg_ms << " ms\n";
+    std::cout << "  Input:   " << cpu_input_avg << " ms\n";
+    std::cout << "  Forward: " << cpu_forward_avg << " ms\n";
+    std::cout << "  Output:  " << cpu_output_avg << " ms\n\n";
+
+    std::cout << "VB Path (Zero-Copy):\n";
+    std::cout << "  Total:   " << vb_avg_ms << " ms\n";
+    std::cout << "  Input:   " << vb_input_avg << " ms\n";
+    std::cout << "  Forward: " << vb_forward_avg << " ms\n";
+    std::cout << "  Output:  " << vb_output_avg << " ms\n\n";
+
+    double speedup = cpu_avg_ms / vb_avg_ms;
+    double time_saved = cpu_avg_ms - vb_avg_ms;
+    std::cout << "Speedup: " << speedup << "x\n";
+    std::cout << "Time saved: " << time_saved << " ms\n";
+    std::cout << "====================================================\n\n";
+
+    EXPECT_LT(vb_avg_ms, cpu_avg_ms) << "VB path should be faster than CPU path";
+    EXPECT_LT(vb_avg_ms, 60.0) << "VB path total should be <60ms (Forward ~36ms + Output ~17ms + overhead)";
+    EXPECT_LT(vb_input_avg, 1.0) << "VB input should achieve near-zero copy (<1ms)";
+    EXPECT_LT(vb_forward_avg, 40.0) << "TPU forward should be <40ms (hardware baseline ~36ms)";
+    EXPECT_LT(vb_output_avg, 20.0) << "Output processing should be <20ms (quantization conversion)";
+    EXPECT_GT(speedup, 2.0) << "VB path should be at least 2x faster than CPU path";
 }
 
 #endif  // USE_CVI_TPU && USE_CVI_MPI

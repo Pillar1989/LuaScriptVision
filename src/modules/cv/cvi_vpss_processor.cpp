@@ -174,6 +174,33 @@ void CviVpssProcessor::cvtColor(Frame& frame, ColorConversion code) {
 #endif
 }
 
+void CviVpssProcessor::convert_format(Frame& frame, PixelFormat output_format) {
+#ifdef USE_CVI_MPI
+    if (frame.empty()) {
+        throw std::invalid_argument("CviVpssProcessor::convert_format - frame is empty");
+    }
+    if (output_format == PixelFormat::UNKNOWN) {
+        throw std::invalid_argument("CviVpssProcessor::convert_format - output format is unknown");
+    }
+    if (frame.pixel_format() == output_format) {
+        return;
+    }
+
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
+    }
+
+    process_frame(frame, static_cast<uint32_t>(frame.width()),
+                  static_cast<uint32_t>(frame.height()), output_format,
+                  false, 0, 0, 0, 0, false, 0);
+#else
+    (void)frame;
+    (void)output_format;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
+}
+
 void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
 #ifdef USE_CVI_MPI
     if (frame.empty()) {

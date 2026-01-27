@@ -477,6 +477,7 @@ if(NOT USE_ONNX_RUNTIME)
         src/modules/cv/device_buffer.cpp
         src/modules/cv/image.cpp
         src/modules/cv/image_source.cpp
+        src/modules/cv/hw_jpeg_decoder.cpp
         src/modules/cv/camera_source.cpp
         src/modules/cv/mmf_context.cpp
         ${TENSOR_SOURCES}
@@ -566,7 +567,9 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
         gtest
+        -Wl,--no-whole-archive
         -Wl,--start-group
         ${CVI_MPI_LIB_DIR}/libsys.a
         ${CVI_MPI_LIB_DIR}/libvpss.a
@@ -581,6 +584,128 @@ if(NOT USE_ONNX_RUNTIME)
     )
 
     message(STATUS "test_cvi_session_vb: CviSession VB input test enabled (static build)")
+
+    # Test 2.2: VPSS Capability Validation Test (runs locally, no device required)
+    add_executable(test_vpss_capability
+        tests/test_vpss_capability.cpp
+        tests/vpss_capability.cpp
+        src/modules/cv/preprocess_config.cpp
+    )
+
+    target_include_directories(test_vpss_capability PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        ${CVI_MPI_INCLUDE_DIR}
+    )
+
+    target_link_libraries(test_vpss_capability PRIVATE
+        -Wl,--whole-archive
+        gtest
+        -Wl,--no-whole-archive
+        pthread
+    )
+
+    message(STATUS "test_vpss_capability: VPSS capability validation test enabled (local)")
+
+    # Test 2.3: End-to-End Pipeline Test (requires device + model)
+    add_executable(test_end_to_end_pipeline
+        tests/test_end_to_end_pipeline.cpp
+        tests/test_common.cpp
+        src/inference/cvi_session.cpp
+        src/inference/shl_c906_u8_to_f32.S
+        src/inference/shl_c906_i8_to_f32.S
+        src/modules/tensor/cvi_tpu_memory.cpp
+        src/modules/tensor/vb_memory.cpp
+        src/modules/tensor/vb_pool_manager.cpp
+        src/modules/tensor/device_buffer.cpp
+        src/modules/tensor/cpu_memory.cpp
+        src/modules/tensor/sync_handle.cpp
+        src/modules/cv/mmf_context.cpp
+        src/modules/cv/cv_types.cpp
+        src/modules/cv/image_source.cpp
+        src/modules/cv/hw_jpeg_decoder.cpp
+        src/modules/cv/hw_jpeg_decoder.cpp
+        src/modules/cv/cvi_frame.cpp
+        src/modules/cv/cvi_vpss_processor.cpp
+        src/modules/cv/cv_helpers.cpp
+    )
+
+    target_include_directories(test_end_to_end_pipeline PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/inference"
+        ${OpenCV_INCLUDE_DIRS}
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+    )
+
+    target_link_directories(test_end_to_end_pipeline PRIVATE
+        ${TPU_LIB_DIR}
+        ${CVI_MPI_LIB_DIR}
+    )
+
+    target_link_libraries(test_end_to_end_pipeline PRIVATE
+        -static
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
+        gtest
+        -Wl,--no-whole-archive
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        ${CVI_MPI_LIB_DIR}/libvpss.a
+        ${CVI_MPI_LIB_DIR}/libvdec.a
+        ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
+        ${OpenCV_LIBS}
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    # Add camera sources when ENABLE_CVI_CAMERA is ON
+    if(ENABLE_CVI_CAMERA)
+        target_sources(test_end_to_end_pipeline PRIVATE
+            src/modules/cv/cvi_camera.cpp
+            src/modules/cv/cvi_sensor.cpp
+            src/modules/cv/camera_source.cpp
+        )
+
+        target_include_directories(test_end_to_end_pipeline PRIVATE
+            ${CVI_ISP_INCLUDE_DIR}
+        )
+
+        target_link_libraries(test_end_to_end_pipeline PRIVATE
+            -Wl,--start-group
+            ${CVI_MPI_LIB_DIR}/libvi.a
+            ${CVI_MPI_LIB_DIR}/libisp.a
+            ${CVI_MPI_LIB_DIR}/libisp_algo.a
+            ${CVI_MPI_LIB_DIR}/libae.a
+            ${CVI_MPI_LIB_DIR}/libawb.a
+            ${CVI_MPI_LIB_DIR}/libaf.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin_isp.a
+            ${CVI_MPI_LIB_DIR}/libsns_full.a
+            -Wl,--end-group
+        )
+
+        target_compile_definitions(test_end_to_end_pipeline PRIVATE USE_CVI_CAMERA)
+
+        message(STATUS "test_end_to_end_pipeline: End-to-end tests with camera enabled (static build)")
+    else()
+        message(STATUS "test_end_to_end_pipeline: End-to-end tests with image only (static build)")
+    endif()
+
+
 
     # Add camera sources and ISP libraries when ENABLE_CVI_CAMERA is ON
     if(ENABLE_CVI_CAMERA)

@@ -27,10 +27,12 @@ LuaIntf::LuaRef Session::run(lua_State* L, const Tensor& input_tensor) {
     LuaIntf::LuaRef outputs = LuaIntf::LuaRef::createTable(L);
     const auto& output_names = session_->get_output_names();
 
-    if (!output_names.empty()) {
+    // Add generic "output0" name for consistency with TPU path
+    outputs["output0"] = output_tensor;
+
+    // Also add model's original output name if different
+    if (!output_names.empty() && output_names[0] != "output0") {
         outputs[output_names[0]] = output_tensor;
-    } else {
-        outputs["output"] = output_tensor;
     }
 
     return outputs;
@@ -141,6 +143,7 @@ void register_module(lua_State* L) {
             // Tensor class binding
             .beginClass<tensor::Tensor>("Tensor")
                 .addStaticFunction("new", &tensor::Tensor::from_lua)
+                .addStaticFunction("arange", &tensor::Tensor::arange)
 
                 .addProperty("ndim", &Tensor::ndim)
                 .addFunction("shape", &tensor::Tensor::shape)
@@ -178,6 +181,9 @@ void register_module(lua_State* L) {
                 .addFunction("sub_", &tensor::Tensor::sub_)
                 .addFunction("mul_", &tensor::Tensor::mul_)
                 .addFunction("div_", &tensor::Tensor::div_)
+
+                // Clamp operation
+                .addFunction("clamp", &tensor::Tensor::clamp)
 
                 .addFunction("sum", &tensor::Tensor::sum)
                 .addFunction("mean", &tensor::Tensor::mean)

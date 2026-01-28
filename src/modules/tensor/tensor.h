@@ -64,6 +64,13 @@ public:
     static Tensor from_lua(lua_State* L, const LuaIntf::LuaRef& data_table,
                           const LuaIntf::LuaRef& shape_table);
 
+    /// 静态工厂方法 - 生成等差数列张量
+    /// @param start 起始值
+    /// @param end 结束值 (不包含)
+    /// @param step 步长 (默认 1.0)
+    /// @return 1D CPU 张量
+    static Tensor arange(float start, float end, float step = 1.0f);
+
 
     // ==================== 属性访问 ====================
     // 实现文件: tensor_core.cpp
@@ -217,6 +224,12 @@ public:
     Tensor& sub_(float scalar);
     Tensor& mul_(float scalar);
     Tensor& div_(float scalar);
+
+    /// 值域裁剪
+    /// @param min_val 最小值
+    /// @param max_val 最大值
+    /// @return 裁剪后的张量
+    Tensor clamp(float min_val, float max_val) const;
 
 
     // ==================== 激活函数 ====================

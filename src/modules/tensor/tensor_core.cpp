@@ -67,6 +67,32 @@ Tensor Tensor::create(const std::vector<float>& data, const std::vector<int64_t>
     return Tensor(data, shape);
 }
 
+// Static factory method - create arithmetic sequence tensor
+Tensor Tensor::arange(float start, float end, float step) {
+    if (std::abs(step) < 1e-7f) {
+        throw std::runtime_error("arange: step cannot be zero");
+    }
+    if ((end > start && step < 0) || (end < start && step > 0)) {
+        throw std::runtime_error("arange: invalid step direction");
+    }
+
+    // Calculate number of elements
+    int64_t count = static_cast<int64_t>(std::ceil((end - start) / step));
+    if (count <= 0) count = 0;
+
+    std::vector<float> data;
+    data.reserve(static_cast<size_t>(count));
+
+    float val = start;
+    for (int64_t i = 0; i < count; ++i) {
+        data.push_back(val);
+        val += step;
+    }
+
+    std::vector<int64_t> shape = {count};
+    return Tensor(std::move(data), shape);
+}
+
 // Lua factory method - manually parse LuaRef tables
 Tensor Tensor::from_lua(lua_State* L, const LuaIntf::LuaRef& data_table, const LuaIntf::LuaRef& shape_table) {
     // Parse data table

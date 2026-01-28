@@ -318,4 +318,35 @@ Tensor& Tensor::div_(float scalar) {
     return *this;
 }
 
+// ========== Clamp ==========
+
+Tensor Tensor::clamp(float min_val, float max_val) const {
+    check_cpu();
+
+    int64_t total = compute_size();
+    auto new_storage = CpuMemory::allocate(total * sizeof(float));
+    float* dst = static_cast<float*>(new_storage->data());
+
+    if (contiguous_) {
+        const float* src = static_cast<const float*>(buffer_->data()) + offset_;
+        for (int64_t i = 0; i < total; ++i) {
+            float v = src[i];
+            if (v < min_val) v = min_val;
+            if (v > max_val) v = max_val;
+            dst[i] = v;
+        }
+    } else {
+        Tensor a = contiguous();
+        const float* src = static_cast<const float*>(a.buffer_->data()) + a.offset_;
+        for (int64_t i = 0; i < total; ++i) {
+            float v = src[i];
+            if (v < min_val) v = min_val;
+            if (v > max_val) v = max_val;
+            dst[i] = v;
+        }
+    }
+
+    return Tensor(new_storage, shape_, compute_strides(shape_), 0, true);
+}
+
 } // namespace tensor

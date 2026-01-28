@@ -1,5 +1,6 @@
--- YOLO11 Object Detection Script (使用新Tensor API)
--- 展示如何用通用Tensor操作替代filter_yolo()等专用方法
+-- YOLO11 Object Detection Script (Tensor API)
+-- Supports both fused single-output and multi-head 6-output models
+-- Optimized: filter by confidence first, then decode only valid candidates
 local utils = lua_utils
 local nn = lua_nn
 local preprocess_lib = require("scripts.lib.preprocess")
@@ -12,10 +13,12 @@ Model.config = {
     conf_thres = 0.25,
     iou_thres  = 0.45,
     stride     = 32,
-    labels = coco_labels  -- 使用公共库中的COCO labels
+    labels = coco_labels,
+    reg_max = 16,
+    strides = {8, 16, 32}
 }
 
--- C++ Preprocess Configuration (使用C++预处理函数)
+-- C++ Preprocess Configuration
 Model.preprocess_config = {
     type = "letterbox",
     input_size = {640, 640},
@@ -23,51 +26,162 @@ Model.preprocess_config = {
     fill_value = 114
 }
 
--- Lua fallback implementation (仅在C++预处理不可用时使用)
--- function Model.preprocess(img)
---     return preprocess_lib.letterbox(img, Model.config.input_size, Model.config.stride)
--- end
+-- DFL decode for a SINGLE anchor point (efficient: only called for valid candidates)
+-- Input: bbox_flat tensor [64, n_anchors], anchor index (0-based)
+-- Output: l, t, r, b decoded distances
+local function dfl_decode_single(bbox_flat, anchor_idx, reg_max)
+    local l, t, r, b = 0, 0, 0, 0
 
--- 使用向量化Tensor操作实现YOLO后处理（方案3 - 极致性能）
-function Model.postprocess(outputs, meta)
-    local output = outputs["output0"]
+    -- For each coordinate (l, t, r, b)
+    for coord = 0, 3 do
+        local start_ch = coord * reg_max
 
-    if not output then
-        error("Missing output0")
+        -- Find max for numerical stability
+        local max_val = -1e30
+        for bin = 0, reg_max - 1 do
+            local v = bbox_flat:at(start_ch + bin, anchor_idx)
+            if v > max_val then max_val = v end
+        end
+
+        -- Softmax + weighted sum
+        local sum_exp = 0
+        local weighted = 0
+        for bin = 0, reg_max - 1 do
+            local v = bbox_flat:at(start_ch + bin, anchor_idx)
+            local e = math.exp(v - max_val)
+            sum_exp = sum_exp + e
+            weighted = weighted + e * bin
+        end
+
+        local dist = weighted / sum_exp
+        if coord == 0 then l = dist
+        elseif coord == 1 then t = dist
+        elseif coord == 2 then r = dist
+        else b = dist end
     end
 
-    -- YOLO11格式: [1, 84, 8400]
-    -- 前4个是box坐标(xywh), 后80个是类别分数
-    local num_classes = 80
+    return l, t, r, b
+end
 
-    -- 1. 提取box坐标和类别分数
-    -- 关键优化：立即调用contiguous()确保后续操作高效
-    local boxes = output:slice(1, 0, 4, 1):squeeze(0):contiguous()  -- [4, 8400]
-    local scores = output:slice(1, 4, 84, 1):squeeze(0):contiguous()  -- [80, 8400]
+-- Process multi-head YOLO output (6 outputs: 3 bbox + 3 cls)
+-- Optimized: filter by confidence FIRST, then decode only valid candidates
+local function process_multi_head(outputs, meta)
+    local reg_max = Model.config.reg_max
+    local strides = Model.config.strides
+    local conf_thres = Model.config.conf_thres
 
-    -- 2. 对每个box找到最大分数和对应类别 (融合操作，单次遍历)
-    local result = scores:max_with_argmax(0)  -- {values=Tensor[8400], indices=table[8400]}
+    local all_proposals = {}
+
+    -- Process each scale (3 scales)
+    for scale = 0, 2 do
+        local bbox_key = "output" .. (scale * 2)
+        local cls_key = "output" .. (scale * 2 + 1)
+
+        local bbox_output = outputs[bbox_key]
+        local cls_output = outputs[cls_key]
+
+        if not bbox_output or not cls_output then
+            print(string.format("Warning: Missing output at scale %d", scale))
+            goto continue
+        end
+
+        local bbox_shape = bbox_output:shape()
+        local cls_shape = cls_output:shape()
+        local stride = strides[scale + 1]
+
+        -- Get grid dimensions from shape [1, channels, H, W]
+        local grid_h = bbox_shape[3]
+        local grid_w = bbox_shape[4]
+        local n_anchors = grid_h * grid_w
+
+        -- Reshape to [channels, n_anchors]
+        local bbox_flat = bbox_output:reshape({bbox_shape[2], n_anchors}):contiguous()
+        local cls_flat = cls_output:reshape({cls_shape[2], n_anchors}):contiguous()
+
+        -- Apply sigmoid to class scores and find max
+        local cls_scores = cls_flat:sigmoid()
+        local max_result = cls_scores:max_with_argmax(0)
+        local max_scores = max_result.values
+        local class_ids = max_result.indices
+
+        -- FIRST: filter by confidence (this is very fast)
+        local valid_indices = max_scores:where_indices(conf_thres, "ge")
+
+        if #valid_indices == 0 then
+            goto continue
+        end
+
+        -- THEN: decode DFL only for valid candidates (typically < 100)
+        local filtered_scores = max_scores:index_select(0, valid_indices):to_table()
+
+        for i, idx in ipairs(valid_indices) do
+            -- Decode DFL for this single anchor
+            local l, t, r, b = dfl_decode_single(bbox_flat, idx, reg_max)
+
+            -- Calculate anchor center
+            local row = math.floor(idx / grid_w)
+            local col = idx % grid_w
+            local ax = (col + 0.5) * stride
+            local ay = (row + 0.5) * stride
+
+            -- dist2bbox
+            local x1 = ax - l * stride
+            local y1 = ay - t * stride
+            local x2 = ax + r * stride
+            local y2 = ay + b * stride
+
+            local cx = (x1 + x2) * 0.5
+            local cy = (y1 + y2) * 0.5
+            local w = x2 - x1
+            local h = y2 - y1
+
+            local cls_id = class_ids[idx + 1]
+            local conf = filtered_scores[i]
+
+            table.insert(all_proposals, {
+                x = cx - w / 2.0,
+                y = cy - h / 2.0,
+                w = w,
+                h = h,
+                score = conf,
+                class_id = cls_id,
+                label = Model.config.labels[cls_id + 1] or "unknown"
+            })
+        end
+
+        ::continue::
+    end
+
+    return all_proposals
+end
+
+-- Process fused single-output YOLO (output0 with shape [1, 84, 8400])
+local function process_fused(outputs, meta)
+    local output = outputs["output0"]
+
+    -- YOLO11 fused format: [1, 84, 8400]
+    -- First 4 channels: cx, cy, w, h (already decoded)
+    -- Next 80 channels: class scores (already sigmoid-ed)
+    local boxes = output:slice(1, 0, 4, 1):squeeze(0):contiguous()
+    local scores = output:slice(1, 4, 84, 1):squeeze(0):contiguous()
+
+    -- Find max class score and id
+    local result = scores:max_with_argmax(0)
     local max_scores = result.values
     local class_ids = result.indices
 
-    -- 3. 向量化过滤：找出满足条件的索引（关键优化！）
+    -- Filter by confidence
     local valid_indices = max_scores:where_indices(Model.config.conf_thres, "ge")
 
     if #valid_indices == 0 then
         return {}
     end
 
-    -- 4. 批量提取有效数据（避免大规模to_table转换）
-    -- extract_columns 直接返回行格式 {{cx,cy,w,h}, ...}
+    -- Extract filtered boxes and scores
     local filtered_boxes = boxes:extract_columns(valid_indices)
-
-    -- 对于1D tensor [8400]，使用index_select提取指定元素，然后转为table
-    local filtered_scores_tensor = max_scores:index_select(0, valid_indices)  -- [num_valid]
-    local filtered_scores = filtered_scores_tensor:to_table()  -- 现在数据量很小，转换快速
+    local filtered_scores = max_scores:index_select(0, valid_indices):to_table()
 
     local proposals = {}
-
-    -- 5. 只遍历过滤后的小数据集（通常<100个）
     for i = 1, #valid_indices do
         local idx = valid_indices[i]
         local box_data = filtered_boxes[i]
@@ -76,16 +190,12 @@ function Model.postprocess(outputs, meta)
         local cy = box_data[2]
         local w = box_data[3]
         local h = box_data[4]
-        local cls_id = class_ids[idx + 1]  -- Lua索引从1开始（C++索引）
-        local conf = filtered_scores[i]  -- 使用过滤后的scores
-
-        -- 将中心点坐标转换为左上角坐标
-        local x = cx - w / 2.0
-        local y = cy - h / 2.0
+        local cls_id = class_ids[idx + 1]
+        local conf = filtered_scores[i]
 
         table.insert(proposals, {
-            x = x,
-            y = y,
+            x = cx - w / 2.0,
+            y = cy - h / 2.0,
             w = w,
             h = h,
             score = conf,
@@ -94,18 +204,36 @@ function Model.postprocess(outputs, meta)
         })
     end
 
-    -- 6. 坐标还原到原图（使用公共库函数）
+    return proposals
+end
+
+-- Main postprocess function
+function Model.postprocess(outputs, meta)
+    local output_count = meta.output_count or 1
+
+    local proposals
+    if output_count == 6 then
+        -- Multi-head YOLO (6 outputs: 3 bbox + 3 cls)
+        print("[Postprocess] Multi-head YOLO (6 outputs)")
+        proposals = process_multi_head(outputs, meta)
+    else
+        -- Fused single-output YOLO
+        print("[Postprocess] Fused YOLO (1 output)")
+        proposals = process_fused(outputs, meta)
+    end
+
+    -- Scale coordinates back to original image
     for _, box in ipairs(proposals) do
         box.x, box.y = preprocess_lib.scale_coords(box.x, box.y, meta)
         box.w = preprocess_lib.scale_size(box.w, meta)
         box.h = preprocess_lib.scale_size(box.h, meta)
     end
 
-    -- 7. NMS
+    -- Apply NMS
     local final_boxes = utils.nms(proposals, Model.config.iou_thres)
-    
-    print(string.format("NMS后最终框: %d", #final_boxes))
-    
+
+    print(string.format("NMS final boxes: %d", #final_boxes))
+
     return final_boxes
 end
 

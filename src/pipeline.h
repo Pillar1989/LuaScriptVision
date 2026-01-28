@@ -90,10 +90,6 @@ private:
     // VPSS processor for preprocessing
     lua_cv::CviVpssProcessor vpss_processor_;
 
-    // Multi-head YOLO decode (set during init)
-    bool multi_head_yolo_ = false;
-    int yolo_num_classes_ = 0;
-
     StageTimings last_timings_{};
 };
 

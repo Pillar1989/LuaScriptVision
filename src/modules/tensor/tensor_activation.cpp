@@ -1,4 +1,5 @@
 #include "tensor.h"
+#include "cpu_memory.h"
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -24,43 +25,54 @@ Tensor Tensor::sigmoid() const {
 Tensor Tensor::softmax(int axis) const {
     check_cpu();
     int ax = axis;
-    if (ax < 0) ax += shape_.size();
+    if (ax < 0) ax += static_cast<int>(shape_.size());
     if (ax < 0 || ax >= static_cast<int>(shape_.size())) {
         throw std::runtime_error("Axis out of range");
     }
 
     Tensor a = contiguous();
-    std::vector<float> result_data(compute_size());
     const float* src = static_cast<const float*>(a.buffer_->data()) + a.offset_;
 
-    if (ax != static_cast<int>(shape_.size()) - 1) {
-        throw std::runtime_error("Softmax only supports last axis for now");
-    }
-
+    // Calculate outer_size (product of dims before axis)
+    // Calculate axis_size (size of the axis dim)
+    // Calculate inner_size (product of dims after axis)
     int64_t outer_size = 1;
     for (int i = 0; i < ax; ++i) {
         outer_size *= shape_[i];
     }
-    int64_t inner_size = shape_[ax];
+    int64_t axis_size = shape_[ax];
+    int64_t inner_size = 1;
+    for (int i = ax + 1; i < static_cast<int>(shape_.size()); ++i) {
+        inner_size *= shape_[i];
+    }
 
-    for (int64_t i = 0; i < outer_size; ++i) {
-        const float* row = src + i * inner_size;
-        float* out_row = result_data.data() + i * inner_size;
+    std::vector<float> result_data(compute_size());
 
-        float max_val = row[0];
-        for (int64_t j = 1; j < inner_size; ++j) {
-            max_val = std::max(max_val, row[j]);
-        }
+    // For each combination of outer and inner indices
+    for (int64_t outer = 0; outer < outer_size; ++outer) {
+        for (int64_t inner = 0; inner < inner_size; ++inner) {
+            // Find max along axis for numerical stability
+            float max_val = -1e30f;
+            for (int64_t k = 0; k < axis_size; ++k) {
+                int64_t idx = (outer * axis_size + k) * inner_size + inner;
+                if (src[idx] > max_val) max_val = src[idx];
+            }
 
-        float sum = 0.0f;
-        for (int64_t j = 0; j < inner_size; ++j) {
-            out_row[j] = std::exp(row[j] - max_val);
-            sum += out_row[j];
-        }
+            // Compute exp and sum
+            float sum = 0.0f;
+            for (int64_t k = 0; k < axis_size; ++k) {
+                int64_t idx = (outer * axis_size + k) * inner_size + inner;
+                float e = std::exp(src[idx] - max_val);
+                result_data[idx] = e;
+                sum += e;
+            }
 
-        float inv_sum = 1.0f / sum;
-        for (int64_t j = 0; j < inner_size; ++j) {
-            out_row[j] *= inv_sum;
+            // Normalize
+            float inv_sum = 1.0f / sum;
+            for (int64_t k = 0; k < axis_size; ++k) {
+                int64_t idx = (outer * axis_size + k) * inner_size + inner;
+                result_data[idx] *= inv_sum;
+            }
         }
     }
 

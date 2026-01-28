@@ -5,12 +5,15 @@
 #include <opencv2/opencv.hpp>
 #include "LuaIntf.h"
 
-// 模块头文件
 #include "modules/lua_cv.h"
 #include "modules/lua_nn.h"
 #include "modules/lua_utils.h"
 
-// 推理上下文
+#if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
+#include "pipeline.h"
+#include "modules/cv/mmf_context.h"
+#endif
+
 struct InferenceContext {
     lua_State* L = nullptr;
 #ifdef USE_ONNX_RUNTIME
@@ -18,11 +21,9 @@ struct InferenceContext {
 #endif
     LuaIntf::LuaRef preprocess;
     LuaIntf::LuaRef postprocess;
-    LuaIntf::LuaRef preprocess_config;  // 新增：C++预处理配置
+    LuaIntf::LuaRef preprocess_config;
 
     ~InferenceContext() {
-        // 重要：先清空 LuaRef 对象，再关闭 Lua 状态
-        // 否则 LuaRef 析构时会访问已关闭的 Lua 状态
         preprocess = LuaIntf::LuaRef();
         postprocess = LuaIntf::LuaRef();
         preprocess_config = LuaIntf::LuaRef();
@@ -34,45 +35,45 @@ struct InferenceContext {
     }
 };
 
+static bool ends_with(const std::string& str, const std::string& suffix) {
+    if (suffix.size() > str.size()) return false;
+    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 void print_usage(const char* prog_name) {
     std::cout << "Usage:\n";
-    std::cout << "  1. Inference mode: " << prog_name << " <script.lua> <model.onnx> <input> [options]\n";
+    std::cout << "  1. Inference mode: " << prog_name << " <script.lua> <model> <input> [options]\n";
     std::cout << "  2. Test mode:      " << prog_name << " <test_script.lua>\n";
     std::cout << "\n=== Inference Mode ===\n";
-    std::cout << "Input: image file (.jpg, .png)\n";
+    std::cout << "Model: .onnx (CPU) or .cvimodel (TPU)\n";
+    std::cout << "Input: image file (.jpg, .png) or 'camera'\n";
     std::cout << "\nOptions:\n";
     std::cout << "  show          - Display window during processing\n";
     std::cout << "  save=OUTPUT   - Save output image\n";
-    std::cout << "\nInference Examples:\n";
-    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua models/yolo11n.onnx images/zidane.jpg show\n";
+    std::cout << "\nExamples:\n";
+    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel zidane.jpg\n";
+    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel camera\n";
     std::cout << "\n=== Test Mode ===\n";
-    std::cout << "Test Examples:\n";
     std::cout << "  " << prog_name << " tests/run_all_tests.lua\n";
-    std::cout << "  " << prog_name << " tests/test_basic.lua\n";
 }
 
 #ifdef USE_ONNX_RUNTIME
-// 初始化推理上下文
 std::unique_ptr<InferenceContext> init_inference(const std::string& script_path,
                                                   const std::string& model_path) {
     auto ctx = std::make_unique<InferenceContext>();
 
-    // 初始化Lua
     ctx->L = luaL_newstate();
     if (!ctx->L) throw std::runtime_error("Failed to create Lua state");
     luaL_openlibs(ctx->L);
 
-    // 注册C++模块
     std::cout << "Registering modules...\n";
     lua_cv::register_module(ctx->L);
     lua_nn::register_module(ctx->L);
     lua_utils::register_module(ctx->L);
 
-    // 加载ONNX模型
     std::cout << "Loading model: " << model_path << "\n";
     ctx->session = std::make_unique<lua_nn::Session>(model_path);
 
-    // 加载Lua脚本
     std::cout << "Loading script: " << script_path << "\n";
     if (luaL_dofile(ctx->L, script_path.c_str()) != LUA_OK) {
         throw std::runtime_error("Failed to load script: " + std::string(lua_tostring(ctx->L, -1)));
@@ -85,14 +86,12 @@ std::unique_ptr<InferenceContext> init_inference(const std::string& script_path,
 
     ctx->preprocess = model["preprocess"];
     ctx->postprocess = model["postprocess"];
-    ctx->preprocess_config = model["preprocess_config"];  // 新增：读取C++预处理配置
+    ctx->preprocess_config = model["preprocess_config"];
 
-    // postprocess必须存在
     if (!ctx->postprocess.isFunction()) {
         throw std::runtime_error("Model must have postprocess function");
     }
 
-    // preprocess可以是函数(Lua模式)或通过preprocess_config(C++模式)提供
     bool has_lua_preprocess = ctx->preprocess.isFunction();
     bool has_cpp_preprocess = ctx->preprocess_config.isValid() && ctx->preprocess_config.isTable();
 
@@ -103,22 +102,15 @@ std::unique_ptr<InferenceContext> init_inference(const std::string& script_path,
     return ctx;
 }
 
-// 执行推理
 LuaIntf::LuaRef run_inference(InferenceContext* ctx, lua_cv::Image& img) {
-    // 尝试使用C++预处理
     if (ctx->preprocess_config.isValid() && ctx->preprocess_config.isTable()) {
         std::string type = ctx->preprocess_config.get<std::string>("type");
 
         auto& registry = lua_cv::PreprocessRegistry::instance();
 
         if (registry.has(type)) {
-            // 执行C++预处理
             auto result = registry.run(type, img, ctx->L, ctx->preprocess_config);
-
-            // 推理
             LuaIntf::LuaRef outputs = ctx->session->run(ctx->L, result.tensor);
-
-            // 后处理
             return ctx->postprocess.call<LuaIntf::LuaRef>(outputs, result.meta);
         } else {
             std::cerr << "Warning: Unknown preprocess type '" << type
@@ -126,7 +118,6 @@ LuaIntf::LuaRef run_inference(InferenceContext* ctx, lua_cv::Image& img) {
         }
     }
 
-    // 回退到Lua预处理
     ctx->preprocess.pushToStack();
     LuaIntf::LuaRef::fromValue(ctx->L, img).pushToStack();
 
@@ -137,11 +128,9 @@ LuaIntf::LuaRef run_inference(InferenceContext* ctx, lua_cv::Image& img) {
     LuaIntf::LuaRef meta = LuaIntf::LuaRef::popFromStack(ctx->L);
     LuaIntf::LuaRef input_tensor_ref = LuaIntf::LuaRef::popFromStack(ctx->L);
 
-    // 推理
     lua_nn::Tensor input_tensor = input_tensor_ref.toValue<lua_nn::Tensor>();
     LuaIntf::LuaRef outputs = ctx->session->run(ctx->L, input_tensor);
 
-    // 后处理
     return ctx->postprocess.call<LuaIntf::LuaRef>(outputs, meta);
 }
 #endif  // USE_ONNX_RUNTIME
@@ -191,7 +180,6 @@ void draw_detections(cv::Mat& frame, LuaIntf::LuaRef& detections) {
     LuaIntf::LuaRef first = detections[1];
     if (!first.has("x") || !first.has("y")) return;
 
-    // 每个类别生成确定性颜色
     static std::vector<cv::Scalar> colors;
     if (colors.empty()) {
         for (int i = 0; i < 80; ++i) {
@@ -216,7 +204,6 @@ void draw_detections(cv::Mat& frame, LuaIntf::LuaRef& detections) {
         int class_id = det.has("class_id") ? det.get<int>("class_id") : 0;
         std::string label = det.has("label") ? det.get<std::string>("label") : "unknown";
 
-        // 绘制 mask
         if (det.has("mask")) {
             try {
                 lua_nn::Tensor mask_tensor = det.get<lua_nn::Tensor>("mask");
@@ -237,10 +224,8 @@ void draw_detections(cv::Mat& frame, LuaIntf::LuaRef& detections) {
             } catch (...) {}
         }
 
-        // 绘制边界框
         cv::rectangle(frame, cv::Rect(x, y, w, h), cv::Scalar(0, 255, 0), 2);
 
-        // 绘制标签
         std::string text = label + " " + std::to_string(score).substr(0, 4);
         int baseline = 0;
         cv::Size textSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
@@ -249,7 +234,6 @@ void draw_detections(cv::Mat& frame, LuaIntf::LuaRef& detections) {
         cv::putText(frame, text, cv::Point(x, y - 5),
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
 
-        // 绘制关键点
         if (det.has("keypoints")) {
             LuaIntf::LuaRef kpts = det.get<LuaIntf::LuaRef>("keypoints");
             int num_kpts = kpts.len();
@@ -284,48 +268,133 @@ void draw_detections(cv::Mat& frame, LuaIntf::LuaRef& detections) {
     }
 }
 
-// 运行测试脚本
 int run_test_script(const std::string& script_path) {
-    std::cout << "\n========== 运行Lua测试脚本 ==========\n";
-    std::cout << "加载脚本: " << script_path << "\n";
+    std::cout << "\n========== Running Lua Test Script ==========\n";
+    std::cout << "Script: " << script_path << "\n";
 
-    // 检查文件是否存在
     std::ifstream file(script_path);
     if (!file.good()) {
-        std::cerr << "错误: 找不到脚本文件: " << script_path << "\n";
+        std::cerr << "Error: Script not found: " << script_path << "\n";
         return 1;
     }
     file.close();
 
-    // 创建Lua状态机
     lua_State* L = luaL_newstate();
     if (!L) {
-        std::cerr << "错误: 无法创建Lua状态机\n";
+        std::cerr << "Error: Failed to create Lua state\n";
         return 1;
     }
     luaL_openlibs(L);
 
-    // 注册所有模块
-    std::cout << "注册模块...\n";
+    std::cout << "Registering modules...\n";
     lua_cv::register_module(L);
     lua_nn::register_module(L);
     lua_utils::register_module(L);
 
-    // 加载并运行脚本
-    std::cout << "执行测试脚本...\n\n";
+    std::cout << "Executing...\n\n";
     int result = luaL_dofile(L, script_path.c_str());
 
     if (result != LUA_OK) {
-        std::cerr << "\n错误: 脚本执行失败: " << lua_tostring(L, -1) << "\n";
+        std::cerr << "\nError: " << lua_tostring(L, -1) << "\n";
         lua_pop(L, 1);
         lua_close(L);
         return 1;
     }
 
     lua_close(L);
-    std::cout << "\n✓ Lua脚本测试完成!\n";
     return 0;
 }
+
+#if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
+int run_cvi_inference(const std::string& script_path,
+                      const std::string& model_path,
+                      const std::string& input_path,
+                      const std::string& save_path) {
+    // Initialize MMF context (VB pools, VPSS mode)
+    lua_cv::MmfContext::Config mmf_config;
+    if (!lua_cv::MmfContext::build_default_config(&mmf_config)) {
+        throw std::runtime_error("Failed to build MMF config");
+    }
+    mmf_config.force_reset = true;
+    if (!lua_cv::MmfContext::instance().init(mmf_config)) {
+        throw std::runtime_error("Failed to init MMF context");
+    }
+
+    // Create Lua state and register modules
+    lua_State* L = luaL_newstate();
+    if (!L) throw std::runtime_error("Failed to create Lua state");
+    luaL_openlibs(L);
+
+    lua_cv::register_module(L);
+    lua_nn::register_module(L);
+    lua_utils::register_module(L);
+
+    // Load Lua script
+    std::cout << "Loading script: " << script_path << "\n";
+    if (luaL_dofile(L, script_path.c_str()) != LUA_OK) {
+        std::string err = lua_tostring(L, -1);
+        lua_close(L);
+        throw std::runtime_error("Failed to load script: " + err);
+    }
+
+    LuaIntf::LuaRef model_table = LuaIntf::LuaRef::popFromStack(L);
+    if (!model_table.isTable()) {
+        lua_close(L);
+        throw std::runtime_error("Script must return a Model table");
+    }
+
+    LuaIntf::LuaRef postprocess = model_table["postprocess"];
+    if (!postprocess.isFunction()) {
+        lua_close(L);
+        throw std::runtime_error("Model must have postprocess function");
+    }
+
+    LuaIntf::LuaRef preprocess_config = model_table["preprocess_config"];
+
+    // Use block scope to ensure pipeline is destroyed before lua_close.
+    // CviPipeline holds LuaRef members that must be released while Lua state is alive.
+    {
+        pipeline::CviPipeline pipe;
+        pipe.init(model_path, L, postprocess, preprocess_config);
+
+        // Run inference
+        pipeline::InferenceResult result;
+        if (input_path == "camera") {
+            result = pipe.run_camera();
+        } else {
+            result = pipe.run_image(input_path);
+        }
+
+        // Print results
+        print_results(result.detections);
+
+        // Save output if requested
+        if (!save_path.empty() && input_path != "camera") {
+            cv::Mat draw_img = cv::imread(input_path);
+            if (!draw_img.empty()) {
+                draw_detections(draw_img, result.detections);
+                cv::imwrite(save_path, draw_img);
+                std::cout << "\nResult saved to: " << save_path << "\n";
+            }
+        }
+
+        // Clear InferenceResult's LuaRef before pipe goes out of scope
+        result.detections = LuaIntf::LuaRef();
+    }
+    // pipe destroyed here → LuaRefs released while L is still alive
+
+    // Cleanup: clear remaining Lua refs before closing state
+    postprocess = LuaIntf::LuaRef();
+    preprocess_config = LuaIntf::LuaRef();
+    model_table = LuaIntf::LuaRef();
+
+    lua_close(L);
+
+    lua_cv::MmfContext::instance().shutdown();
+
+    return 0;
+}
+#endif  // USE_CVI_TPU && USE_CVI_MPI
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -335,15 +404,12 @@ int main(int argc, char* argv[]) {
 
     std::string first_arg = argv[1];
 
-    // 判断是测试模式还是推理模式
-    // 测试模式：只有一个参数，且是 .lua 文件
-    if (argc == 2 && first_arg.size() > 4 &&
-        first_arg.substr(first_arg.size() - 4) == ".lua") {
+    // Test mode: single .lua argument
+    if (argc == 2 && ends_with(first_arg, ".lua")) {
         return run_test_script(first_arg);
     }
 
-#ifdef USE_ONNX_RUNTIME
-    // 推理模式：需要至少 3 个参数（script, model, input）
+    // Inference mode: script, model, input
     if (argc < 4) {
         print_usage(argv[0]);
         return 1;
@@ -353,10 +419,9 @@ int main(int argc, char* argv[]) {
     std::string model_path = argv[2];
     std::string input_path = argv[3];
 
+    std::string save_path;
     bool show_result = false;
-    std::string save_path = "";
 
-    // 解析可选参数
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "show") {
@@ -367,20 +432,20 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        // 初始化推理上下文（共用）
+#if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
+        if (ends_with(model_path, ".cvimodel")) {
+            return run_cvi_inference(script_path, model_path, input_path, save_path);
+        }
+#endif
+
+#ifdef USE_ONNX_RUNTIME
         auto ctx = init_inference(script_path, model_path);
 
-        // ========== 图片推理模式 ==========
         std::cout << "Loading image: " << input_path << "\n";
         auto img = lua_cv::imread(input_path);
         std::cout << "Image size: " << img.width() << "x" << img.height() << "\n\n";
 
-        std::cout << "Preprocessing...\n";
-        std::cout << "Running inference...\n";
-        std::cout << "Postprocessing...\n";
-
         LuaIntf::LuaRef detections = run_inference(ctx.get(), img);
-
         print_results(detections);
 
         if (show_result || !save_path.empty()) {
@@ -401,22 +466,22 @@ int main(int argc, char* argv[]) {
             }
 #else
             if (show_result) {
-                std::cerr << "Warning: Display mode not supported (OpenCV built without videoio/highgui)\n";
+                std::cerr << "Warning: Display mode not supported\n";
             }
 #endif
         }
+#else
+        std::cerr << "Error: No inference backend available for " << model_path << "\n";
+        return 1;
+#endif  // USE_ONNX_RUNTIME
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
+#if defined(USE_CVI_MPI)
+        lua_cv::MmfContext::instance().shutdown();
+#endif
         return 1;
     }
-#else
-    // Inference mode requires ONNX Runtime
-    std::cerr << "Error: Inference mode is not available.\n";
-    std::cerr << "This build was compiled without ONNX Runtime support.\n";
-    std::cerr << "Only test mode is available: " << argv[0] << " <test_script.lua>\n";
-    return 1;
-#endif  // USE_ONNX_RUNTIME
 
     return 0;
 }

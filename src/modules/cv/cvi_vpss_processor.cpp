@@ -1,6 +1,7 @@
 #include "cvi_vpss_processor.h"
 
 #include <stdexcept>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -229,7 +230,7 @@ void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
 }
 
 void CviVpssProcessor::letterbox(Frame& frame, int width, int height, uint8_t pad_value,
-                                 LetterboxMeta* meta) {
+                                 LetterboxMeta* meta, PixelFormat output_format) {
 #ifdef USE_CVI_MPI
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::letterbox - frame is empty");
@@ -240,8 +241,6 @@ void CviVpssProcessor::letterbox(Frame& frame, int width, int height, uint8_t pa
 
     const int ori_w = frame.width();
     const int ori_h = frame.height();
-
-    PixelFormat output_format = PixelFormat::RGB_PLANAR;
 
     process_frame(frame, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
                   output_format, false, 0, 0, 0, 0, true, pad_value);
@@ -589,8 +588,11 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         input_format = PixelFormat::BGR;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     ensure_group(static_cast<uint32_t>(frame.width()), static_cast<uint32_t>(frame.height()), input_format);
+    auto t1 = std::chrono::steady_clock::now();
     ensure_channel(out_width, out_height, out_format, letterbox, pad_value);
+    auto t2 = std::chrono::steady_clock::now();
 
     VPSS_CROP_INFO_S crop_info{};
     if (use_crop) {
@@ -610,12 +612,14 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
     VB_BLK input_block = VB_INVALID_HANDLE;
     bool input_from_mat = false;
 
+    auto t3 = std::chrono::steady_clock::now();
     if (frame.storage_type() == Frame::StorageType::CVI && frame.video_frame()) {
         input_frame = *frame.video_frame();
     } else {
         input_frame = mat_to_video_frame(frame.to_mat(), input_block, select_output_pool(frame.width(), frame.height(), input_format));
         input_from_mat = true;
     }
+    auto t4 = std::chrono::steady_clock::now();
 
     CVI_S32 rc = CVI_SUCCESS;
     const int send_attempts = 3;
@@ -642,6 +646,7 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         oss << "CviVpssProcessor - CVI_VPSS_SendFrame failed: 0x" << std::hex << rc;
         throw std::runtime_error(oss.str());
     }
+    auto t5 = std::chrono::steady_clock::now();
 
     VIDEO_FRAME_INFO_S output_frame{};
     const int get_attempts = 5;
@@ -655,6 +660,8 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         }
         usleep(5000);
     }
+    auto t6 = std::chrono::steady_clock::now();
+
     if (use_crop) {
         crop_info.bEnable = CVI_FALSE;
         CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
@@ -666,26 +673,32 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         throw std::runtime_error(oss.str());
     }
 
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::cout << "[VPSS] ensure_group=" << ms(t0, t1)
+              << "ms ensure_channel=" << ms(t1, t2)
+              << "ms input_prep=" << ms(t2, t3) + ms(t3, t4)
+              << "ms send=" << ms(t4, t5)
+              << "ms get=" << ms(t5, t6)
+              << "ms from_mat=" << (input_from_mat ? "yes" : "no") << "\n";
+
     Frame out(output_frame, grp_, chn_);
     out.set_vpss_owner(grp_, chn_);
     frame = std::move(out);
 }
 
 VB_POOL CviVpssProcessor::select_output_pool(uint32_t width, uint32_t height, PixelFormat format) const {
-    PixelFormat pool_format = format;
-    if (format == PixelFormat::RGB || format == PixelFormat::GRAY) {
-        pool_format = PixelFormat::BGR;
-    }
-
+    // find_pool handles RGB↔BGR fallback internally, so pass the exact format.
     if (MmfContext::instance().is_initialized()) {
-        VB_POOL pool = MmfContext::instance().vb_plan().find_pool(width, height, pool_format);
+        VB_POOL pool = MmfContext::instance().vb_plan().find_pool(width, height, format);
         if (pool != VB_INVALID_POOLID) {
             return pool;
         }
     }
 
     uint32_t needed = COMMON_GetPicBufferSize(width, height,
-                                              to_cvi_pixel_format(pool_format),
+                                              to_cvi_pixel_format(format),
                                               DATA_BITWIDTH_8, COMPRESS_MODE_NONE, 0);
     if (needed == 0) {
         return VB_INVALID_POOLID;

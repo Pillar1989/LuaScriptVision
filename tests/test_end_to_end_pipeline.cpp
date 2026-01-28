@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <stdexcept>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -50,6 +51,20 @@ std::string get_env_path(const char* name) {
         return {};
     }
     return std::string(env);
+}
+
+uint8_t get_letterbox_pad_value() {
+    std::string value = get_env_path("TEST_LETTERBOX_PAD");
+    if (value.empty()) {
+        return 114;
+    }
+    char* endptr = nullptr;
+    long parsed = std::strtol(value.c_str(), &endptr, 10);
+    if (endptr == value.c_str() || parsed < 0 || parsed > 255) {
+        std::cout << "  Warning: Invalid TEST_LETTERBOX_PAD=" << value << " (using 114)\n";
+        return 114;
+    }
+    return static_cast<uint8_t>(parsed);
 }
 
 struct Detection {
@@ -419,6 +434,71 @@ bool choose_output_format(const inference::CviSession::VbInputSpec& spec,
     }
 }
 
+struct ModelInputPlan {
+    lua_cv::PixelFormat desired_format = lua_cv::PixelFormat::UNKNOWN;
+    bool has_desired_format = false;
+    uint8_t pad_value = 0;
+};
+
+ModelInputPlan build_model_input_plan(const inference::CviSession::VbInputSpec& spec) {
+    ModelInputPlan plan;
+    plan.has_desired_format = choose_output_format(spec, &plan.desired_format);
+    lua_cv::PixelFormat forced_format = lua_cv::PixelFormat::UNKNOWN;
+    if (parse_force_pixel_format(&forced_format)) {
+        plan.desired_format = forced_format;
+        plan.has_desired_format = true;
+        std::cout << "  Forcing output format: "
+                  << lua_cv::pixel_format_name(plan.desired_format) << "\n";
+    }
+    plan.pad_value = get_letterbox_pad_value();
+    std::cout << "  Letterbox pad value: " << static_cast<int>(plan.pad_value) << "\n";
+    return plan;
+}
+
+void log_frame_info(const char* label, const lua_cv::Frame& frame) {
+    std::cout << "  " << label << ": " << frame.width() << "x" << frame.height()
+              << ", format=" << lua_cv::pixel_format_name(frame.pixel_format()) << "\n";
+}
+
+void prepare_frame_for_model(lua_cv::Frame& frame,
+                             lua_cv::CviVpssProcessor& vpss,
+                             const inference::CviSession::VbInputSpec& spec,
+                             const ModelInputPlan& plan,
+                             lua_cv::CviVpssProcessor::LetterboxMeta* meta) {
+    if (!meta) {
+        throw std::invalid_argument("prepare_frame_for_model - meta is null");
+    }
+
+    log_frame_info("Before VPSS", frame);
+
+    if (frame.width() == static_cast<int>(spec.width) &&
+        frame.height() == static_cast<int>(spec.height)) {
+        meta->scale = 1.0f;
+        meta->pad_x = 0;
+        meta->pad_y = 0;
+        meta->ori_w = frame.width();
+        meta->ori_h = frame.height();
+        std::cout << "  VPSS skip: frame already " << spec.width << "x"
+                  << spec.height << "\n";
+    } else {
+        // Pass desired output format to letterbox to do resize+pad+format in one VPSS pass
+        lua_cv::PixelFormat lb_format = lua_cv::PixelFormat::RGB_PLANAR;
+        if (plan.has_desired_format) {
+            lb_format = plan.desired_format;
+        }
+        vpss.letterbox(frame, spec.width, spec.height, plan.pad_value, meta, lb_format);
+    }
+
+    if (plan.has_desired_format && frame.pixel_format() != plan.desired_format) {
+        std::cout << "  Converting format: "
+                  << lua_cv::pixel_format_name(frame.pixel_format())
+                  << " -> " << lua_cv::pixel_format_name(plan.desired_format) << "\n";
+        vpss.convert_format(frame, plan.desired_format);
+    }
+
+    log_frame_info("After VPSS", frame);
+}
+
 void log_input_spec(const inference::CviSession::VbInputSpec& spec) {
     std::cout << "  Model input spec: format=" << vb_pixel_format_name(spec.pixel_format)
               << ", normalized=" << (spec.normalized ? "true" : "false")
@@ -597,16 +677,7 @@ TEST(EndToEndPipeline, ImageFileToDetection) {
     ASSERT_TRUE(session.supports_vb_input()) << "Model does not support VB input";
     auto vb_spec = session.get_vb_input_spec();
     log_input_spec(vb_spec);
-
-    lua_cv::PixelFormat desired_format = lua_cv::PixelFormat::UNKNOWN;
-    bool has_desired_format = choose_output_format(vb_spec, &desired_format);
-    lua_cv::PixelFormat forced_format = lua_cv::PixelFormat::UNKNOWN;
-    if (parse_force_pixel_format(&forced_format)) {
-        desired_format = forced_format;
-        has_desired_format = true;
-        std::cout << "  Forcing output format: "
-                  << lua_cv::pixel_format_name(desired_format) << "\n";
-    }
+    ModelInputPlan input_plan = build_model_input_plan(vb_spec);
 
     end_stage = std::chrono::high_resolution_clock::now();
     double stage2_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();
@@ -618,16 +689,8 @@ TEST(EndToEndPipeline, ImageFileToDetection) {
 
     lua_cv::CviVpssProcessor vpss;
     lua_cv::CviVpssProcessor::LetterboxMeta letterbox_meta;
-    vpss.letterbox(frame, vb_spec.width, vb_spec.height, 114, &letterbox_meta);
+    ASSERT_NO_THROW(prepare_frame_for_model(frame, vpss, vb_spec, input_plan, &letterbox_meta));
     ASSERT_FALSE(frame.empty()) << "VPSS preprocessing failed";
-
-    if (has_desired_format && frame.pixel_format() != desired_format) {
-        std::cout << "  Converting format: "
-                  << lua_cv::pixel_format_name(frame.pixel_format())
-                  << " -> " << lua_cv::pixel_format_name(desired_format) << "\n";
-        vpss.convert_format(frame, desired_format);
-        ASSERT_FALSE(frame.empty()) << "VPSS format conversion failed";
-    }
 
     end_stage = std::chrono::high_resolution_clock::now();
     double vpss_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();
@@ -707,6 +770,8 @@ TEST(EndToEndPipeline, CameraToDetection) {
     lua_cv::CameraSource camera;
     ASSERT_TRUE(camera.open("")) << "Failed to open camera";
 
+    ASSERT_TRUE(camera.wait_for_ready(5000)) << "Camera not ready";
+
     auto end_stage = std::chrono::high_resolution_clock::now();
     double stage1_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();
     std::cout << "  Camera initialized (" << stage1_ms << " ms)\n\n";
@@ -741,43 +806,20 @@ TEST(EndToEndPipeline, CameraToDetection) {
     ASSERT_TRUE(session.supports_vb_input()) << "Model does not support VB input";
     auto vb_spec = session.get_vb_input_spec();
     log_input_spec(vb_spec);
-
-    lua_cv::PixelFormat desired_format = lua_cv::PixelFormat::UNKNOWN;
-    bool has_desired_format = choose_output_format(vb_spec, &desired_format);
-    lua_cv::PixelFormat forced_format = lua_cv::PixelFormat::UNKNOWN;
-    if (parse_force_pixel_format(&forced_format)) {
-        desired_format = forced_format;
-        has_desired_format = true;
-        std::cout << "  Forcing output format: "
-                  << lua_cv::pixel_format_name(desired_format) << "\n";
-    }
+    ModelInputPlan input_plan = build_model_input_plan(vb_spec);
 
     end_stage = std::chrono::high_resolution_clock::now();
     double stage3_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();
     std::cout << "  Model loaded: input " << vb_spec.width << "x" << vb_spec.height
               << " (" << stage3_ms << " ms)\n\n";
 
-    std::cout << "[Stage 4] VPSS preprocessing (NV21→RGB888 + letterbox)...\n";
+    std::cout << "[Stage 4] VPSS preprocessing (letterbox + format convert)...\n";
     start_stage = std::chrono::high_resolution_clock::now();
-
-    std::cout << "  Before VPSS: " << frame.width() << "x" << frame.height()
-              << ", format=" << lua_cv::pixel_format_name(frame.pixel_format()) << "\n";
 
     lua_cv::CviVpssProcessor vpss;
     lua_cv::CviVpssProcessor::LetterboxMeta letterbox_meta;
-    vpss.letterbox(frame, vb_spec.width, vb_spec.height, 114, &letterbox_meta);
+    ASSERT_NO_THROW(prepare_frame_for_model(frame, vpss, vb_spec, input_plan, &letterbox_meta));
     ASSERT_FALSE(frame.empty()) << "VPSS preprocessing failed";
-
-    if (has_desired_format && frame.pixel_format() != desired_format) {
-        std::cout << "  Converting format: "
-                  << lua_cv::pixel_format_name(frame.pixel_format())
-                  << " -> " << lua_cv::pixel_format_name(desired_format) << "\n";
-        vpss.convert_format(frame, desired_format);
-        ASSERT_FALSE(frame.empty()) << "VPSS format conversion failed";
-    }
-
-    std::cout << "  After VPSS: " << frame.width() << "x" << frame.height()
-              << ", format=" << lua_cv::pixel_format_name(frame.pixel_format()) << "\n";
 
     end_stage = std::chrono::high_resolution_clock::now();
     double vpss_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();

@@ -169,6 +169,7 @@ endif()
 
 add_executable(lua_runner
     src/main.cpp
+    src/pipeline.cpp
     ${MODULE_SOURCES}
     ${TENSOR_SOURCES}
     ${MEMORY_SOURCES}

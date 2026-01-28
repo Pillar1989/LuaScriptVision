@@ -29,7 +29,8 @@ public:
     void crop(Frame& frame, int x, int y, int w, int h) override;
     void convert_format(Frame& frame, PixelFormat output_format);
     void letterbox(Frame& frame, int width, int height, uint8_t pad_value,
-                   LetterboxMeta* meta = nullptr);
+                   LetterboxMeta* meta = nullptr,
+                   PixelFormat output_format = PixelFormat::RGB_PLANAR);
 
 #ifdef USE_CVI_MPI
     VIDEO_FRAME_INFO_S mat_to_video_frame(const cv::Mat& mat, VB_BLK& vb_block);

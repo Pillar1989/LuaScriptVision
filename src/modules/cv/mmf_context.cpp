@@ -67,7 +67,7 @@ const MmfPlan& plan() {
             VpssGroupPlan{1, 0, 0, VpssInputKind::Mem, 1280, 720},
         },
         CameraOutputPlan{0, 1920, 1080, PixelFormat::NV21, 3},
-        CameraOutputPlan{1, 640, 640, PixelFormat::BGR, 2},
+        CameraOutputPlan{1, 640, 640, PixelFormat::RGB, 2},
         {
             Resolution{1920, 1080},
             Resolution{0, 0},
@@ -83,7 +83,7 @@ const MmfPlan& plan() {
             VbPoolSpec{1280, 720, PixelFormat::NV21, 2, true},
             VbPoolSpec{1280, 720, PixelFormat::BGR, 1, true},
             VbPoolSpec{640, 640, PixelFormat::RGB_PLANAR, 2, true},
-            VbPoolSpec{640, 640, PixelFormat::BGR, 4, true},
+            VbPoolSpec{640, 640, PixelFormat::RGB, 4, true},
             VbPoolSpec{0, 0, PixelFormat::UNKNOWN, 0, true},
         },
     };
@@ -259,27 +259,69 @@ VB_POOL VbPoolPlan::find_pool(uint32_t width, uint32_t height, PixelFormat forma
         return VB_INVALID_POOLID;
     }
 
-    uint32_t needed = find_block_size(width, height, format);
-    if (needed == 0) {
-        return VB_INVALID_POOLID;
+    auto select_pool = [&](PixelFormat target_format) -> VB_POOL {
+        uint32_t needed = find_block_size(width, height, target_format);
+        if (needed == 0) {
+            return VB_INVALID_POOLID;
+        }
+
+        VB_POOL best_pool = VB_INVALID_POOLID;
+        uint32_t best_size = 0;
+
+        for (size_t i = 0; i < pools_.size(); ++i) {
+            const Pool& pool = pools_[i];
+            if (pool.format != target_format || pool.block_size == 0) {
+                continue;
+            }
+            if (pool.block_size >= needed &&
+                (best_pool == VB_INVALID_POOLID || pool.block_size < best_size)) {
+                best_pool = static_cast<VB_POOL>(i);
+                best_size = pool.block_size;
+            }
+        }
+        return best_pool;
+    };
+
+    struct Candidate {
+        VB_POOL id = VB_INVALID_POOLID;
+        uint32_t block_size = 0;
+        uint32_t block_count = 0;
+    };
+
+    auto make_candidate = [&](PixelFormat target_format) -> Candidate {
+        VB_POOL pool_id = select_pool(target_format);
+        if (pool_id == VB_INVALID_POOLID) {
+            return {};
+        }
+        const auto& pool = pools_[static_cast<size_t>(pool_id)];
+        return {pool_id, pool.block_size, pool.block_count};
+    };
+
+    Candidate primary = make_candidate(format);
+    Candidate fallback{};
+    if (format == PixelFormat::RGB) {
+        fallback = make_candidate(PixelFormat::BGR);
+    } else if (format == PixelFormat::BGR) {
+        fallback = make_candidate(PixelFormat::RGB);
     }
 
-    VB_POOL best_pool = VB_INVALID_POOLID;
-    uint32_t best_size = 0;
-
-    for (size_t i = 0; i < pools_.size(); ++i) {
-        const Pool& pool = pools_[i];
-        if (pool.format != format || pool.block_size == 0) {
-            continue;
-        }
-        if (pool.block_size >= needed &&
-            (best_pool == VB_INVALID_POOLID || pool.block_size < best_size)) {
-            best_pool = static_cast<VB_POOL>(i);
-            best_size = pool.block_size;
-        }
+    if (primary.id == VB_INVALID_POOLID) {
+        return fallback.id;
+    }
+    if (fallback.id == VB_INVALID_POOLID) {
+        return primary.id;
     }
 
-    return best_pool;
+    if (fallback.block_size < primary.block_size) {
+        return fallback.id;
+    }
+    if (fallback.block_size > primary.block_size) {
+        return primary.id;
+    }
+    if (fallback.block_count > primary.block_count) {
+        return fallback.id;
+    }
+    return primary.id;
 }
 
 uint32_t VbPoolPlan::find_block_size(uint32_t width, uint32_t height, PixelFormat format) const {

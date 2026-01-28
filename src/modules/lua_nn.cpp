@@ -1,7 +1,7 @@
 /**
- * lua_nn.cpp - ONNX Runtime Session 绑定和 Lua 模块注册
+ * lua_nn.cpp - Inference Session bindings and Lua module registration
  *
- * 现在使用 inference::OnnxSession 作为底层推理引擎
+ * Supports ONNX Runtime (CPU) and CVI Runtime (TPU) backends.
  */
 
 #include "lua_nn.h"
@@ -10,24 +10,20 @@ namespace lua_nn {
 
 #ifdef USE_ONNX_RUNTIME
 
-// ========== Session 实现 ==========
+// ========== Session (ONNX) ==========
 
 Session::Session(const std::string& model_path, int num_threads)
     : session_(std::make_unique<inference::OnnxSession>(model_path, num_threads)) {
 }
 
 LuaIntf::LuaRef Session::run(lua_State* L, const Tensor& input_tensor) {
-    // 获取输入数据和形状
     auto shape = input_tensor.shape();
     const float* input_data = input_tensor.raw_data();
 
-    // 调用底层推理引擎
     auto [output_data, output_shape] = session_->run(input_data, shape);
 
-    // 创建输出 Tensor
     Tensor output_tensor(std::move(output_data), output_shape);
 
-    // 返回 Lua table（为了向后兼容，仍然用 table 包装）
     LuaIntf::LuaRef outputs = LuaIntf::LuaRef::createTable(L);
     const auto& output_names = session_->get_output_names();
 
@@ -58,18 +54,94 @@ std::vector<int64_t> Session::output_shape(size_t index) const {
 
 #endif  // USE_ONNX_RUNTIME
 
-// ========== Lua 模块注册 ==========
+#ifdef USE_CVI_TPU
+
+// ========== TpuSession (CVI Runtime) ==========
+
+TpuSession::TpuSession(const std::string& model_path)
+    : session_(std::make_unique<inference::CviSession>(model_path)) {
+}
+
+LuaIntf::LuaRef TpuSession::run(lua_State* L, const Tensor& input_tensor) {
+    auto shape = input_tensor.shape();
+    const float* input_data = input_tensor.raw_data();
+
+    // Use run() for single primary output (compatible with ONNX Session API)
+    auto [output_data, output_shape] = session_->run(input_data, shape);
+
+    Tensor output_tensor(std::move(output_data), output_shape);
+
+    LuaIntf::LuaRef outputs = LuaIntf::LuaRef::createTable(L);
+    const auto& names = session_->get_output_names();
+
+    int32_t primary_idx = session_->primary_output_index();
+    std::string primary_name = (primary_idx >= 0 &&
+                                static_cast<size_t>(primary_idx) < names.size())
+                               ? names[primary_idx]
+                               : "output0";
+    outputs[primary_name] = output_tensor;
+
+    return outputs;
+}
+
+LuaIntf::LuaRef TpuSession::run_all(lua_State* L, const Tensor& input_tensor) {
+    auto shape = input_tensor.shape();
+    const float* input_data = input_tensor.raw_data();
+
+    std::vector<std::vector<float>> output_data;
+    std::vector<std::vector<int64_t>> output_shapes;
+    session_->run_all(input_data, shape, &output_data, &output_shapes);
+
+    LuaIntf::LuaRef outputs = LuaIntf::LuaRef::createTable(L);
+    const auto& names = session_->get_output_names();
+
+    for (size_t i = 0; i < output_data.size(); ++i) {
+        Tensor tensor(std::move(output_data[i]), output_shapes[i]);
+        std::string name = (i < names.size()) ? names[i]
+                           : "output" + std::to_string(i);
+        outputs[name] = tensor;
+    }
+
+    return outputs;
+}
+
+std::vector<std::string> TpuSession::input_names() const {
+    return session_->get_input_names();
+}
+
+std::vector<std::string> TpuSession::output_names() const {
+    return session_->get_output_names();
+}
+
+std::vector<int64_t> TpuSession::input_shape(size_t index) const {
+    return session_->get_input_shape(index);
+}
+
+std::vector<int64_t> TpuSession::output_shape(size_t index) const {
+    return session_->get_output_shape(index);
+}
+
+int32_t TpuSession::output_count() const {
+    return session_->output_count();
+}
+
+std::string TpuSession::backend_name() const {
+    return session_->backend_name();
+}
+
+#endif  // USE_CVI_TPU
+
+// ========== Lua Module Registration ==========
 
 void register_module(lua_State* L) {
     using namespace LuaIntf;
 
     LuaBinding(L)
         .beginModule("lua_nn")
-            // Tensor类绑定 (显式使用 tensor::Tensor)
+            // Tensor class binding
             .beginClass<tensor::Tensor>("Tensor")
                 .addStaticFunction("new", &tensor::Tensor::from_lua)
 
-                // 属性
                 .addProperty("ndim", &Tensor::ndim)
                 .addFunction("shape", &tensor::Tensor::shape)
                 .addFunction("strides", &tensor::Tensor::strides)
@@ -78,7 +150,7 @@ void register_module(lua_State* L) {
                 .addFunction("contiguous", &Tensor::contiguous)
                 .addFunction("view", &Tensor::view)
 
-                // Level 1: 基础形状操作
+                // Shape operations
                 .addFunction("slice", &tensor::Tensor::slice)
                 .addFunction("select_dim", &tensor::Tensor::select_dim)
                 .addFunction("get_column", &tensor::Tensor::get_column)
@@ -91,7 +163,7 @@ void register_module(lua_State* L) {
                 .addFunction("squeeze", &tensor::Tensor::squeeze)
                 .addFunction("unsqueeze", &tensor::Tensor::unsqueeze)
 
-                // Level 2: 数学运算
+                // Math operations
                 .addFunction("add", static_cast<tensor::Tensor(tensor::Tensor::*)(float) const>(&tensor::Tensor::add))
                 .addFunction("add_tensor", static_cast<tensor::Tensor(tensor::Tensor::*)(const tensor::Tensor&) const>(&tensor::Tensor::add))
                 .addFunction("sub", static_cast<tensor::Tensor(tensor::Tensor::*)(float) const>(&tensor::Tensor::sub))
@@ -101,7 +173,7 @@ void register_module(lua_State* L) {
                 .addFunction("div", static_cast<tensor::Tensor(tensor::Tensor::*)(float) const>(&tensor::Tensor::div))
                 .addFunction("div_tensor", static_cast<tensor::Tensor(tensor::Tensor::*)(const tensor::Tensor&) const>(&tensor::Tensor::div))
 
-                // In-place 操作（避免内存分配）
+                // In-place operations
                 .addFunction("add_", &tensor::Tensor::add_)
                 .addFunction("sub_", &tensor::Tensor::sub_)
                 .addFunction("mul_", &tensor::Tensor::mul_)
@@ -126,7 +198,7 @@ void register_module(lua_State* L) {
                 .addFunction("le", &tensor::Tensor::le)
                 .addFunction("eq", &tensor::Tensor::eq)
 
-                // Level 3: 高级操作
+                // Advanced operations
                 .addFunction("topk_new", &tensor::Tensor::topk_lua)
                 .addFunction("to_table", &tensor::Tensor::to_table)
                 .addFunction("to_string", &tensor::Tensor::to_string)
@@ -134,7 +206,7 @@ void register_module(lua_State* L) {
                 .addFunction("set", &tensor::Tensor::set_lua)
                 .addFunction("at", &tensor::Tensor::at2d)
 
-                // 向量化过滤操作
+                // Vectorized filtering
                 .addFunction("nonzero", &tensor::Tensor::nonzero)
                 .addFunction("where_indices", &tensor::Tensor::where_indices)
                 .addFunction("index_select", &tensor::Tensor::index_select)
@@ -145,7 +217,7 @@ void register_module(lua_State* L) {
                 .addStaticFunction("concat", &tensor::Tensor::concat)
                 .addFunction("split", &tensor::Tensor::split)
 
-                // Legacy方法（向后兼容）
+                // Legacy methods (backward compatible)
                 .addFunction("filter_yolo", &tensor::Tensor::filter_yolo)
                 .addFunction("filter_yolo_pose", &tensor::Tensor::filter_yolo_pose)
                 .addFunction("filter_yolo_seg", &tensor::Tensor::filter_yolo_seg)
@@ -153,7 +225,7 @@ void register_module(lua_State* L) {
                 .addFunction("argmax_old", &tensor::Tensor::argmax)
                 .addFunction("topk", &tensor::Tensor::topk)
 
-                // Metamethods (使用 const& 避免不必要的 shared_ptr 原子操作)
+                // Metamethods
                 .addMetaFunction("__len", [](const tensor::Tensor* t) { return t->size(); })
                 .addMetaFunction("__tostring", [](const tensor::Tensor* t) {
                     return t->to_string(10);
@@ -164,7 +236,7 @@ void register_module(lua_State* L) {
                 .addMetaFunction("__div", [](const tensor::Tensor& t, float scalar) { return t.div(scalar); })
             .endClass()
 
-            // TensorView绑定
+            // TensorView binding
             .beginClass<TensorView<float>>("FloatView")
                 .addFunction("get", &TensorView<float>::get)
                 .addFunction("set", &TensorView<float>::set)
@@ -172,7 +244,7 @@ void register_module(lua_State* L) {
             .endClass()
 
 #ifdef USE_ONNX_RUNTIME
-            // Session绑定 (仅在启用ONNX Runtime时可用)
+            // ONNX Session binding
             .beginClass<Session>("Session")
                 .addConstructor(
                     LUA_SP(std::shared_ptr<Session>),
@@ -183,6 +255,22 @@ void register_module(lua_State* L) {
                 .addProperty("output_names", &Session::output_names)
             .endClass()
 #endif  // USE_ONNX_RUNTIME
+
+#ifdef USE_CVI_TPU
+            // TPU Session binding
+            .beginClass<TpuSession>("TpuSession")
+                .addConstructor(
+                    LUA_SP(std::shared_ptr<TpuSession>),
+                    LUA_ARGS(const std::string&)
+                )
+                .addFunction("run", &TpuSession::run)
+                .addFunction("run_all", &TpuSession::run_all)
+                .addProperty("input_names", &TpuSession::input_names)
+                .addProperty("output_names", &TpuSession::output_names)
+                .addProperty("output_count", &TpuSession::output_count)
+                .addProperty("backend", &TpuSession::backend_name)
+            .endClass()
+#endif  // USE_CVI_TPU
         .endModule();
 }
 

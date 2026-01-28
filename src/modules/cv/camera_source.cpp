@@ -30,7 +30,7 @@ bool CameraSource::open(const std::string& source) {
 #endif
     close();
     CviCamera::Config config;
-    config.format = PixelFormat::BGR;
+    config.format = PixelFormat::UNKNOWN;
     config.enable_infer = true;
     camera_ = std::make_unique<CviCamera>(config);
     if (!camera_->open()) {
@@ -51,6 +51,18 @@ bool CameraSource::read(Frame& frame) {
     throw std::runtime_error("CameraSource::read - USE_CVI_CAMERA not enabled");
 #else
     return camera_->read(frame);
+#endif
+}
+
+bool CameraSource::wait_for_ready(int timeout_ms) {
+    if (!opened_) {
+        throw std::runtime_error("CameraSource::wait_for_ready - source not opened");
+    }
+#ifndef USE_CVI_CAMERA
+    (void)timeout_ms;
+    throw std::runtime_error("CameraSource::wait_for_ready - USE_CVI_CAMERA not enabled");
+#else
+    return camera_->wait_for_ready(timeout_ms);
 #endif
 }
 

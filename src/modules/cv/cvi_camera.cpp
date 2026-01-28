@@ -40,6 +40,7 @@ constexpr int kReadyPollTimeoutMs = 200;
 constexpr int kReadyPollSleepUs = 20000;
 constexpr int kVpssPoolTraceMax = 4;
 constexpr int kCameraVpssDepth = 3;
+constexpr COMPRESS_MODE_E kCameraCompressMode = COMPRESS_MODE_NONE;
 constexpr size_t kProcDumpBytes = 8192;
 constexpr size_t kProcDumpBytesLarge = 16384;
 
@@ -992,7 +993,7 @@ bool CviCamera::start_vi_pipe() {
     VI_PIPE_ATTR_S pipe_attr = make_vi_pipe_attr_base();
     pipe_attr.u32MaxW = static_cast<CVI_U32>(width_);
     pipe_attr.u32MaxH = static_cast<CVI_U32>(height_);
-    pipe_attr.enCompressMode = COMPRESS_MODE_NONE;
+    pipe_attr.enCompressMode = kCameraCompressMode;
 
     if (!check_rc(CVI_VI_CreatePipe(vi_pipe_, &pipe_attr), "CVI_VI_CreatePipe")) {
         return false;
@@ -1169,7 +1170,7 @@ bool CviCamera::start_vi_channel() {
     VI_CHN_ATTR_S chn_attr = make_vi_chn_attr_base();
     chn_attr.stSize.u32Width = static_cast<CVI_U32>(width_);
     chn_attr.stSize.u32Height = static_cast<CVI_U32>(height_);
-    chn_attr.enCompressMode = COMPRESS_MODE_TILE;
+    chn_attr.enCompressMode = kCameraCompressMode;
 
     chn_attr.enPixelFormat = PIXEL_FORMAT_NV21;
     chn_attr.u32Depth = kCameraVpssDepth;

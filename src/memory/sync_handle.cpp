@@ -1,18 +1,13 @@
 #include "sync_handle.h"
 #include <stdexcept>
 
-namespace tensor {
+namespace memory {
 
 std::shared_ptr<SyncHandle> SyncHandle::create(DeviceType device) {
     switch (device) {
         case DeviceType::CPU:
-            return std::make_shared<CpuSyncHandle>();
-
         case DeviceType::VB:
             return std::make_shared<CpuSyncHandle>();
-
-        case DeviceType::NPU:
-            throw std::runtime_error("SyncHandle::create: NPU handle not implemented");
 
         case DeviceType::TPU:
             throw std::runtime_error("SyncHandle::create: TPU handle not implemented");
@@ -22,4 +17,4 @@ std::shared_ptr<SyncHandle> SyncHandle::create(DeviceType device) {
     }
 }
 
-} // namespace tensor
+} // namespace memory

@@ -9,7 +9,14 @@
 #include <cvi_sys.h>
 #include <cvi_buffer.h>
 
-namespace tensor {
+namespace memory {
+
+enum class PoolType {
+    CAMERA_1080P,   // Pool 0: 1920x1080 NV21
+    VDEC_720P,      // Pool 1: 1280x720 NV21
+    PREVIEW_720P,   // Pool 2: 1280x720 NV21
+    TPU_640P,       // Pool 3: 640x640 RGB_PLANAR
+};
 
 struct VbPoolConfig {
     uint32_t width = 0;
@@ -55,6 +62,12 @@ private:
     bool config_matches(const VB_CONFIG_S& other) const;
 };
 
+} // namespace memory
+
+// Backward compatibility
+namespace tensor {
+    using VbPoolConfig = memory::VbPoolConfig;
+    using VbPoolManager = memory::VbPoolManager;
 } // namespace tensor
 
 #endif  // USE_CVI_MPI

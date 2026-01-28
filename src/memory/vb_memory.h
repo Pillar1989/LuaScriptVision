@@ -7,10 +7,11 @@
 #include <memory>
 
 #include "device_buffer.h"
+#include "sync_handle.h"
 #include <cvi_vb.h>
 #include <cvi_sys.h>
 
-namespace tensor {
+namespace memory {
 
 class VbMemory : public DeviceBuffer {
 public:
@@ -44,10 +45,15 @@ public:
     void sync(SyncHandle* handle = nullptr) const override;
     bool supports_async() const override { return false; }
 
-    uint64_t physical_address() const { return phys_addr_; }
+    // Hardware acceleration
+    bool has_physical_addr() const override { return phys_addr_ != 0; }
+    uint64_t physical_addr() const override { return phys_addr_; }
+    uint64_t physical_address() const { return phys_addr_; }  // Backward compatible alias
+    void flush_cache() override;
+    void invalidate_cache() override;
+
     VB_BLK block() const { return block_; }
-    void flush_cache();
-    void invalidate_cache();
+    bool is_cached() const { return cached_; }
 
 private:
     VbMemory(VB_BLK block, uint64_t phys_addr, size_t size_bytes, bool cached, bool owns_block);
@@ -63,6 +69,11 @@ private:
     size_t mapped_size_ = 0;
 };
 
+} // namespace memory
+
+// Backward compatibility
+namespace tensor {
+    using VbMemory = memory::VbMemory;
 } // namespace tensor
 
 #endif  // USE_CVI_MPI

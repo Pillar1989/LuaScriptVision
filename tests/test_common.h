@@ -23,7 +23,7 @@
 #include <opencv2/opencv.hpp>
 
 // CV module headers
-#include "cv/cvi_frame.h"
+#include "cv/frame.h"
 #include "cv/cv_types.h"
 #include "cv/opencv_processor.h"
 #include "cv/cv_helpers.h"

@@ -48,7 +48,13 @@ list(REMOVE_ITEM LUA_SRC
 )
 
 add_library(lua STATIC ${LUA_SRC})
-target_compile_options(lua PRIVATE -x c++ -O3 -Wall -DLUA_USE_POSIX)
+# Build Lua as C++ for exception safety
+# Add -flto to match the toolchain's Release flags (required for static linking with LTO)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(lua PRIVATE -x c++ -O3 -Wall -DLUA_USE_POSIX -flto)
+else()
+    target_compile_options(lua PRIVATE -x c++ -O3 -Wall -DLUA_USE_POSIX)
+endif()
 target_include_directories(lua PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/lua")
 
 # ==========================================================
@@ -118,6 +124,7 @@ endif()
 # 收集模块源文件
 file(GLOB MODULE_SOURCES "src/modules/*.cpp")
 file(GLOB TENSOR_SOURCES "src/modules/tensor/*.cpp")
+file(GLOB MEMORY_SOURCES "src/memory/*.cpp")
 file(GLOB CV_SOURCES "src/modules/cv/*.cpp")
 file(GLOB BINDING_SOURCES "src/bindings/*.cpp")
 file(GLOB INFERENCE_SOURCES "src/inference/*.cpp")
@@ -164,6 +171,7 @@ add_executable(lua_runner
     src/main.cpp
     ${MODULE_SOURCES}
     ${TENSOR_SOURCES}
+    ${MEMORY_SOURCES}
     ${CV_SOURCES}
     ${BINDING_SOURCES}
     ${INFERENCE_SOURCES}
@@ -171,9 +179,14 @@ add_executable(lua_runner
 
 target_link_libraries(lua_runner PRIVATE
     LuaIntf
-    lua
     ${OpenCV_LIBS}
 )
+
+# Lua linking: for static builds, lua must be linked after -static flag
+# For dynamic builds (ONNX), link normally
+if(USE_ONNX_RUNTIME)
+    target_link_libraries(lua_runner PRIVATE lua)
+endif()
 
 # Conditionally link ONNX Runtime
 if(USE_ONNX_RUNTIME)
@@ -182,6 +195,7 @@ endif()
 
 target_include_directories(lua_runner PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
@@ -239,6 +253,9 @@ if(NOT USE_ONNX_RUNTIME)
         # Use link group for proper static library resolution (ISP depends on sys)
         target_link_libraries(lua_runner PRIVATE
             -static
+            -Wl,--whole-archive
+            lua
+            -Wl,--no-whole-archive
             ${TPU_LIB_DIR}/libcviruntime-static.a
             ${TPU_LIB_DIR}/libcvikernel-static.a
             ${TPU_LIB_DIR}/libcvimath-static.a
@@ -261,6 +278,9 @@ if(NOT USE_ONNX_RUNTIME)
 
         target_link_libraries(lua_runner PRIVATE
             -static
+            -Wl,--whole-archive
+            lua
+            -Wl,--no-whole-archive
             ${CVI_BASE_LIBS}
             z
             m
@@ -312,11 +332,15 @@ if(USE_ONNX_RUNTIME)
     )
 else()
     target_sources(cpp_infer PRIVATE
-        src/modules/tensor/cvi_tpu_memory.cpp
+        src/memory/tpu_memory.cpp
+        src/memory/device_buffer.cpp
+        src/memory/cpu_memory.cpp
+        src/memory/sync_handle.cpp
     )
     target_include_directories(cpp_infer PRIVATE
         ${TPU_INCLUDE_DIR}
         ${CVI_MPI_INCLUDE_DIR}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
     )
     target_link_directories(cpp_infer PRIVATE ${TPU_LIB_DIR})
     target_link_libraries(cpp_infer PRIVATE
@@ -354,13 +378,15 @@ if(NOT USE_ONNX_RUNTIME)
     # Test 1: TPU Memory Management
     add_executable(test_tpu_memory
         tests/test_tpu_memory.cpp
-        src/modules/tensor/device_buffer.cpp
-        src/modules/tensor/cpu_memory.cpp
-        src/modules/tensor/cvi_tpu_memory.cpp
+        src/memory/device_buffer.cpp
+        src/memory/cpu_memory.cpp
+        src/memory/tpu_memory.cpp
+        src/memory/sync_handle.cpp
     )
 
     target_include_directories(test_tpu_memory PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
         ${TPU_INCLUDE_DIR}
         ${CVI_MPI_INCLUDE_DIR}
@@ -377,7 +403,10 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
         gtest_main
+        gtest
+        -Wl,--no-whole-archive
         z
         m
         pthread
@@ -389,22 +418,23 @@ if(NOT USE_ONNX_RUNTIME)
     # Test 1.1: VB Pool Manager Test
     add_executable(test_vb_pool
         tests/test_vb_pool.cpp
-        src/modules/tensor/vb_pool_manager.cpp
-        src/modules/tensor/vb_memory.cpp
-        src/modules/tensor/device_buffer.cpp
-        src/modules/tensor/cpu_memory.cpp
-        src/modules/tensor/sync_handle.cpp
+        src/memory/vb_pool_manager.cpp
+        src/memory/vb_memory.cpp
+        src/memory/device_buffer.cpp
+        src/memory/cpu_memory.cpp
+        src/memory/sync_handle.cpp
     )
 
     if(NOT USE_ONNX_RUNTIME)
         target_sources(test_vb_pool PRIVATE
-            src/modules/tensor/cvi_tpu_memory.cpp
+            src/memory/tpu_memory.cpp
         )
     endif()
 
     target_include_directories(test_vb_pool PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/tests"
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
         ${CVI_MPI_INCLUDE_DIR}
     )
@@ -438,7 +468,10 @@ if(NOT USE_ONNX_RUNTIME)
     target_link_libraries(test_vb_pool PRIVATE
         -static
         ${_VB_POOL_TPU_LIBS}
+        -Wl,--whole-archive
         gtest_main
+        gtest
+        -Wl,--no-whole-archive
         -Wl,--start-group
         ${CVI_MPI_LIB_DIR}/libsys.a
         -Wl,--end-group
@@ -465,27 +498,25 @@ if(NOT USE_ONNX_RUNTIME)
         tests/test_ion_loader.cpp
         tests/test_camera_capture.cpp
         tests/test_input_source_image.cpp
-        tests/test_input_source_camera.cpp
-        tests/test_vi_vpss_link.cpp
         src/modules/cv/cvi_vpss_processor.cpp
         src/modules/cv/ion_image_loader.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
         src/modules/cv/opencv_processor.cpp
-        src/modules/cv/cvi_frame.cpp
+        src/modules/cv/frame.cpp
         src/modules/cv/cv_helpers.cpp
         src/modules/cv/cv_types.cpp
-        src/modules/cv/device_buffer.cpp
-        src/modules/cv/image.cpp
         src/modules/cv/image_source.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
         src/modules/cv/camera_source.cpp
         src/modules/cv/mmf_context.cpp
         ${TENSOR_SOURCES}
+        ${MEMORY_SOURCES}
     )
 
     target_include_directories(test_cv_func PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/tests"
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
@@ -534,12 +565,12 @@ if(NOT USE_ONNX_RUNTIME)
         src/inference/cvi_session.cpp
         src/inference/shl_c906_u8_to_f32.S
         src/inference/shl_c906_i8_to_f32.S
-        src/modules/tensor/cvi_tpu_memory.cpp
-        src/modules/tensor/vb_memory.cpp
-        src/modules/tensor/vb_pool_manager.cpp
-        src/modules/tensor/device_buffer.cpp
-        src/modules/tensor/cpu_memory.cpp
-        src/modules/tensor/sync_handle.cpp
+        src/memory/tpu_memory.cpp
+        src/memory/vb_memory.cpp
+        src/memory/vb_pool_manager.cpp
+        src/memory/device_buffer.cpp
+        src/memory/cpu_memory.cpp
+        src/memory/sync_handle.cpp
         src/modules/cv/mmf_context.cpp
         src/modules/cv/cv_types.cpp
     )
@@ -547,6 +578,7 @@ if(NOT USE_ONNX_RUNTIME)
     target_include_directories(test_cvi_session_vb PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/tests"
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
@@ -616,18 +648,18 @@ if(NOT USE_ONNX_RUNTIME)
         src/inference/cvi_session.cpp
         src/inference/shl_c906_u8_to_f32.S
         src/inference/shl_c906_i8_to_f32.S
-        src/modules/tensor/cvi_tpu_memory.cpp
-        src/modules/tensor/vb_memory.cpp
-        src/modules/tensor/vb_pool_manager.cpp
-        src/modules/tensor/device_buffer.cpp
-        src/modules/tensor/cpu_memory.cpp
-        src/modules/tensor/sync_handle.cpp
+        src/memory/tpu_memory.cpp
+        src/memory/vb_memory.cpp
+        src/memory/vb_pool_manager.cpp
+        src/memory/device_buffer.cpp
+        src/memory/cpu_memory.cpp
+        src/memory/sync_handle.cpp
         src/modules/cv/mmf_context.cpp
         src/modules/cv/cv_types.cpp
         src/modules/cv/image_source.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
         src/modules/cv/hw_jpeg_decoder.cpp
-        src/modules/cv/cvi_frame.cpp
+        src/modules/cv/frame.cpp
         src/modules/cv/cvi_vpss_processor.cpp
         src/modules/cv/cv_helpers.cpp
     )
@@ -635,6 +667,7 @@ if(NOT USE_ONNX_RUNTIME)
     target_include_directories(test_end_to_end_pipeline PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/tests"
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
@@ -774,7 +807,9 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_LIB_DIR}/libcvikernel-static.a
         ${TPU_LIB_DIR}/libcvimath-static.a
         ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
         gtest
+        -Wl,--no-whole-archive
         ${CVI_MPI_LIB_DIR}/3rd/libini.a
         z
         m

@@ -5,8 +5,8 @@
 #include <set>
 #include <cstring>
 #include <unistd.h>
-#include "modules/tensor/vb_pool_manager.h"
-#include "modules/tensor/vb_memory.h"
+#include "memory/vb_pool_manager.h"
+#include "memory/vb_memory.h"
 
 namespace tensor {
 namespace {

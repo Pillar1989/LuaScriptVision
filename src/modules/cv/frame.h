@@ -5,8 +5,6 @@
 #include <opencv2/opencv.hpp>
 
 #include "cv_types.h"
-#include "device_buffer.h"
-#include "image.h"
 #include "vb_memory.h"
 
 #ifdef USE_CVI_MPI
@@ -106,8 +104,6 @@ private:
     mutable cv::Mat mapped_view_;      // Zero-copy view of mmap'd CVI memory
     mutable void* mapped_ptr_ = nullptr;
     mutable size_t mapped_size_ = 0;
-
-    CvImage image_;
 
 #ifdef USE_CVI_MPI
     VIDEO_FRAME_INFO_S cvi_frame_{};

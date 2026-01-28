@@ -1,4 +1,4 @@
-#include "cvi_frame.h"
+#include "frame.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -93,7 +93,6 @@ Frame& Frame::operator=(Frame&& other) noexcept {
     mapped_view_ = std::move(other.mapped_view_);
     mapped_ptr_ = other.mapped_ptr_;
     mapped_size_ = other.mapped_size_;
-    image_ = other.image_;
 
 #ifdef USE_CVI_MPI
     cvi_frame_ = other.cvi_frame_;

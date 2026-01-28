@@ -86,6 +86,49 @@ const char* get_backend_name(const Frame& frame) {
     return "opencv";
 }
 
+#ifdef USE_CVI_MPI
+bool can_zero_copy(const Frame& frame,
+                   PIXEL_FORMAT_E required_format,
+                   uint32_t required_width,
+                   uint32_t required_height,
+                   std::string* reason) {
+    if (frame.storage_type() != Frame::StorageType::CVI) {
+        if (reason) {
+            *reason = "frame is not CVI storage type";
+        }
+        return false;
+    }
+    if (!frame.has_physical_addr()) {
+        if (reason) {
+            *reason = "frame has no physical address";
+        }
+        return false;
+    }
+    uint64_t paddr = frame.physical_addr();
+    if ((paddr & 0x3F) != 0) {
+        if (reason) {
+            *reason = "physical address is not 64-byte aligned";
+        }
+        return false;
+    }
+    PIXEL_FORMAT_E frame_format = to_cvi_pixel_format(frame.pixel_format());
+    if (frame_format != required_format) {
+        if (reason) {
+            *reason = "pixel format mismatch";
+        }
+        return false;
+    }
+    if (static_cast<uint32_t>(frame.width()) != required_width ||
+        static_cast<uint32_t>(frame.height()) != required_height) {
+        if (reason) {
+            *reason = "dimension mismatch";
+        }
+        return false;
+    }
+    return true;
+}
+#endif
+
 static void validate_norm_params(int channels,
                                  const std::vector<double>& mean,
                                  const std::vector<double>& stddev,

@@ -13,10 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "modules/tensor/cvi_tpu_memory.h"
-#if defined(USE_CVI_MPI)
-#include "modules/tensor/vb_memory.h"
-#endif
+// Headers already included via cvi_session.h for CviTpuMemory and VbMemory
 
 // RVV optimized dequantization functions (C906 assembly)
 extern "C" {

@@ -11,7 +11,7 @@
 #include "lua_nn.h"
 
 // Use Frame from cv module
-#include "cv/cvi_frame.h"
+#include "cv/frame.h"
 
 namespace lua_cv {
 

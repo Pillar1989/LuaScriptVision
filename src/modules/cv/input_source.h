@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "cvi_frame.h"
+#include "frame.h"
 
 namespace lua_cv {
 

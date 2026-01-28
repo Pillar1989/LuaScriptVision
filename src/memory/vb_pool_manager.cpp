@@ -9,7 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace tensor {
+namespace memory {
 
 uint32_t VbPoolConfig::block_size() const {
     if (width == 0 || height == 0 || block_count == 0 || pixel_format == PIXEL_FORMAT_MAX) {
@@ -252,6 +252,6 @@ bool VbPoolManager::config_matches(const VB_CONFIG_S& other) const {
     return true;
 }
 
-} // namespace tensor
+} // namespace memory
 
 #endif  // USE_CVI_MPI

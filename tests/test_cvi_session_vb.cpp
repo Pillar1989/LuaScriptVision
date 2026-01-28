@@ -3,7 +3,7 @@
 #if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
 
 #include "inference/cvi_session.h"
-#include "tensor/vb_memory.h"
+#include "memory/vb_memory.h"
 #include <cstdlib>
 #include <fstream>
 

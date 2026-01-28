@@ -3,22 +3,17 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace tensor {
+namespace memory {
 
 std::shared_ptr<CpuMemory> CpuMemory::allocate(size_t size_bytes, size_t alignment, bool zero_init) {
     if (size_bytes == 0) {
         throw std::invalid_argument("CpuMemory::allocate: size_bytes cannot be 0");
     }
-
-    // 对齐要求必须是 2 的幂
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
         throw std::invalid_argument("CpuMemory::allocate: alignment must be power of 2");
     }
 
     auto storage = std::shared_ptr<CpuMemory>(new CpuMemory());
-
-    // 使用 aligned_alloc 分配对齐内存
-    // size_bytes 必须是 alignment 的倍数
     size_t aligned_size = ((size_bytes + alignment - 1) / alignment) * alignment;
 
 #if defined(_WIN32)
@@ -31,7 +26,6 @@ std::shared_ptr<CpuMemory> CpuMemory::allocate(size_t size_bytes, size_t alignme
         throw std::bad_alloc();
     }
 
-    // 只在明确需要时初始化为 0（默认跳过，提高性能）
     if (zero_init) {
         std::memset(storage->data_, 0, aligned_size);
     }
@@ -54,7 +48,7 @@ std::shared_ptr<CpuMemory> CpuMemory::from_external(void* ptr, size_t size_bytes
     auto storage = std::shared_ptr<CpuMemory>(new CpuMemory());
     storage->data_ = ptr;
     storage->size_bytes_ = size_bytes;
-    storage->alignment_ = 1;  // 外部内存对齐未知
+    storage->alignment_ = 1;
     storage->owns_memory_ = take_ownership;
 
     return storage;
@@ -83,7 +77,6 @@ CpuMemory::CpuMemory(CpuMemory&& other) noexcept
 
 CpuMemory& CpuMemory::operator=(CpuMemory&& other) noexcept {
     if (this != &other) {
-        // 释放当前资源
         if (owns_memory_ && data_) {
 #if defined(_WIN32)
             _aligned_free(data_);
@@ -92,13 +85,11 @@ CpuMemory& CpuMemory::operator=(CpuMemory&& other) noexcept {
 #endif
         }
 
-        // 移动资源
         data_ = other.data_;
         size_bytes_ = other.size_bytes_;
         alignment_ = other.alignment_;
         owns_memory_ = other.owns_memory_;
 
-        // 清空源对象
         other.data_ = nullptr;
         other.size_bytes_ = 0;
         other.owns_memory_ = false;
@@ -115,10 +106,8 @@ void CpuMemory::copy_to(DeviceBuffer* dst) const {
     }
 
     if (dst->device() == DeviceType::CPU) {
-        // CPU -> CPU: 直接 memcpy
         std::memcpy(dst->data(), data_, size_bytes_);
     } else {
-        // CPU -> NPU/TPU: 需要子类实现
         throw std::runtime_error("CpuMemory::copy_to: cross-device copy not implemented for target device");
     }
 }
@@ -132,36 +121,28 @@ void CpuMemory::copy_from(const DeviceBuffer* src) {
     }
 
     if (src->device() == DeviceType::CPU) {
-        // CPU -> CPU: 直接 memcpy
         std::memcpy(data_, src->data(), src->size_bytes());
     } else {
-        // NPU/TPU -> CPU: 需要子类实现
         throw std::runtime_error("CpuMemory::copy_from: cross-device copy not implemented for source device");
     }
 }
 
-// ========== 异步接口实现（CPU 同步降级） ==========
-
 void CpuMemory::copy_to_async(DeviceBuffer* dst, SyncHandle* handle) const {
-    // CPU 实现：直接同步执行，忽略 handle
-    (void)handle;  // 忽略未使用参数
+    (void)handle;
     copy_to(dst);
 }
 
 void CpuMemory::copy_from_async(const DeviceBuffer* src, SyncHandle* handle) {
-    // CPU 实现：直接同步执行，忽略 handle
-    (void)handle;  // 忽略未使用参数
+    (void)handle;
     copy_from(src);
 }
 
 void CpuMemory::sync(SyncHandle* handle) const {
-    // CPU 操作同步执行，无需等待
-    (void)handle;  // 忽略未使用参数
+    (void)handle;
 }
 
 bool CpuMemory::supports_async() const {
-    // CPU 不支持真正的异步操作
     return false;
 }
 
-} // namespace tensor
+} // namespace memory

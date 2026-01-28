@@ -4,8 +4,8 @@
 #include <cstdlib>
 #include <chrono>
 #include <iomanip>
-#include "modules/tensor/cvi_tpu_memory.h"
-#include "modules/tensor/cpu_memory.h"
+#include "memory/tpu_memory.h"
+#include "memory/cpu_memory.h"
 
 #if defined(USE_CVI_TPU)
 #include <cviruntime.h>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cvi_frame.h"
+#include "frame.h"
 #include "cv_types.h"
 
 namespace lua_cv {

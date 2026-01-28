@@ -13,12 +13,11 @@
 #include <cviruntime_context.h>
 #include <linux/cvi_comm_video.h>
 
-namespace tensor {
-class CviTpuMemory;
+// Include actual headers for memory types
+#include "memory/tpu_memory.h"
 #if defined(USE_CVI_MPI)
-class VbMemory;
+#include "memory/vb_memory.h"
 #endif
-}
 
 namespace inference {
 

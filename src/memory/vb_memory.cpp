@@ -10,11 +10,11 @@
 #include "vb_pool_manager.h"
 #include <cvi_buffer.h>
 #if defined(USE_CVI_TPU)
-#include "cvi_tpu_memory.h"
+#include "tpu_memory.h"
 #include <cviruntime_context.h>
 #endif
 
-namespace tensor {
+namespace memory {
 namespace {
 void invalidate_if_cached(uint64_t phys_addr, void* data, size_t size, bool cached) {
     if (cached && phys_addr != 0 && data != nullptr && size > 0) {
@@ -247,6 +247,6 @@ void VbMemory::sync(SyncHandle* handle) const {
     }
 }
 
-} // namespace tensor
+} // namespace memory
 
 #endif  // USE_CVI_MPI

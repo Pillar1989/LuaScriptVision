@@ -376,6 +376,7 @@ bool CviPipeline::open_camera() {
     next_infer_time_ = std::chrono::steady_clock::time_point{};
     skip_state_ready_ = false;
     vpss_nobuf_streak_ = 0;
+    camera_nobuf_streak_ = 0;
 
     return true;
 #endif
@@ -455,8 +456,38 @@ bool CviPipeline::run_camera_frame_adaptive(InferenceResult* result) {
     auto t_read_start = std::chrono::steady_clock::now();
     lua_cv::Frame input_frame;
     if (!camera_->read(input_frame)) {
+        auto t_read_end = std::chrono::steady_clock::now();
+        if (!skip_state_ready_) {
+            next_infer_time_ = t_read_end;
+            skip_state_ready_ = true;
+        }
+        int last_error = camera_->last_error();
+        if (last_error == CVI_ERR_VPSS_NOBUF || last_error == CVI_ERR_VPSS_BUF_EMPTY) {
+            camera_nobuf_streak_++;
+
+            double frame_interval_ms = kDefaultFrameIntervalMs;
+            if (camera_fps_ > 0.0) {
+                frame_interval_ms = 1000.0 / camera_fps_;
+            }
+            int threshold = compute_nobuf_threshold(infer_ema_ms_, frame_interval_ms);
+            if (camera_nobuf_streak_ >= threshold) {
+                double cooldown_ms = compute_nobuf_cooldown_ms(
+                    camera_nobuf_streak_, threshold, infer_ema_ms_, frame_interval_ms);
+                auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double, std::milli>(cooldown_ms));
+                next_infer_time_ = t_read_end + interval;
+            } else {
+                auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double, std::milli>(frame_interval_ms));
+                next_infer_time_ = t_read_end + interval;
+            }
+
+            *result = InferenceResult{};
+            return false;
+        }
         throw std::runtime_error("[Pipeline] Failed to read camera frame");
     }
+    camera_nobuf_streak_ = 0;
     auto t_read_end = std::chrono::steady_clock::now();
 
     if (!skip_state_ready_) {
@@ -540,6 +571,7 @@ void CviPipeline::close_camera() {
     next_infer_time_ = std::chrono::steady_clock::time_point{};
     skip_state_ready_ = false;
     vpss_nobuf_streak_ = 0;
+    camera_nobuf_streak_ = 0;
 #endif
 }
 

@@ -120,6 +120,7 @@ private:
     std::chrono::steady_clock::time_point next_infer_time_{};
     bool skip_state_ready_ = false;
     int vpss_nobuf_streak_ = 0;
+    int camera_nobuf_streak_ = 0;
 
     StageTimings last_timings_{};
 };

@@ -584,6 +584,7 @@ bool CviCamera::open() {
         return true;
     }
 
+    last_error_ = CVI_SUCCESS;
     if (!sensor_.init()) {
         return false;
     }
@@ -684,6 +685,7 @@ bool CviCamera::read_internal(Frame& frame, int timeout_ms, bool log_error) {
         trace_vpss_pool_usage(trace_pool_id, "after GetChnFrame");
     }
     if (rc != CVI_SUCCESS) {
+        last_error_ = rc;
         if (log_error) {
             std::cerr << "[ERROR] CviCamera::read - CVI_VPSS_GetChnFrame failed: 0x"
                       << std::hex << rc << std::dec << std::endl;
@@ -700,6 +702,7 @@ bool CviCamera::read_internal(Frame& frame, int timeout_ms, bool log_error) {
         return false;
     }
 
+    last_error_ = CVI_SUCCESS;
     Frame out(cvi_frame, static_cast<int>(vpss_grp_), static_cast<int>(vpss_chn_));
     out.set_vpss_owner(static_cast<int>(vpss_grp_), static_cast<int>(vpss_chn_));
     frame = std::move(out);
@@ -724,6 +727,10 @@ double CviCamera::fps() const {
 
 bool CviCamera::is_opened() const {
     return opened_;
+}
+
+int CviCamera::last_error() const {
+    return last_error_;
 }
 
 const char* CviCamera::get_sensor_name() const {

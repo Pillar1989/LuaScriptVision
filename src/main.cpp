@@ -2,6 +2,7 @@
 #include <string>
 #include <iomanip>
 #include <fstream>
+#include <csignal>
 #include <opencv2/opencv.hpp>
 #include "LuaIntf.h"
 
@@ -39,6 +40,19 @@ static bool ends_with(const std::string& str, const std::string& suffix) {
     if (suffix.size() > str.size()) return false;
     return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+namespace {
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void handle_signal(int signal) {
+    (void)signal;
+    g_stop_requested = 1;
+}
+
+bool stop_requested() {
+    return g_stop_requested != 0;
+}
+}  // namespace
 
 void print_usage(const char* prog_name) {
     std::cout << "Usage:\n";
@@ -370,6 +384,10 @@ int run_cvi_inference(const std::string& script_path,
             std::cout << "Max frames: " << (max_frames == 0 ? "infinite" : std::to_string(max_frames)) << "\n";
             std::cout << "Press Ctrl+C to stop...\n\n";
 
+            g_stop_requested = 0;
+            std::signal(SIGINT, handle_signal);
+            std::signal(SIGTERM, handle_signal);
+
             // Open camera once
             if (!pipe.open_camera()) {
                 throw std::runtime_error("Failed to open camera");
@@ -383,7 +401,7 @@ int run_cvi_inference(const std::string& script_path,
             int skipped_since_fps = 0;
 
             try {
-                while (max_frames == 0 || frame_count < max_frames) {
+                while (!stop_requested() && (max_frames == 0 || frame_count < max_frames)) {
                     // Read frame, infer when due (adaptive skip).
                     pipeline::InferenceResult result;
                     bool inferred = pipe.run_camera_frame_adaptive(&result);

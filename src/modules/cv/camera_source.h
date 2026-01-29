@@ -15,6 +15,7 @@ public:
     bool read(Frame& frame) override;
     bool wait_for_ready(int timeout_ms);
     double fps() const;
+    int last_error() const;
     void release(Frame& frame) override;
     void close() override;
     InputType type() const override { return InputType::CAMERA; }

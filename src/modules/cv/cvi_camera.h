@@ -46,6 +46,7 @@ public:
     int height() const override;
     double fps() const override;
     bool is_opened() const override;
+    int last_error() const;
 
     const char* get_sensor_name() const;
 
@@ -102,6 +103,7 @@ private:
     bool vpss_pool_attached_ = false;
     VB_POOL vpss_stream_pool_ = VB_INVALID_POOLID;
     bool vpss_stream_pool_attached_ = false;
+    CVI_S32 last_error_ = CVI_SUCCESS;
 
     pthread_t isp_thread_{};
 };

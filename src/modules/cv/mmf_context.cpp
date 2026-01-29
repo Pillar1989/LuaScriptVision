@@ -64,7 +64,7 @@ const MmfPlan& plan() {
         0,
         {
             VpssGroupPlan{0, 1, 1, VpssInputKind::Isp, 1920, 1080},
-            VpssGroupPlan{1, 0, 0, VpssInputKind::Mem, 1280, 720},
+            VpssGroupPlan{5, 0, 0, VpssInputKind::Mem, 1280, 720},
         },
         CameraOutputPlan{0, 1920, 1080, PixelFormat::NV21, 3},
         CameraOutputPlan{1, 640, 640, PixelFormat::RGB, 2},
@@ -547,17 +547,6 @@ void MmfContext::resolve_vpss_groups() {
     resolved_isp_group_ = vpss_group_for_input(VpssInputKind::Isp);
     resolved_mem_group_ = vpss_group_for_input(VpssInputKind::Mem);
 
-    // Use CVI_VPSS_GetAvailableGrp() to find a free group for MEM input
-    // This avoids conflicts with camera's ISP group
-    int available = CVI_VPSS_GetAvailableGrp();
-    if (available >= 0) {
-        if (available != resolved_isp_group_) {
-            resolved_mem_group_ = available;
-        } else if (resolved_mem_group_ < 0 || resolved_mem_group_ == resolved_isp_group_) {
-            resolved_mem_group_ = available;
-        }
-    }
-
     if (resolved_isp_group_ < 0) {
         resolved_isp_group_ = 0;
     }
@@ -567,11 +556,7 @@ void MmfContext::resolve_vpss_groups() {
 
     groups_resolved_ = true;
     std::cout << "[MMF] VPSS groups resolved: isp=" << resolved_isp_group_
-              << " mem=" << resolved_mem_group_;
-    if (available >= 0) {
-        std::cout << " (available=" << available << ")";
-    }
-    std::cout << std::endl;
+              << " mem=" << resolved_mem_group_ << std::endl;
 }
 #endif
 

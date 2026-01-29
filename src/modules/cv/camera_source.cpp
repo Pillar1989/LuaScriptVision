@@ -77,6 +77,17 @@ double CameraSource::fps() const {
 #endif
 }
 
+int CameraSource::last_error() const {
+#ifndef USE_CVI_CAMERA
+    return 0;
+#else
+    if (!camera_) {
+        return 0;
+    }
+    return camera_->last_error();
+#endif
+}
+
 void CameraSource::release(Frame& frame) {
     frame.release();
 }

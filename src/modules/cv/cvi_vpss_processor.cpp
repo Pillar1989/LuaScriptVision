@@ -111,6 +111,7 @@ CviVpssProcessor::~CviVpssProcessor() {
 
 void CviVpssProcessor::resize(Frame& frame, int width, int height) {
 #ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::resize - frame is empty");
     }
@@ -138,6 +139,7 @@ void CviVpssProcessor::resize(Frame& frame, int width, int height) {
 
 void CviVpssProcessor::cvtColor(Frame& frame, ColorConversion code) {
 #ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::cvtColor - frame is empty");
     }
@@ -177,6 +179,7 @@ void CviVpssProcessor::cvtColor(Frame& frame, ColorConversion code) {
 
 void CviVpssProcessor::convert_format(Frame& frame, PixelFormat output_format) {
 #ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::convert_format - frame is empty");
     }
@@ -204,6 +207,7 @@ void CviVpssProcessor::convert_format(Frame& frame, PixelFormat output_format) {
 
 void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
 #ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::crop - frame is empty");
     }
@@ -232,6 +236,7 @@ void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
 void CviVpssProcessor::letterbox(Frame& frame, int width, int height, uint8_t pad_value,
                                  LetterboxMeta* meta, PixelFormat output_format) {
 #ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
     if (frame.empty()) {
         throw std::invalid_argument("CviVpssProcessor::letterbox - frame is empty");
     }
@@ -397,6 +402,14 @@ VIDEO_FRAME_INFO_S CviVpssProcessor::mat_to_video_frame(const cv::Mat& mat, VB_B
     frame.u32PoolId = CVI_VB_Handle2PoolId(vb_block);
 
     return frame;
+}
+
+int CviVpssProcessor::last_error() const {
+#ifdef USE_CVI_MPI
+    return last_error_;
+#else
+    return 0;
+#endif
 }
 
 void CviVpssProcessor::ensure_group(uint32_t input_width, uint32_t input_height, PixelFormat input_format) {
@@ -583,16 +596,14 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
                                      PixelFormat out_format, bool use_crop,
                                      int crop_x, int crop_y, int crop_w, int crop_h,
                                      bool letterbox, uint8_t pad_value) {
+    last_error_ = CVI_SUCCESS;
     PixelFormat input_format = frame.pixel_format();
     if (input_format == PixelFormat::UNKNOWN) {
         input_format = PixelFormat::BGR;
     }
 
-    auto t0 = std::chrono::steady_clock::now();
     ensure_group(static_cast<uint32_t>(frame.width()), static_cast<uint32_t>(frame.height()), input_format);
-    auto t1 = std::chrono::steady_clock::now();
     ensure_channel(out_width, out_height, out_format, letterbox, pad_value);
-    auto t2 = std::chrono::steady_clock::now();
 
     VPSS_CROP_INFO_S crop_info{};
     if (use_crop) {
@@ -604,6 +615,7 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         crop_info.stCropRect.u32Height = static_cast<CVI_U32>(crop_h);
         CVI_S32 rc = CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
         if (rc != CVI_SUCCESS) {
+            last_error_ = rc;
             throw std::runtime_error("CviVpssProcessor - CVI_VPSS_SetChnCrop failed");
         }
     }
@@ -612,14 +624,12 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
     VB_BLK input_block = VB_INVALID_HANDLE;
     bool input_from_mat = false;
 
-    auto t3 = std::chrono::steady_clock::now();
     if (frame.storage_type() == Frame::StorageType::CVI && frame.video_frame()) {
         input_frame = *frame.video_frame();
     } else {
         input_frame = mat_to_video_frame(frame.to_mat(), input_block, select_output_pool(frame.width(), frame.height(), input_format));
         input_from_mat = true;
     }
-    auto t4 = std::chrono::steady_clock::now();
 
     CVI_S32 rc = CVI_SUCCESS;
     const int send_attempts = 3;
@@ -642,12 +652,11 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
             crop_info.bEnable = CVI_FALSE;
             CVI_VPSS_SetChnCrop(grp_, chn_, &crop_info);
         }
+        last_error_ = rc;
         std::ostringstream oss;
         oss << "CviVpssProcessor - CVI_VPSS_SendFrame failed: 0x" << std::hex << rc;
         throw std::runtime_error(oss.str());
     }
-    auto t5 = std::chrono::steady_clock::now();
-
     VIDEO_FRAME_INFO_S output_frame{};
     const int get_attempts = 5;
     for (int attempt = 0; attempt < get_attempts; ++attempt) {
@@ -660,7 +669,6 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
         }
         usleep(5000);
     }
-    auto t6 = std::chrono::steady_clock::now();
 
     if (use_crop) {
         crop_info.bEnable = CVI_FALSE;
@@ -668,20 +676,11 @@ void CviVpssProcessor::process_frame(Frame& frame, uint32_t out_width, uint32_t 
     }
 
     if (rc != CVI_SUCCESS) {
+        last_error_ = rc;
         std::ostringstream oss;
         oss << "CviVpssProcessor - CVI_VPSS_GetChnFrame failed: 0x" << std::hex << rc;
         throw std::runtime_error(oss.str());
     }
-
-    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
-    std::cout << "[VPSS] ensure_group=" << ms(t0, t1)
-              << "ms ensure_channel=" << ms(t1, t2)
-              << "ms input_prep=" << ms(t2, t3) + ms(t3, t4)
-              << "ms send=" << ms(t4, t5)
-              << "ms get=" << ms(t5, t6)
-              << "ms from_mat=" << (input_from_mat ? "yes" : "no") << "\n";
 
     Frame out(output_frame, grp_, chn_);
     out.set_vpss_owner(grp_, chn_);

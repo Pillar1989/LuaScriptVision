@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cfloat>
 #include <stdexcept>
 #include <sstream>
 #include <vector>
@@ -388,6 +389,14 @@ LuaIntf::LuaRef Tensor::argmin_lua(lua_State* L, int axis) const {
 // ========== Max with Argmax (Fused) ==========
 
 LuaIntf::LuaRef Tensor::max_with_argmax(lua_State* L, int axis) const {
+#ifdef ENABLE_RV_THEAD
+    // Special case: 2D tensor with axis=0 -> use RVV optimized version
+    if (ndim() == 2 && axis == 0) {
+        return max_with_argmax_thead(L, axis);
+    }
+#endif
+
+    // Generic CPU implementation for other cases
     check_cpu();
     Tensor a = contiguous();
 
@@ -461,5 +470,95 @@ LuaIntf::LuaRef Tensor::max_with_argmax(lua_State* L, int axis) const {
     return result;
 }
 
+// ========== 融合 Softmax + Weighted Sum ==========
 
-} // namespace tensor
+Tensor Tensor::weighted_sum(int axis, const Tensor& weights) const {
+#ifdef ENABLE_RV_THEAD
+    // 使用玄铁优化版本
+    return weighted_sum_thead(axis, weights);
+#else
+    // CPU fallback
+    return weighted_sum_cpu(axis, weights);
+#endif
+}
+
+Tensor Tensor::weighted_sum_cpu(int axis, const Tensor& weights) const {
+    check_cpu();
+
+    // 确保连续内存
+    if (!contiguous_) {
+        return contiguous().weighted_sum_cpu(axis, weights);
+    }
+
+    // 验证输入
+    if (ndim() != 3 || axis != 1) {
+        throw std::runtime_error(
+            "weighted_sum_cpu: requires 3D tensor with axis=1");
+    }
+
+    int64_t outer = shape_[0];
+    int64_t axis_size = shape_[1];
+    int64_t inner = shape_[2];
+
+    if (weights.size() != axis_size) {
+        throw std::runtime_error(
+            "weighted_sum_cpu: weights size must match axis dimension");
+    }
+
+    const float* input_data = data();
+    const float* weight_data = weights.data();
+
+    // 分配输出 [outer, inner]
+    auto out_storage = CpuMemory::allocate(outer * inner * sizeof(float));
+    float* output_data = static_cast<float*>(out_storage->data());
+
+    // 处理每个 (outer, inner) 组合
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t i = 0; i < inner; ++i) {
+            const float* ptr = input_data + o * axis_size * inner + i;
+            const int64_t stride = inner;
+
+            // Step 1: 找 max（数值稳定性）
+            float max_val = -FLT_MAX;
+            for (int64_t a = 0; a < axis_size; ++a) {
+                max_val = std::max(max_val, ptr[a * stride]);
+            }
+
+            // Step 2 & 3: exp + weighted sum
+            float sum_exp = 0.0f;
+            float weighted_sum = 0.0f;
+
+            for (int64_t a = 0; a < axis_size; ++a) {
+                float exp_val = std::exp(ptr[a * stride] - max_val);
+                sum_exp += exp_val;
+                weighted_sum += weight_data[a] * exp_val;
+            }
+
+            // 归一化
+            output_data[o * inner + i] = weighted_sum / sum_exp;
+        }
+    }
+
+    return Tensor(out_storage, {outer, inner},
+                  compute_strides({outer, inner}), 0, true);
+}
+
+// ========== 融合 Sigmoid + Max + Argmax ==========
+
+LuaIntf::LuaRef Tensor::sigmoid_max_with_argmax(lua_State* L, int axis) const {
+#ifdef ENABLE_RV_THEAD
+    // 使用玄铁优化版本
+    return sigmoid_max_with_argmax_thead(L, axis);
+#else
+    // CPU fallback
+    return sigmoid_max_with_argmax_cpu(L, axis);
+#endif
+}
+
+LuaIntf::LuaRef Tensor::sigmoid_max_with_argmax_cpu(lua_State* L, int axis) const {
+    // CPU fallback: 调用现有的 sigmoid() + max_with_argmax()
+    Tensor scores = this->sigmoid();
+    return scores.max_with_argmax(L, axis);
+}
+
+}  // namespace tensor

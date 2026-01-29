@@ -50,9 +50,12 @@ void print_usage(const char* prog_name) {
     std::cout << "\nOptions:\n";
     std::cout << "  show          - Display window during processing\n";
     std::cout << "  save=OUTPUT   - Save output image\n";
+    std::cout << "  frames=N      - Run N frames (camera mode only, 0=infinite)\n";
+    std::cout << "  fps           - Display FPS counter (camera mode only)\n";
     std::cout << "\nExamples:\n";
     std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel zidane.jpg\n";
-    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel camera\n";
+    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel camera frames=100 fps\n";
+    std::cout << "  " << prog_name << " scripts/yolo11_detector.lua model.cvimodel camera frames=0 fps\n";
     std::cout << "\n=== Test Mode ===\n";
     std::cout << "  " << prog_name << " tests/run_all_tests.lua\n";
 }
@@ -309,7 +312,9 @@ int run_test_script(const std::string& script_path) {
 int run_cvi_inference(const std::string& script_path,
                       const std::string& model_path,
                       const std::string& input_path,
-                      const std::string& save_path) {
+                      const std::string& save_path,
+                      int max_frames,
+                      bool show_fps) {
     // Initialize MMF context (VB pools, VPSS mode)
     lua_cv::MmfContext::Config mmf_config;
     if (!lua_cv::MmfContext::build_default_config(&mmf_config)) {
@@ -357,29 +362,132 @@ int run_cvi_inference(const std::string& script_path,
         pipeline::CviPipeline pipe;
         pipe.init(model_path, L, postprocess, preprocess_config);
 
-        // Run inference
-        pipeline::InferenceResult result;
-        if (input_path == "camera") {
-            result = pipe.run_camera();
-        } else {
-            result = pipe.run_image(input_path);
-        }
+        bool is_camera = (input_path == "camera");
 
-        // Print results
-        print_results(result.detections);
+        if (is_camera && max_frames != 1) {
+            // Continuous camera inference mode
+            std::cout << "\n========== Continuous Camera Inference ==========\n";
+            std::cout << "Max frames: " << (max_frames == 0 ? "infinite" : std::to_string(max_frames)) << "\n";
+            std::cout << "Press Ctrl+C to stop...\n\n";
 
-        // Save output if requested
-        if (!save_path.empty() && input_path != "camera") {
-            cv::Mat draw_img = cv::imread(input_path);
-            if (!draw_img.empty()) {
-                draw_detections(draw_img, result.detections);
-                cv::imwrite(save_path, draw_img);
-                std::cout << "\nResult saved to: " << save_path << "\n";
+            // Open camera once
+            if (!pipe.open_camera()) {
+                throw std::runtime_error("Failed to open camera");
             }
-        }
 
-        // Clear InferenceResult's LuaRef before pipe goes out of scope
-        result.detections = LuaIntf::LuaRef();
+            int frame_count = 0;
+            int skipped_count = 0;
+            auto t_start = std::chrono::steady_clock::now();
+            auto t_last_fps = t_start;
+            int frames_since_fps = 0;
+            int skipped_since_fps = 0;
+
+            try {
+                while (max_frames == 0 || frame_count < max_frames) {
+                    // Read frame, infer when due (adaptive skip).
+                    pipeline::InferenceResult result;
+                    bool inferred = pipe.run_camera_frame_adaptive(&result);
+                    if (inferred) {
+                        frame_count++;
+                        frames_since_fps++;
+                    } else {
+                        skipped_count++;
+                        skipped_since_fps++;
+                    }
+
+                    // Calculate and display FPS
+                    auto now = std::chrono::steady_clock::now();
+                    auto fps_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - t_last_fps).count();
+
+                    if (show_fps && fps_elapsed >= 1000) {  // Update FPS every second
+                        double fps = frames_since_fps * 1000.0 / fps_elapsed;
+                        int total_window = frames_since_fps + skipped_since_fps;
+                        double skip_ratio = (total_window > 0)
+                            ? (skipped_since_fps * 100.0 / total_window)
+                            : 0.0;
+                        auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - t_start).count();
+
+                        std::cout << "\r[Frame " << std::setw(6) << frame_count
+                                  << "] FPS: " << std::fixed << std::setprecision(1) << fps
+                                  << " | Skip: " << std::setprecision(1) << skip_ratio << "%"
+                                  << " | Time: " << total_elapsed << "s"
+                                  << std::flush;
+
+                        t_last_fps = now;
+                        frames_since_fps = 0;
+                        skipped_since_fps = 0;
+                    }
+
+                    // Print detections for inferred frames.
+                    if (inferred && result.detections.isTable()) {
+                        int num_dets = result.detections.len();
+                        if (num_dets > 0) {
+                            if (show_fps) {
+                                std::cout << "\n";
+                            }
+                            std::cout << "[Frame " << frame_count << "]\n";
+                            print_results(result.detections);
+                        }
+                    }
+
+                    // Clear result LuaRef
+                    result.detections = LuaIntf::LuaRef();
+                }
+            } catch (...) {
+                pipe.close_camera();
+                throw;
+            }
+
+            // Close camera
+            pipe.close_camera();
+
+            if (show_fps) {
+                std::cout << "\n";  // Newline after FPS display
+            }
+
+            auto t_end = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_end - t_start).count();
+
+            std::cout << "\n========== Summary ==========\n";
+            int total_frames = frame_count + skipped_count;
+            double skip_ratio = (total_frames > 0)
+                ? (skipped_count * 100.0 / total_frames)
+                : 0.0;
+            std::cout << "Total frames: " << frame_count << "\n";
+            std::cout << "Skipped frames: " << skipped_count
+                      << " (" << std::fixed << std::setprecision(1)
+                      << skip_ratio << "%)\n";
+            std::cout << "Total time: " << total_ms / 1000.0 << "s\n";
+            std::cout << "Average FPS: " << std::fixed << std::setprecision(2)
+                      << (frame_count * 1000.0 / total_ms) << "\n";
+        } else {
+            // Single-shot inference (image or single camera frame)
+            pipeline::InferenceResult result;
+            if (is_camera) {
+                result = pipe.run_camera();
+            } else {
+                result = pipe.run_image(input_path);
+            }
+
+            // Print results
+            print_results(result.detections);
+
+            // Save output if requested
+            if (!save_path.empty() && !is_camera) {
+                cv::Mat draw_img = cv::imread(input_path);
+                if (!draw_img.empty()) {
+                    draw_detections(draw_img, result.detections);
+                    cv::imwrite(save_path, draw_img);
+                    std::cout << "\nResult saved to: " << save_path << "\n";
+                }
+            }
+
+            // Clear InferenceResult's LuaRef
+            result.detections = LuaIntf::LuaRef();
+        }
     }
     // pipe destroyed here → LuaRefs released while L is still alive
 
@@ -421,6 +529,8 @@ int main(int argc, char* argv[]) {
 
     std::string save_path;
     bool show_result = false;
+    int max_frames = 1;  // Default: single frame
+    bool show_fps = false;
 
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
@@ -428,13 +538,18 @@ int main(int argc, char* argv[]) {
             show_result = true;
         } else if (arg.find("save=") == 0) {
             save_path = arg.substr(5);
+        } else if (arg.find("frames=") == 0) {
+            max_frames = std::stoi(arg.substr(7));
+        } else if (arg == "fps") {
+            show_fps = true;
         }
     }
 
     try {
 #if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
         if (ends_with(model_path, ".cvimodel")) {
-            return run_cvi_inference(script_path, model_path, input_path, save_path);
+            return run_cvi_inference(script_path, model_path, input_path, save_path,
+                                    max_frames, show_fps);
         }
 #endif
 

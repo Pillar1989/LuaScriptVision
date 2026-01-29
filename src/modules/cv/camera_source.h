@@ -14,6 +14,7 @@ public:
     bool open(const std::string& source) override;
     bool read(Frame& frame) override;
     bool wait_for_ready(int timeout_ms);
+    double fps() const;
     void release(Frame& frame) override;
     void close() override;
     InputType type() const override { return InputType::CAMERA; }

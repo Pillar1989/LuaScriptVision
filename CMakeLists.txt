@@ -37,6 +37,43 @@ else()
 endif()
 
 # ==========================================================
+# 0.5 T-Head RISC-V Optimizations (RVV)
+# ==========================================================
+# Default: enabled on SG200X (auto-detect), can be disabled manually
+option(ENABLE_RV_THEAD "Enable T-Head RISC-V vector optimizations" ON)
+
+if(ENABLE_RV_THEAD)
+    # Check if compiler supports RVV intrinsics
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-march=rv64gcv0p7_zfh_xthead")
+
+    check_cxx_source_compiles("
+        #include <riscv_vector.h>
+        int main() {
+            vfloat32m2_t v = vfmv_v_f_f32m2(0.0f, 4);
+            return 0;
+        }
+    " HAVE_RV_THEAD)
+
+    if(HAVE_RV_THEAD)
+        message(STATUS "T-Head RISC-V optimizations: ENABLED")
+        add_compile_definitions(ENABLE_RV_THEAD)
+
+        # RVV 优化源文件（稍后添加到 tensor_module）
+        set(TENSOR_RV_THEAD_SOURCES
+            src/modules/tensor/rv-thead/weighted_sum.cpp
+            src/modules/tensor/rv-thead/sigmoid_max.cpp
+            src/modules/tensor/rv-thead/max_with_argmax.cpp
+        )
+    else()
+        message(WARNING "Compiler does not support RVV, disabling T-Head optimizations")
+        set(ENABLE_RV_THEAD OFF)
+    endif()
+else()
+    message(STATUS "T-Head RISC-V optimizations: DISABLED (CPU fallback)")
+endif()
+
+# ==========================================================
 # 1. Build Lua as C++ (Critical for exception safety)
 # ==========================================================
 file(GLOB LUA_SRC "lua/*.c")
@@ -128,6 +165,12 @@ file(GLOB MEMORY_SOURCES "src/memory/*.cpp")
 file(GLOB CV_SOURCES "src/modules/cv/*.cpp")
 file(GLOB BINDING_SOURCES "src/bindings/*.cpp")
 file(GLOB INFERENCE_SOURCES "src/inference/*.cpp")
+
+# T-Head RISC-V optimized tensor operations
+if(ENABLE_RV_THEAD AND TENSOR_RV_THEAD_SOURCES)
+    list(APPEND TENSOR_SOURCES ${TENSOR_RV_THEAD_SOURCES})
+    message(STATUS "T-Head tensor optimizations: ${TENSOR_RV_THEAD_SOURCES}")
+endif()
 
 # SG200X RVV optimized assembly files (only for cross-compilation)
 if(NOT USE_ONNX_RUNTIME)

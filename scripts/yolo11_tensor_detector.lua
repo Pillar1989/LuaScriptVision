@@ -1,6 +1,6 @@
 -- YOLO11 Object Detection Script (Tensor API)
 -- Supports both fused single-output and multi-head 6-output models
--- Optimized: filter by confidence first, then decode only valid candidates
+-- Optimized: vectorized DFL decode using pure C++ tensor operations
 local utils = lua_utils
 local nn = lua_nn
 local preprocess_lib = require("scripts.lib.preprocess")
@@ -26,51 +26,39 @@ Model.preprocess_config = {
     fill_value = 114
 }
 
--- DFL decode for a SINGLE anchor point (efficient: only called for valid candidates)
--- Input: bbox_flat tensor [64, n_anchors], anchor index (0-based)
--- Output: l, t, r, b decoded distances
-local function dfl_decode_single(bbox_flat, anchor_idx, reg_max)
-    local l, t, r, b = 0, 0, 0, 0
+-- DFL decode using fused weighted_sum (RVV optimized on T-Head platforms)
+-- Input: bbox_selected [64, n_valid] - selected valid anchors
+-- Output: tensor [4, n_valid] with decoded distances
+local function dfl_decode_vectorized(bbox_selected, reg_max, n_valid)
+    -- 1. Reshape to [4, 16, n_valid]
+    local reshaped = bbox_selected:reshape({4, reg_max, n_valid})
 
-    -- For each coordinate (l, t, r, b)
-    for coord = 0, 3 do
-        local start_ch = coord * reg_max
+    -- 2. Create weights [0, 1, 2, ..., 15]
+    local weights = nn.Tensor.arange(0, reg_max, 1)  -- [16]
 
-        -- Find max for numerical stability
-        local max_val = -1e30
-        for bin = 0, reg_max - 1 do
-            local v = bbox_flat:at(start_ch + bin, anchor_idx)
-            if v > max_val then max_val = v end
-        end
+    -- 3. Fused softmax + weighted sum (single C++ call, RVV optimized)
+    local result = reshaped:weighted_sum(1, weights)  -- [4, n_valid]
 
-        -- Softmax + weighted sum
-        local sum_exp = 0
-        local weighted = 0
-        for bin = 0, reg_max - 1 do
-            local v = bbox_flat:at(start_ch + bin, anchor_idx)
-            local e = math.exp(v - max_val)
-            sum_exp = sum_exp + e
-            weighted = weighted + e * bin
-        end
-
-        local dist = weighted / sum_exp
-        if coord == 0 then l = dist
-        elseif coord == 1 then t = dist
-        elseif coord == 2 then r = dist
-        else b = dist end
-    end
-
-    return l, t, r, b
+    return result
 end
 
 -- Process multi-head YOLO output (6 outputs: 3 bbox + 3 cls)
--- Optimized: filter by confidence FIRST, then decode only valid candidates
+-- Optimizations:
+--   1. Vectorized DFL decode in pure C++
+--   2. Single-pass sigmoid_max_with_argmax (RVV optimized, 13.87ms at memory bandwidth limit)
 local function process_multi_head(outputs, meta)
     local reg_max = Model.config.reg_max
     local strides = Model.config.strides
     local conf_thres = Model.config.conf_thres
 
     local all_proposals = {}
+
+    local t_total = os.clock()
+    local time_reshape = 0
+    local time_sigmoid_max = 0
+    local time_filter = 0
+    local time_dfl = 0
+    local time_dist2bbox = 0
 
     -- Process each scale (3 scales)
     for scale = 0, 2 do
@@ -95,32 +83,56 @@ local function process_multi_head(outputs, meta)
         local n_anchors = grid_h * grid_w
 
         -- Reshape to [channels, n_anchors]
+        local t0 = os.clock()
         local bbox_flat = bbox_output:reshape({bbox_shape[2], n_anchors}):contiguous()
         local cls_flat = cls_output:reshape({cls_shape[2], n_anchors}):contiguous()
+        time_reshape = time_reshape + (os.clock() - t0)
 
-        -- Apply sigmoid to class scores and find max
-        local cls_scores = cls_flat:sigmoid()
-        local max_result = cls_scores:max_with_argmax(0)
-        local max_scores = max_result.values
-        local class_ids = max_result.indices
+        -- Single-pass sigmoid_max_with_argmax (RVV optimized)
+        t0 = os.clock()
+        local result = cls_flat:sigmoid_max_with_argmax(0)
+        local max_scores = result.values     -- [n_anchors], sigmoid values
+        local class_ids = result.indices     -- table[n_anchors], class indices
+        local t_sigmoid_max_scale = (os.clock() - t0) * 1000
+        time_sigmoid_max = time_sigmoid_max + (os.clock() - t0)
 
-        -- FIRST: filter by confidence (this is very fast)
+        -- Filter by confidence threshold
+        t0 = os.clock()
         local valid_indices = max_scores:where_indices(conf_thres, "ge")
+        time_filter = time_filter + (os.clock() - t0)
 
         if #valid_indices == 0 then
             goto continue
         end
 
-        -- THEN: decode DFL only for valid candidates (typically < 100)
-        local filtered_scores = max_scores:index_select(0, valid_indices):to_table()
+        local n_valid = #valid_indices
 
-        for i, idx in ipairs(valid_indices) do
-            -- Decode DFL for this single anchor
-            local l, t, r, b = dfl_decode_single(bbox_flat, idx, reg_max)
+        -- Extract valid anchors for DFL decode
+        t0 = os.clock()
+        local bbox_selected = bbox_flat:index_select(1, valid_indices)  -- [64, n_valid]
+
+        -- VECTORIZED DFL DECODE: Pure C++ tensor operations
+        local dist_decoded = dfl_decode_vectorized(bbox_selected, reg_max, n_valid)  -- [4, n_valid]
+
+        -- Get filtered scores
+        local filtered_scores = max_scores:index_select(0, valid_indices):to_table()
+        time_dfl = time_dfl + (os.clock() - t0)
+
+        -- Convert decoded distances to boxes
+        t0 = os.clock()
+        for i = 1, n_valid do
+            -- valid_indices[i] is 0-based C++ index
+            local anchor_idx = valid_indices[i]
+
+            -- Get decoded distances
+            local l = dist_decoded:at(0, i - 1)
+            local t = dist_decoded:at(1, i - 1)
+            local r = dist_decoded:at(2, i - 1)
+            local b = dist_decoded:at(3, i - 1)
 
             -- Calculate anchor center
-            local row = math.floor(idx / grid_w)
-            local col = idx % grid_w
+            local row = math.floor(anchor_idx / grid_w)
+            local col = anchor_idx % grid_w
             local ax = (col + 0.5) * stride
             local ay = (row + 0.5) * stride
 
@@ -135,7 +147,8 @@ local function process_multi_head(outputs, meta)
             local w = x2 - x1
             local h = y2 - y1
 
-            local cls_id = class_ids[idx + 1]
+            -- Get class ID (class_ids is 1-based Lua table)
+            local cls_id = class_ids[anchor_idx + 1]
             local conf = filtered_scores[i]
 
             table.insert(all_proposals, {
@@ -148,6 +161,7 @@ local function process_multi_head(outputs, meta)
                 label = Model.config.labels[cls_id + 1] or "unknown"
             })
         end
+        time_dist2bbox = time_dist2bbox + (os.clock() - t0)
 
         ::continue::
     end
@@ -214,11 +228,9 @@ function Model.postprocess(outputs, meta)
     local proposals
     if output_count == 6 then
         -- Multi-head YOLO (6 outputs: 3 bbox + 3 cls)
-        print("[Postprocess] Multi-head YOLO (6 outputs)")
         proposals = process_multi_head(outputs, meta)
     else
         -- Fused single-output YOLO
-        print("[Postprocess] Fused YOLO (1 output)")
         proposals = process_fused(outputs, meta)
     end
 

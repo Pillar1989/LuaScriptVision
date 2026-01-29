@@ -292,6 +292,18 @@ public:
     /// @return Lua table: {values = Tensor, indices = table}
     LuaIntf::LuaRef max_with_argmax(lua_State* L, int axis = -1) const;
 
+    /// 融合 softmax + weighted sum (用于 DFL decode)
+    /// @param axis 沿此轴做 softmax 和加权求和
+    /// @param weights 权重张量 [axis_size]
+    /// @return 加权 softmax 结果
+    Tensor weighted_sum(int axis, const Tensor& weights) const;
+
+    /// 融合 sigmoid + max + argmax (用于 YOLO class score)
+    /// @param L Lua state
+    /// @param axis 沿此轴找 max
+    /// @return Lua table: {values = Tensor, indices = table}
+    LuaIntf::LuaRef sigmoid_max_with_argmax(lua_State* L, int axis) const;
+
     /// 获取单个元素
     float get_item(const std::vector<int64_t>& indices) const;
 
@@ -386,6 +398,29 @@ private:
 
     /// 标准化轴索引（处理负数）
     void normalize_axis(int& axis) const;
+
+#ifdef ENABLE_RV_THEAD
+    // ==================== 玄铁 RISC-V 优化实现 ====================
+    // 实现文件: rv-thead/weighted_sum.cpp, rv-thead/sigmoid_max.cpp
+
+    /// 玄铁优化: weighted_sum
+    Tensor weighted_sum_thead(int axis, const Tensor& weights) const;
+
+    /// 玄铁优化: max_with_argmax
+    LuaIntf::LuaRef max_with_argmax_thead(lua_State* L, int axis) const;
+
+    /// 玄铁优化: sigmoid_max_with_argmax
+    LuaIntf::LuaRef sigmoid_max_with_argmax_thead(lua_State* L, int axis) const;
+#endif
+
+    // ==================== CPU fallback 实现 ====================
+    // 实现文件: tensor_reduction.cpp
+
+    /// CPU fallback: weighted_sum
+    Tensor weighted_sum_cpu(int axis, const Tensor& weights) const;
+
+    /// CPU fallback: sigmoid_max_with_argmax
+    LuaIntf::LuaRef sigmoid_max_with_argmax_cpu(lua_State* L, int axis) const;
 
     // 实现文件: tensor_device.cpp
     /// 创建连续副本（优化批量 memcpy - OPT-6）

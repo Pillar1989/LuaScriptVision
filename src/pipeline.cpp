@@ -25,6 +25,65 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+constexpr double kSkipEmaAlpha = 0.2;
+constexpr int kSkipBudgetMax = 16;
+constexpr double kDefaultFrameIntervalMs = 33.333;
+
+int compute_skip_budget(double infer_ms, double camera_fps) {
+    if (infer_ms <= 0.0 || camera_fps <= 0.0) {
+        return 0;
+    }
+    double frame_interval_ms = 1000.0 / camera_fps;
+    if (frame_interval_ms <= 0.0) {
+        return 0;
+    }
+    int budget = static_cast<int>(std::ceil(infer_ms / frame_interval_ms)) - 1;
+    if (budget < 0) {
+        budget = 0;
+    } else if (budget > kSkipBudgetMax) {
+        budget = kSkipBudgetMax;
+    }
+    return budget;
+}
+
+double clamp_value(double value, double min_value, double max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+int compute_nobuf_threshold(double infer_ms, double frame_interval_ms) {
+    if (infer_ms <= 0.0 || frame_interval_ms <= 0.0) {
+        return 3;
+    }
+    double ratio = infer_ms / frame_interval_ms;
+    if (ratio >= 2.0) {
+        return 1;
+    }
+    if (ratio >= 1.3) {
+        return 2;
+    }
+    return 3;
+}
+
+double compute_nobuf_cooldown_ms(int streak, int threshold,
+                                 double infer_ms, double frame_interval_ms) {
+    double base_ms = (infer_ms > 0.0) ? infer_ms * 1.2 : frame_interval_ms * 2.0;
+    base_ms = clamp_value(base_ms, frame_interval_ms, 250.0);
+    int exponent = streak - threshold;
+    if (exponent < 0) {
+        exponent = 0;
+    } else if (exponent > 4) {
+        exponent = 4;
+    }
+    double cooldown_ms = base_ms * std::pow(2.0, exponent);
+    return clamp_value(cooldown_ms, frame_interval_ms, 1000.0);
+}
+
 }  // namespace
 
 CviPipeline::CviPipeline() = default;
@@ -277,27 +336,79 @@ InferenceResult CviPipeline::run_camera() {
 #ifndef USE_CVI_CAMERA
     throw std::runtime_error("[Pipeline] Camera support not enabled (USE_CVI_CAMERA)");
 #else
-    InferenceResult result;
+    // Single-shot: open camera, capture one frame, close camera
+    if (!open_camera()) {
+        throw std::runtime_error("[Pipeline] Failed to open camera");
+    }
+
+    InferenceResult result = run_camera_frame();
+    close_camera();
+
+    return result;
+#endif
+}
+
+bool CviPipeline::open_camera() {
+#ifndef USE_CVI_CAMERA
+    return false;
+#else
+    if (camera_ && camera_->is_opened()) {
+        return true;  // Already open
+    }
+
+    camera_ = std::make_unique<lua_cv::CameraSource>();
+    if (!camera_->open("")) {
+        camera_.reset();
+        return false;
+    }
+
+    if (!camera_->wait_for_ready(5000)) {
+        camera_->close();
+        camera_.reset();
+        return false;
+    }
+
+    camera_fps_ = camera_->fps();
+    if (camera_fps_ <= 0.0) {
+        camera_fps_ = 30.0;
+    }
+    infer_ema_ms_ = 0.0;
+    next_infer_time_ = std::chrono::steady_clock::time_point{};
+    skip_state_ready_ = false;
+    vpss_nobuf_streak_ = 0;
+
+    return true;
+#endif
+}
+
+InferenceResult CviPipeline::run_camera_frame() {
+#ifndef USE_CVI_CAMERA
+    throw std::runtime_error("[Pipeline] Camera support not enabled (USE_CVI_CAMERA)");
+#else
+    if (!camera_ || !camera_->is_opened()) {
+        throw std::runtime_error("[Pipeline] Camera not open - call open_camera() first");
+    }
+
     auto t_total = std::chrono::steady_clock::now();
 
     // 1. Camera input
     auto t_input = std::chrono::steady_clock::now();
-    lua_cv::CameraSource camera;
-    if (!camera.open("")) {
-        throw std::runtime_error("[Pipeline] Failed to open camera");
-    }
-    if (!camera.wait_for_ready(5000)) {
-        throw std::runtime_error("[Pipeline] Camera not ready after 5s");
-    }
     lua_cv::Frame input_frame;
-    if (!camera.read(input_frame)) {
+    if (!camera_->read(input_frame)) {
         throw std::runtime_error("[Pipeline] Failed to read camera frame");
     }
-    result.timings.input_ms = elapsed_ms(t_input);
+    double input_ms = elapsed_ms(t_input);
 
-    std::cout << "[Pipeline] Camera frame: " << input_frame.width() << "x"
-              << input_frame.height()
-              << " format=" << lua_cv::pixel_format_name(input_frame.pixel_format()) << "\n";
+    return run_camera_frame_from_input(input_frame, input_ms, t_total);
+#endif
+}
+
+#ifdef USE_CVI_CAMERA
+InferenceResult CviPipeline::run_camera_frame_from_input(lua_cv::Frame& input_frame,
+                                                         double input_ms,
+                                                         std::chrono::steady_clock::time_point total_start) {
+    InferenceResult result;
+    result.timings.input_ms = input_ms;
 
     // 2. Preprocess via VPSS
     auto t_preprocess = std::chrono::steady_clock::now();
@@ -313,31 +424,130 @@ InferenceResult CviPipeline::run_camera() {
     // Add output_count to meta for Lua postprocess
     meta["output_count"] = session_->output_count();
 
-    const auto& stats = session_->last_run_stats();
-    std::cout << "[Pipeline] TPU: input=" << stats.input_ms
-              << "ms forward=" << stats.forward_ms
-              << "ms output=" << stats.output_ms << "ms\n";
-
     // 4. Lua postprocess
     auto t_post = std::chrono::steady_clock::now();
     result.detections = postprocess_.call<LuaIntf::LuaRef>(outputs, meta);
     result.timings.postprocess_ms = elapsed_ms(t_post);
 
     // Release frames
-    camera.release(input_frame);
+    camera_->release(input_frame);
     preprocessed.release();
-    camera.close();
 
-    result.timings.total_ms = elapsed_ms(t_total);
+    result.timings.total_ms = elapsed_ms(total_start);
     last_timings_ = result.timings;
 
-    std::cout << "[Pipeline] Timings: input=" << result.timings.input_ms
-              << "ms preprocess=" << result.timings.preprocess_ms
-              << "ms inference=" << result.timings.inference_ms
-              << "ms postprocess=" << result.timings.postprocess_ms
-              << "ms total=" << result.timings.total_ms << "ms\n";
-
     return result;
+}
+#endif
+
+bool CviPipeline::run_camera_frame_adaptive(InferenceResult* result) {
+#ifndef USE_CVI_CAMERA
+    (void)result;
+    throw std::runtime_error("[Pipeline] Camera support not enabled (USE_CVI_CAMERA)");
+#else
+    if (!result) {
+        throw std::invalid_argument("[Pipeline] run_camera_frame_adaptive - result is null");
+    }
+    if (!camera_ || !camera_->is_opened()) {
+        throw std::runtime_error("[Pipeline] Camera not open - call open_camera() first");
+    }
+
+    auto t_read_start = std::chrono::steady_clock::now();
+    lua_cv::Frame input_frame;
+    if (!camera_->read(input_frame)) {
+        throw std::runtime_error("[Pipeline] Failed to read camera frame");
+    }
+    auto t_read_end = std::chrono::steady_clock::now();
+
+    if (!skip_state_ready_) {
+        next_infer_time_ = t_read_end;
+        skip_state_ready_ = true;
+    }
+
+    if (t_read_end < next_infer_time_) {
+        camera_->release(input_frame);
+        *result = InferenceResult{};
+        return false;
+    }
+
+    double input_ms =
+        std::chrono::duration<double, std::milli>(t_read_end - t_read_start).count();
+
+    InferenceResult local;
+    try {
+        local = run_camera_frame_from_input(input_frame, input_ms, t_read_start);
+    } catch (const std::exception&) {
+        int last_error = vpss_processor_.last_error();
+        if (last_error == CVI_ERR_VPSS_NOBUF || last_error == CVI_ERR_VPSS_BUF_EMPTY) {
+            vpss_nobuf_streak_++;
+
+            double frame_interval_ms = kDefaultFrameIntervalMs;
+            if (camera_fps_ > 0.0) {
+                frame_interval_ms = 1000.0 / camera_fps_;
+            }
+            int threshold = compute_nobuf_threshold(infer_ema_ms_, frame_interval_ms);
+            if (vpss_nobuf_streak_ >= threshold) {
+                double cooldown_ms = compute_nobuf_cooldown_ms(
+                    vpss_nobuf_streak_, threshold, infer_ema_ms_, frame_interval_ms);
+                auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double, std::milli>(cooldown_ms));
+                next_infer_time_ = t_read_end + interval;
+            }
+
+            *result = InferenceResult{};
+            return false;
+        }
+        throw;
+    }
+    vpss_nobuf_streak_ = 0;
+
+    // Update EWMA based on processing time (preprocess + inference + postprocess).
+    const double current_proc_ms =
+        local.timings.preprocess_ms + local.timings.inference_ms + local.timings.postprocess_ms;
+    const double kEmaAlpha = 0.2;
+    const double kSafetyFactor = 1.2;
+    if (infer_ema_ms_ <= 0.0) {
+        infer_ema_ms_ = current_proc_ms;
+    } else {
+        infer_ema_ms_ = infer_ema_ms_ * (1.0 - kEmaAlpha) + current_proc_ms * kEmaAlpha;
+    }
+
+    double frame_interval_ms = kDefaultFrameIntervalMs;
+    if (camera_fps_ > 0.0) {
+        frame_interval_ms = 1000.0 / camera_fps_;
+    }
+    double target_interval_ms = infer_ema_ms_ * kSafetyFactor;
+    if (target_interval_ms < frame_interval_ms) {
+        target_interval_ms = frame_interval_ms;
+    }
+    auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double, std::milli>(target_interval_ms));
+    next_infer_time_ = t_read_end + interval;
+
+    *result = std::move(local);
+    return true;
+#endif
+}
+
+void CviPipeline::close_camera() {
+#ifdef USE_CVI_CAMERA
+    if (camera_) {
+        camera_->close();
+        camera_.reset();
+    }
+    camera_fps_ = 0.0;
+    infer_ema_ms_ = 0.0;
+    next_infer_time_ = std::chrono::steady_clock::time_point{};
+    skip_state_ready_ = false;
+    vpss_nobuf_streak_ = 0;
+#endif
+}
+
+bool CviPipeline::is_camera_open() const {
+#ifdef USE_CVI_CAMERA
+    return camera_ && camera_->is_opened();
+#else
+    return false;
 #endif
 }
 

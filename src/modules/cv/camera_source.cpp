@@ -66,6 +66,17 @@ bool CameraSource::wait_for_ready(int timeout_ms) {
 #endif
 }
 
+double CameraSource::fps() const {
+#ifndef USE_CVI_CAMERA
+    return 0.0;
+#else
+    if (!camera_) {
+        return 0.0;
+    }
+    return camera_->fps();
+#endif
+}
+
 void CameraSource::release(Frame& frame) {
     frame.release();
 }

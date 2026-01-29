@@ -193,6 +193,10 @@ void register_module(lua_State* L) {
                 .addFunction("argmin", &tensor::Tensor::argmin_lua)
                 .addFunction("max_with_argmax", &tensor::Tensor::max_with_argmax)
 
+                // Fused operations (RVV optimized on T-Head platforms)
+                .addFunction("weighted_sum", &tensor::Tensor::weighted_sum)
+                .addFunction("sigmoid_max_with_argmax", &tensor::Tensor::sigmoid_max_with_argmax)
+
                 .addFunction("sigmoid", &tensor::Tensor::sigmoid)
                 .addFunction("softmax", &tensor::Tensor::softmax)
                 .addFunction("exp", &tensor::Tensor::exp_)

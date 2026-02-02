@@ -75,6 +75,8 @@ protected:
         pipeline_config.rtsp_session = "test_suite";
         pipeline_config.result_queue_size = 10;
         pipeline_config.stream_fps = 30;
+        pipeline_config.enable_audio = true;  // Enable audio capture
+        pipeline_config.audio_volume = 80;     // Set volume to 80%
 
         pipeline_ = new ParallelPipeline(pipeline_config);
 

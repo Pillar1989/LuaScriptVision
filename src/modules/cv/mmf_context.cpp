@@ -61,7 +61,7 @@ const MmfPlan& plan() {
     static constexpr MmfPlan kPlan = {
         0,
         0,
-        0,
+        1,
         {
             VpssGroupPlan{0, 1, 1, VpssInputKind::Isp, 1920, 1080},
             VpssGroupPlan{5, 0, 0, VpssInputKind::Mem, 1280, 720},
@@ -74,16 +74,16 @@ const MmfPlan& plan() {
             Resolution{0, 0},
         },
         {
-            Resolution{1280, 720},
+            Resolution{640, 640},
             Resolution{0, 0},
             Resolution{0, 0},
         },
         {
-            VbPoolSpec{1920, 1080, PixelFormat::NV21, 8, true},
-            VbPoolSpec{1280, 720, PixelFormat::NV21, 2, true},
-            VbPoolSpec{1280, 720, PixelFormat::BGR, 1, true},
+            VbPoolSpec{1920, 1080, PixelFormat::NV21, 5, true},  // Pool 0: 4→5 (VI pipe needs 5 for CameraCaptureTest)
+            VbPoolSpec{1920, 1080, PixelFormat::NV21, 5, true},  // Pool 1: must keep 5 (stream depth=3, all buffers used)
+            VbPoolSpec{0, 0, PixelFormat::UNKNOWN, 0, true},     // Pool 2: 4→0 (unused NV21 pool, save 2.34 MB)
             VbPoolSpec{640, 640, PixelFormat::RGB_PLANAR, 2, true},
-            VbPoolSpec{640, 640, PixelFormat::RGB, 4, true},
+            VbPoolSpec{640, 640, PixelFormat::RGB, 4, true},     // Pool 4: camera infer output
             VbPoolSpec{0, 0, PixelFormat::UNKNOWN, 0, true},
         },
     };

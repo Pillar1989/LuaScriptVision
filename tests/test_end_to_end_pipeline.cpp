@@ -650,8 +650,10 @@ TEST(EndToEndPipeline, ImageFileToDetection) {
 
     auto start_total = std::chrono::high_resolution_clock::now();
 
-    std::cout << "[Stage 1] Loading image...\n";
     auto start_stage = std::chrono::high_resolution_clock::now();
+
+#ifdef USE_VDEC_DECODE
+    std::cout << "[Stage 1] Loading image (hardware VDEC decode)...\n";
 
     lua_cv::ImageSource image_source;
     ASSERT_TRUE(image_source.open(image_path)) << "Failed to open image";
@@ -664,6 +666,21 @@ TEST(EndToEndPipeline, ImageFileToDetection) {
     lua_cv::Frame orig_frame = frame.clone();
     int orig_width = frame.width();
     int orig_height = frame.height();
+#else
+    std::cout << "[Stage 1] Loading image (software decode)...\n";
+
+    // Use software JPEG decode (OpenCV) - no VB pool/VDEC required
+    cv::Mat decoded_img = cv::imread(image_path, cv::IMREAD_COLOR);
+    ASSERT_FALSE(decoded_img.empty()) << "Failed to load image: " << image_path;
+
+    lua_cv::Frame frame(decoded_img);
+    ASSERT_FALSE(frame.empty()) << "Frame is empty";
+
+    // Save original frame for visualization
+    lua_cv::Frame orig_frame = frame.clone();
+    int orig_width = frame.width();
+    int orig_height = frame.height();
+#endif
 
     auto end_stage = std::chrono::high_resolution_clock::now();
     double stage1_ms = std::chrono::duration<double, std::milli>(end_stage - start_stage).count();
@@ -738,8 +755,13 @@ TEST(EndToEndPipeline, ImageFileToDetection) {
     std::cout << "  Total pipeline:  " << total_ms << " ms\n";
     std::cout << "  Target (<60ms):  " << (total_ms < 60.0 ? "PASS" : "FAIL") << "\n\n";
 
+#ifdef USE_VDEC_DECODE
+    // Hardware decode - cleanup ImageSource
     image_source.release(frame);
     image_source.close();
+#else
+    // Software decode - no cleanup needed
+#endif
 
     EXPECT_LT(stats.input_ms, 1.0) << "Zero-copy input should be <1ms";
     EXPECT_LT(stats.forward_ms, 45.0) << "TPU forward should be <45ms (hardware baseline ~37ms)";

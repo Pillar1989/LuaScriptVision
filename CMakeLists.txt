@@ -74,6 +74,20 @@ else()
 endif()
 
 # ==========================================================
+# 0.6 JPEG Decode Method Selection
+# ==========================================================
+# Default: software decode (OpenCV) - no VB pool dependency
+# Set to ON to use hardware VDEC decoder (requires VB pool)
+option(USE_VDEC_DECODE "Use hardware VDEC for JPEG decode (requires VB pool)" OFF)
+
+if(USE_VDEC_DECODE)
+    message(STATUS "JPEG decode: Hardware VDEC (requires VB pool)")
+    add_compile_definitions(USE_VDEC_DECODE)
+else()
+    message(STATUS "JPEG decode: Software (OpenCV, no VB pool dependency)")
+endif()
+
+# ==========================================================
 # 1. Build Lua as C++ (Critical for exception safety)
 # ==========================================================
 file(GLOB LUA_SRC "lua/*.c")
@@ -165,6 +179,8 @@ file(GLOB MEMORY_SOURCES "src/memory/*.cpp")
 file(GLOB CV_SOURCES "src/modules/cv/*.cpp")
 file(GLOB BINDING_SOURCES "src/bindings/*.cpp")
 file(GLOB INFERENCE_SOURCES "src/inference/*.cpp")
+file(GLOB STREAM_SOURCES "src/stream/*.cpp")
+file(GLOB PIPELINE_SOURCES "src/pipeline/*.cpp")
 
 # T-Head RISC-V optimized tensor operations
 if(ENABLE_RV_THEAD AND TENSOR_RV_THEAD_SOURCES)
@@ -211,14 +227,15 @@ else()
 endif()
 
 add_executable(lua_runner
-    src/main.cpp
-    src/pipeline.cpp
+    examples/lua_runner/main.cpp
     ${MODULE_SOURCES}
     ${TENSOR_SOURCES}
     ${MEMORY_SOURCES}
     ${CV_SOURCES}
     ${BINDING_SOURCES}
     ${INFERENCE_SOURCES}
+    ${STREAM_SOURCES}
+    ${PIPELINE_SOURCES}
 )
 
 target_link_libraries(lua_runner PRIVATE
@@ -243,6 +260,8 @@ target_include_directories(lua_runner PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/utils"
     ${OpenCV_INCLUDE_DIRS}
@@ -258,10 +277,12 @@ if(NOT USE_ONNX_RUNTIME)
     target_include_directories(lua_runner PRIVATE
         ${TPU_INCLUDE_DIR}
         ${CVI_MPI_INCLUDE_DIR}
+        ${CVI_RTSP_INCLUDE_DIR}
     )
     target_link_directories(lua_runner PRIVATE
         ${TPU_LIB_DIR}
         ${CVI_MPI_LIB_DIR}
+        ${CVI_RTSP_LIB_DIR}
     )
 
     # Base libraries (always needed for TPU/VPSS)
@@ -273,6 +294,7 @@ if(NOT USE_ONNX_RUNTIME)
         ${CVI_MPI_LIB_DIR}/libsys.a
         ${CVI_MPI_LIB_DIR}/libvpss.a
         ${CVI_MPI_LIB_DIR}/libvdec.a
+        ${CVI_MPI_LIB_DIR}/libvenc.a
         ${CVI_MPI_LIB_DIR}/libvo.a
     )
 
@@ -309,6 +331,7 @@ if(NOT USE_ONNX_RUNTIME)
             ${CVI_MPI_LIB_DIR}/libsys.a
             ${CVI_MPI_LIB_DIR}/libvpss.a
             ${CVI_MPI_LIB_DIR}/libvdec.a
+            ${CVI_MPI_LIB_DIR}/libvenc.a
             ${CVI_MPI_LIB_DIR}/libvo.a
             -Wl,--end-group
             z
@@ -353,7 +376,7 @@ endif()
 # 5. Pure C++ Inference App (ONNX Runtime or CVI Runtime)
 # ==========================================================
 add_executable(cpp_infer
-    src/cpp_main.cpp
+    examples/cpp_runner/main.cpp
     ${INFERENCE_SOURCES}
 )
 
@@ -811,7 +834,7 @@ if(NOT USE_ONNX_RUNTIME)
             -Wl,--end-group
         )
 
-        target_compile_definitions(test_cv_func PRIVATE USE_CVI_CAMERA)
+        target_compile_definitions(test_cv_func PRIVATE USE_CVI_MPI USE_CVI_CAMERA)
 
         message(STATUS "test_cv_func: Camera capture tests enabled (ISP libraries linked)")
     endif()
@@ -866,6 +889,270 @@ if(NOT USE_ONNX_RUNTIME)
 
     message(STATUS "test_vdec_standalone: VDEC standalone test enabled (static build)")
 
+    # Test 4: VENC Encoder Test
+    add_executable(test_venc_encoder
+        tests/test_venc_encoder.cpp
+        src/stream/venc_encoder.cpp
+        src/modules/cv/mmf_context.cpp
+        src/modules/cv/cv_types.cpp
+    )
+
+    target_include_directories(test_venc_encoder PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+    )
+
+    target_link_directories(test_venc_encoder PRIVATE
+        ${TPU_LIB_DIR}
+        ${CVI_MPI_LIB_DIR}
+    )
+
+    target_link_libraries(test_venc_encoder PRIVATE
+        -static
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
+        gtest
+        -Wl,--no-whole-archive
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        ${CVI_MPI_LIB_DIR}/libvpss.a
+        ${CVI_MPI_LIB_DIR}/libvdec.a
+        ${CVI_MPI_LIB_DIR}/libvenc.a
+        ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    target_compile_definitions(test_venc_encoder PRIVATE USE_CVI_MPI)
+
+    message(STATUS "test_venc_encoder: VENC encoder test enabled (static build)")
+
+    # Test 5: RTSP Server Test (requires dynamic linking for libcvi_rtsp.so)
+    add_executable(test_rtsp_server
+        tests/test_rtsp_server.cpp
+        src/stream/rtsp_server.cpp
+        src/stream/venc_encoder.cpp
+        src/modules/cv/mmf_context.cpp
+        src/modules/cv/cv_types.cpp
+    )
+
+    target_include_directories(test_rtsp_server PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+        ${CVI_RTSP_INCLUDE_DIR}
+    )
+
+    target_link_directories(test_rtsp_server PRIVATE
+        ${TPU_LIB_DIR}
+        ${CVI_MPI_LIB_DIR}
+        ${CVI_RTSP_LIB_DIR}
+    )
+
+    # RTSP test uses dynamic linking because libcvi_rtsp.so is a shared library
+    target_link_libraries(test_rtsp_server PRIVATE
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
+        gtest
+        -Wl,--no-whole-archive
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        ${CVI_MPI_LIB_DIR}/libvpss.a
+        ${CVI_MPI_LIB_DIR}/libvdec.a
+        ${CVI_MPI_LIB_DIR}/libvenc.a
+        ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
+        cvi_rtsp
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    # Set RPATH for dynamic libraries on device
+    set_target_properties(test_rtsp_server PROPERTIES
+        BUILD_RPATH "/mnt/system/usr/lib"
+        INSTALL_RPATH "/mnt/system/usr/lib"
+    )
+
+    target_compile_definitions(test_rtsp_server PRIVATE USE_CVI_MPI)
+
+    message(STATUS "test_rtsp_server: RTSP server test enabled (dynamic linking for libcvi_rtsp.so)")
+
+    # Test 6: Multi-Channel Test (requires camera support)
+    if(ENABLE_CVI_CAMERA)
+        add_executable(test_multi_channel
+            tests/test_multi_channel.cpp
+            src/stream/rtsp_server.cpp
+            src/stream/venc_encoder.cpp
+            src/modules/cv/mmf_context.cpp
+            src/modules/cv/cv_types.cpp
+            src/modules/cv/cvi_camera.cpp
+            src/modules/cv/cvi_sensor.cpp
+            src/modules/cv/frame.cpp
+        )
+
+        target_include_directories(test_multi_channel PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
+            ${TPU_INCLUDE_DIR}
+            ${CVI_MPI_INCLUDE_DIR}
+            ${CVI_ISP_INCLUDE_DIR}
+            ${CVI_RTSP_INCLUDE_DIR}
+            ${OpenCV_INCLUDE_DIRS}
+        )
+
+        target_link_directories(test_multi_channel PRIVATE
+            ${TPU_LIB_DIR}
+            ${CVI_MPI_LIB_DIR}
+            ${CVI_RTSP_LIB_DIR}
+        )
+
+        target_link_libraries(test_multi_channel PRIVATE
+            ${OpenCV_LIBS}
+            ${TPU_LIB_DIR}/libcviruntime-static.a
+            ${TPU_LIB_DIR}/libcvikernel-static.a
+            ${TPU_LIB_DIR}/libcvimath-static.a
+            ${TPU_LIB_DIR}/libflatbuffers.a
+            -Wl,--whole-archive
+            gtest
+            -Wl,--no-whole-archive
+            -Wl,--start-group
+            ${CVI_MPI_LIB_DIR}/libvi.a
+            ${CVI_MPI_LIB_DIR}/libisp.a
+            ${CVI_MPI_LIB_DIR}/libisp_algo.a
+            ${CVI_MPI_LIB_DIR}/libae.a
+            ${CVI_MPI_LIB_DIR}/libawb.a
+            ${CVI_MPI_LIB_DIR}/libaf.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin_isp.a
+            ${CVI_MPI_LIB_DIR}/libsns_full.a
+            ${CVI_MPI_LIB_DIR}/libsys.a
+            ${CVI_MPI_LIB_DIR}/libvpss.a
+            ${CVI_MPI_LIB_DIR}/libvdec.a
+            ${CVI_MPI_LIB_DIR}/libvenc.a
+            ${CVI_MPI_LIB_DIR}/libvo.a
+            -Wl,--end-group
+            cvi_rtsp
+            z
+            m
+            pthread
+            dl
+            atomic
+        )
+
+        set_target_properties(test_multi_channel PROPERTIES
+            BUILD_RPATH "/mnt/system/usr/lib"
+            INSTALL_RPATH "/mnt/system/usr/lib"
+        )
+
+        target_compile_definitions(test_multi_channel PRIVATE USE_CVI_MPI USE_CVI_CAMERA)
+
+        message(STATUS "test_multi_channel: Multi-channel camera test enabled")
+    endif()
+
+    # Test 7: Parallel Pipeline Test (requires camera support)
+    if(ENABLE_CVI_CAMERA)
+        add_executable(test_parallel_pipeline
+            tests/test_parallel_pipeline.cpp
+            src/pipeline/parallel_pipeline.cpp
+            src/stream/rtsp_server.cpp
+            src/stream/venc_encoder.cpp
+            src/modules/cv/mmf_context.cpp
+            src/modules/cv/cv_types.cpp
+            src/modules/cv/cvi_camera.cpp
+            src/modules/cv/cvi_sensor.cpp
+            src/modules/cv/frame.cpp
+        )
+
+        target_include_directories(test_parallel_pipeline PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
+            ${TPU_INCLUDE_DIR}
+            ${CVI_MPI_INCLUDE_DIR}
+            ${CVI_ISP_INCLUDE_DIR}
+            ${CVI_RTSP_INCLUDE_DIR}
+            ${OpenCV_INCLUDE_DIRS}
+        )
+
+        target_link_directories(test_parallel_pipeline PRIVATE
+            ${TPU_LIB_DIR}
+            ${CVI_MPI_LIB_DIR}
+            ${CVI_RTSP_LIB_DIR}
+        )
+
+        target_link_libraries(test_parallel_pipeline PRIVATE
+            ${OpenCV_LIBS}
+            ${TPU_LIB_DIR}/libcviruntime-static.a
+            ${TPU_LIB_DIR}/libcvikernel-static.a
+            ${TPU_LIB_DIR}/libcvimath-static.a
+            ${TPU_LIB_DIR}/libflatbuffers.a
+            -Wl,--whole-archive
+            gtest
+            -Wl,--no-whole-archive
+            -Wl,--start-group
+            ${CVI_MPI_LIB_DIR}/libvi.a
+            ${CVI_MPI_LIB_DIR}/libisp.a
+            ${CVI_MPI_LIB_DIR}/libisp_algo.a
+            ${CVI_MPI_LIB_DIR}/libae.a
+            ${CVI_MPI_LIB_DIR}/libawb.a
+            ${CVI_MPI_LIB_DIR}/libaf.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin.a
+            ${CVI_MPI_LIB_DIR}/libcvi_bin_isp.a
+            ${CVI_MPI_LIB_DIR}/libsns_full.a
+            ${CVI_MPI_LIB_DIR}/libsys.a
+            ${CVI_MPI_LIB_DIR}/libvpss.a
+            ${CVI_MPI_LIB_DIR}/libvdec.a
+            ${CVI_MPI_LIB_DIR}/libvenc.a
+            ${CVI_MPI_LIB_DIR}/libvo.a
+            -Wl,--end-group
+            cvi_rtsp
+            z
+            m
+            pthread
+            dl
+            atomic
+        )
+
+        set_target_properties(test_parallel_pipeline PROPERTIES
+            BUILD_RPATH "/mnt/system/usr/lib"
+            INSTALL_RPATH "/mnt/system/usr/lib"
+        )
+
+        target_compile_definitions(test_parallel_pipeline PRIVATE USE_CVI_MPI USE_CVI_CAMERA)
+
+        message(STATUS "test_parallel_pipeline: Parallel pipeline test enabled")
+    endif()
+
     # Dynamic linking version (commented out - for reference only)
     # # Use dynamic linking like sample_vdec Makefile, with RPATH for device
     # target_link_libraries(test_vdec_standalone PRIVATE
@@ -899,4 +1186,89 @@ if(NOT USE_ONNX_RUNTIME)
     #     BUILD_RPATH "/mnt/system/usr/lib:/mnt/system/usr/lib/3rd"
     #     INSTALL_RPATH "/mnt/system/usr/lib:/mnt/system/usr/lib/3rd"
     # )
+endif()
+
+# ==========================================================
+# 7. Parallel Inference + Streaming Application (Phase 1.4)
+# ==========================================================
+if(NOT USE_ONNX_RUNTIME AND ENABLE_CVI_CAMERA)
+    add_executable(parallel_infer_stream
+        examples/parallel_infer_stream/main.cpp
+        ${MODULE_SOURCES}
+        ${TENSOR_SOURCES}
+        ${MEMORY_SOURCES}
+        ${CV_SOURCES}
+        ${BINDING_SOURCES}
+        ${INFERENCE_SOURCES}
+        ${STREAM_SOURCES}
+        ${PIPELINE_SOURCES}
+    )
+
+    target_include_directories(parallel_infer_stream PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/tensor"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/modules/cv"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/stream"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bindings"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/utils"
+        ${OpenCV_INCLUDE_DIRS}
+        ${TPU_INCLUDE_DIR}
+        ${CVI_MPI_INCLUDE_DIR}
+        ${CVI_ISP_INCLUDE_DIR}
+        ${CVI_RTSP_INCLUDE_DIR}
+    )
+
+    target_link_directories(parallel_infer_stream PRIVATE
+        ${TPU_LIB_DIR}
+        ${CVI_MPI_LIB_DIR}
+        ${CVI_RTSP_LIB_DIR}
+    )
+
+    target_link_libraries(parallel_infer_stream PRIVATE
+        LuaIntf
+        ${OpenCV_LIBS}
+        ${TPU_LIB_DIR}/libcviruntime-static.a
+        ${TPU_LIB_DIR}/libcvikernel-static.a
+        ${TPU_LIB_DIR}/libcvimath-static.a
+        ${TPU_LIB_DIR}/libflatbuffers.a
+        -Wl,--whole-archive
+        lua
+        -Wl,--no-whole-archive
+        -Wl,--start-group
+        ${CVI_MPI_LIB_DIR}/libvi.a
+        ${CVI_MPI_LIB_DIR}/libisp.a
+        ${CVI_MPI_LIB_DIR}/libisp_algo.a
+        ${CVI_MPI_LIB_DIR}/libae.a
+        ${CVI_MPI_LIB_DIR}/libawb.a
+        ${CVI_MPI_LIB_DIR}/libaf.a
+        ${CVI_MPI_LIB_DIR}/libcvi_bin.a
+        ${CVI_MPI_LIB_DIR}/libcvi_bin_isp.a
+        ${CVI_MPI_LIB_DIR}/libsns_full.a
+        ${CVI_MPI_LIB_DIR}/libsys.a
+        ${CVI_MPI_LIB_DIR}/libvpss.a
+        ${CVI_MPI_LIB_DIR}/libvdec.a
+        ${CVI_MPI_LIB_DIR}/libvenc.a
+        ${CVI_MPI_LIB_DIR}/libvo.a
+        -Wl,--end-group
+        cvi_rtsp
+        z
+        m
+        pthread
+        dl
+        atomic
+    )
+
+    set_target_properties(parallel_infer_stream PROPERTIES
+        BUILD_RPATH "/mnt/system/usr/lib"
+        INSTALL_RPATH "/mnt/system/usr/lib"
+    )
+
+    target_compile_definitions(parallel_infer_stream PRIVATE
+        USE_CVI_MPI USE_CVI_CAMERA USE_CVI_TPU
+    )
+
+    message(STATUS "parallel_infer_stream: Parallel inference + streaming application enabled")
 endif()

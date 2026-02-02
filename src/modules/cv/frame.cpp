@@ -214,6 +214,20 @@ cv::Mat Frame::to_mat_copy() const {
             cv::cvtColor(mapped_view_, bgr, code);
             return bgr;
         }
+        if (format_ == PixelFormat::RGB_PLANAR) {
+            // Convert planar R,G,B to interleaved BGR
+            int w = static_cast<int>(cvi_frame_.stVFrame.u32Width);
+            int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
+            int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
+            uint8_t* base = static_cast<uint8_t*>(mapped_ptr_);
+            cv::Mat r_plane(h, w, CV_8UC1, base, stride);
+            cv::Mat g_plane(h, w, CV_8UC1, base + stride * h, stride);
+            cv::Mat b_plane(h, w, CV_8UC1, base + stride * h * 2, stride);
+            cv::Mat bgr;
+            std::vector<cv::Mat> channels = {b_plane, g_plane, r_plane};
+            cv::merge(channels, bgr);
+            return bgr;
+        }
         return mapped_view_.clone();
     }
 #endif
@@ -334,16 +348,17 @@ std::shared_ptr<tensor::VbMemory> Frame::as_vb_memory() const {
                         static_cast<size_t>(cvi_frame_.stVFrame.u32Length[1]) +
                         static_cast<size_t>(cvi_frame_.stVFrame.u32Length[2]);
     if (total_size == 0) {
+        // Fallback calculation for planar formats
         int h = static_cast<int>(cvi_frame_.stVFrame.u32Height);
         int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
         if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
             total_size = static_cast<size_t>(stride) * static_cast<size_t>(h + h / 2);
+        } else if (format_ == PixelFormat::RGB_PLANAR) {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h) * 3;
         } else {
             total_size = static_cast<size_t>(stride) * static_cast<size_t>(h);
         }
     }
-
-    // Get or create VB_BLK handle from physical address
     VB_BLK block = vb_block_;
     if (block == VB_INVALID_HANDLE) {
         block = CVI_VB_PhysAddr2Handle(cvi_frame_.stVFrame.u64PhyAddr[0]);
@@ -376,6 +391,8 @@ void Frame::ensure_mapped() const {
         int stride = static_cast<int>(cvi_frame_.stVFrame.u32Stride[0]);
         if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
             total_size = static_cast<size_t>(stride) * static_cast<size_t>(h + h / 2);
+        } else if (format_ == PixelFormat::RGB_PLANAR) {
+            total_size = static_cast<size_t>(stride) * static_cast<size_t>(h) * 3;
         } else {
             total_size = static_cast<size_t>(stride) * static_cast<size_t>(h);
         }
@@ -405,6 +422,9 @@ void Frame::ensure_mapped() const {
     } else if (format_ == PixelFormat::NV12 || format_ == PixelFormat::NV21) {
         // Return raw YUV data as single-channel (no conversion for view)
         mapped_view_ = cv::Mat(h + h / 2, w, CV_8UC1, base, stride);
+    } else if (format_ == PixelFormat::RGB_PLANAR) {
+        // Planar R,G,B: expose as single-channel (3*h, w) for raw access
+        mapped_view_ = cv::Mat(h * 3, w, CV_8UC1, base, stride);
     } else {
         unmap();
         throw std::runtime_error("Frame::ensure_mapped - unsupported CVI pixel format");

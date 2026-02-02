@@ -184,6 +184,8 @@ TEST(VpssPerformanceTest, Breakdown) {
     double full_min = 0.0;
     double full_avg = 0.0;
     if (!test_image_path().empty()) {
+#ifdef USE_VDEC_DECODE
+        // Hardware VDEC decode
         std::vector<uint8_t> jpeg_data;
         if (read_file(test_image_path(), jpeg_data)) {
             uint32_t jpeg_w = 0;
@@ -198,10 +200,11 @@ TEST(VpssPerformanceTest, Breakdown) {
                     for (int i = 0; i < iterations; ++i) {
                         timer.start();
                         VIDEO_FRAME_INFO_S decoded = decoder.decode_sync(jpeg_data.data(), jpeg_data.size());
+                        VdecFrameGuard frame_guard(&decoder, decoded);  // RAII: 自动释放
                         Frame frame(decoded, false);
                         processor.letterbox(frame, 640, 640, 114, nullptr);
-                        decoder.release_frame(decoded);
                         pipeline_times.push_back(timer.elapsed_ms());
+                        // frame_guard 析构时自动调用 decoder.release_frame(decoded)
                     }
                     full_min = *std::min_element(pipeline_times.begin(), pipeline_times.end());
                     full_avg = std::accumulate(pipeline_times.begin(), pipeline_times.end(), 0.0) / iterations;
@@ -213,6 +216,25 @@ TEST(VpssPerformanceTest, Breakdown) {
         } else {
             std::cout << "[WARN] Failed to read test image; skipping full pipeline stats" << std::endl;
         }
+#else
+        // Software JPEG decode (OpenCV) - no VB pool required
+        cv::Mat jpeg_img = decode_jpeg_software(test_image_path());
+        if (!jpeg_img.empty()) {
+            std::vector<double> pipeline_times;
+            pipeline_times.reserve(iterations);
+            for (int i = 0; i < iterations; ++i) {
+                timer.start();
+                Frame frame(jpeg_img);  // cv::Mat -> Frame
+                processor.letterbox(frame, 640, 640, 114, nullptr);
+                pipeline_times.push_back(timer.elapsed_ms());
+            }
+            full_min = *std::min_element(pipeline_times.begin(), pipeline_times.end());
+            full_avg = std::accumulate(pipeline_times.begin(), pipeline_times.end(), 0.0) / iterations;
+            full_pipeline_ok = true;
+        } else {
+            std::cout << "[WARN] Failed to decode test image; skipping full pipeline stats" << std::endl;
+        }
+#endif
     } else {
         std::cout << "[WARN] No test image path; skipping full pipeline stats" << std::endl;
     }

@@ -36,6 +36,7 @@ public:
 #ifdef USE_CVI_MPI
     VIDEO_FRAME_INFO_S mat_to_video_frame(const cv::Mat& mat, VB_BLK& vb_block);
     VIDEO_FRAME_INFO_S mat_to_video_frame(const cv::Mat& mat, VB_BLK& vb_block, VB_POOL pool);
+    void destroy_group();  // Public method for explicit cleanup before MMF shutdown
 #endif
 
 private:
@@ -47,7 +48,6 @@ private:
                        bool use_crop, int crop_x, int crop_y, int crop_w, int crop_h,
                        bool letterbox, uint8_t pad_value);
     VB_POOL select_output_pool(uint32_t width, uint32_t height, PixelFormat format) const;
-    void destroy_group();
 
     VPSS_GRP grp_ = -1;
     VPSS_CHN chn_ = 0;

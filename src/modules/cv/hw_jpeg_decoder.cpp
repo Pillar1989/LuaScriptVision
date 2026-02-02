@@ -120,11 +120,13 @@ void HwJpegDecoder::cleanup() {
         return;
     }
 
+    std::cout << "[VDEC] Cleanup - chn=" << chn_ << std::endl;
     CVI_VDEC_StopRecvStream(chn_);
     CVI_VDEC_DestroyChn(chn_);
     initialized_ = false;
     max_width_ = 0;
     max_height_ = 0;
+    std::cout << "[VDEC] Cleanup DONE" << std::endl;
 }
 
 VIDEO_FRAME_INFO_S HwJpegDecoder::decode(const uint8_t* data, size_t size) {
@@ -202,13 +204,21 @@ VIDEO_FRAME_INFO_S HwJpegDecoder::decode_sync(const uint8_t* data, size_t size) 
         }
     }
 
+    std::cout << "[VDEC] GetFrame SUCCESS - chn=" << chn_
+              << " phys=0x" << std::hex << frame.stVFrame.u64PhyAddr[0] << std::dec
+              << " size=" << frame.stVFrame.u32Width << "x" << frame.stVFrame.u32Height
+              << std::endl;
     return frame;
 }
 
 void HwJpegDecoder::release_frame(const VIDEO_FRAME_INFO_S& frame) {
     if (!initialized_) {
+        std::cout << "[VDEC] ReleaseFrame SKIP - not initialized" << std::endl;
         return;
     }
+    std::cout << "[VDEC] ReleaseFrame - chn=" << chn_
+              << " phys=0x" << std::hex << frame.stVFrame.u64PhyAddr[0] << std::dec
+              << std::endl;
     CVI_VDEC_ReleaseFrame(chn_, &frame);
 }
 

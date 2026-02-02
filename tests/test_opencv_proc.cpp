@@ -19,9 +19,7 @@ TEST(OpenCvProcessorTest, ResizeUpscale) {
     cv::Mat mat = create_test_image(320, 240);
     Frame frame(mat);
 
-    processor.resize(frame, 640, 480);
-    EXPECT_EQ(frame.width(), 640);
-    EXPECT_EQ(frame.height(), 480);
+    EXPECT_THROW(processor.resize(frame, 640, 480), std::invalid_argument);
 }
 
 TEST(OpenCvProcessorTest, CvtColorBgrToRgb) {

@@ -1,12 +1,16 @@
 /**
  * test_ion_loader.cpp - IonImageLoader performance test
+ *
+ * NOTE: This test uses hardware VDEC decoder which requires VB pool.
+ * Disabled by default in favor of software JPEG decode.
+ * Define USE_VDEC_DECODE to enable hardware decode tests.
  */
 
 #include "test_common.h"
 #include <numeric>
 #include <algorithm>
 
-#ifdef USE_CVI_MPI
+#if defined(USE_CVI_MPI) && defined(USE_VDEC_DECODE)
 
 #include "cv/ion_image_loader.h"
 #include "cv/hw_jpeg_decoder.h"
@@ -181,12 +185,15 @@ TEST(IonLoaderTest, Breakdown) {
     double hw_decode_sync_time = 0.0;
     bool hw_decode_success = false;
     {
+        std::cout << "\n[TEST] IonLoaderTest - HW JPEG decode START" << std::endl;
         HwJpegDecoder hw_decoder;
         if (hw_decoder.init(width, height)) {
             try {
+                std::cout << "[TEST] First decode (warmup)" << std::endl;
                 VIDEO_FRAME_INFO_S frame = hw_decoder.decode(file_data.data(), file_data.size());
                 hw_decoder.release_frame(frame);
 
+                std::cout << "[TEST] decode() benchmark loop START" << std::endl;
                 times.clear();
                 for (int i = 0; i < iterations; ++i) {
                     timer.start();
@@ -195,7 +202,9 @@ TEST(IonLoaderTest, Breakdown) {
                     hw_decoder.release_frame(frame);
                 }
                 hw_decode_time = *std::min_element(times.begin(), times.end());
+                std::cout << "[TEST] decode() benchmark loop END" << std::endl;
 
+                std::cout << "[TEST] decode_sync() benchmark loop START" << std::endl;
                 times.clear();
                 for (int i = 0; i < iterations; ++i) {
                     timer.start();
@@ -205,11 +214,14 @@ TEST(IonLoaderTest, Breakdown) {
                 }
                 hw_decode_sync_time = *std::min_element(times.begin(), times.end());
                 hw_decode_success = true;
+                std::cout << "[TEST] decode_sync() benchmark loop END" << std::endl;
             } catch (const std::exception& e) {
-                std::cerr << "[IonLoader] HW JPEG decode failed: " << e.what() << std::endl;
+                std::cerr << "[TEST] HW JPEG decode EXCEPTION: " << e.what() << std::endl;
             }
+            std::cout << "[TEST] Calling hw_decoder.cleanup()" << std::endl;
             hw_decoder.cleanup();
         }
+        std::cout << "[TEST] IonLoaderTest - HW JPEG decode END (hw_decoder destructor will be called)" << std::endl;
     }
 
     std::cout << "\n[IonLoader] Timing breakdown" << std::endl;
@@ -244,7 +256,11 @@ TEST(IonLoaderTest, Breakdown) {
 #else
 
 TEST(IonLoaderTest, Skipped) {
+#ifndef USE_CVI_MPI
     GTEST_SKIP() << "USE_CVI_MPI not defined";
+#else
+    GTEST_SKIP() << "USE_VDEC_DECODE not defined (using software JPEG decode)";
+#endif
 }
 
 #endif

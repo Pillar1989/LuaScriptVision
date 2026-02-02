@@ -226,6 +226,8 @@ TEST(BenchmarkTest, VpssBenchmarks) {
     EXPECT_GT(vpss_steady_result.avg_ms, 0.0);
 
     if (!test_image_path().empty()) {
+#ifdef USE_VDEC_DECODE
+        // Hardware VDEC decode
         std::vector<uint8_t> jpeg_data;
         if (read_file(test_image_path(), jpeg_data)) {
             uint32_t jpeg_w = 0;
@@ -238,9 +240,10 @@ TEST(BenchmarkTest, VpssBenchmarks) {
                     const std::string vpss_full_label = "VDEC->VPSS Letterbox (full pipeline)";
                     auto vpss_full_result = run_benchmark(vpss_full_label, [&]() {
                         VIDEO_FRAME_INFO_S decoded = decoder.decode_sync(jpeg_data.data(), jpeg_data.size());
+                        VdecFrameGuard frame_guard(&decoder, decoded);  // RAII: 自动释放
                         Frame frame(decoded, false);
                         processor.letterbox(frame, 640, 640, 114, nullptr);
-                        decoder.release_frame(decoded);
+                        // frame_guard 析构时自动调用 decoder.release_frame(decoded)
                     }, iterations);
                     print_benchmark_result(vpss_full_result);
                     EXPECT_GT(vpss_full_result.avg_ms, 0.0);
@@ -251,6 +254,21 @@ TEST(BenchmarkTest, VpssBenchmarks) {
         } else {
             std::cout << "[WARN] Failed to read test image; skipping full pipeline benchmark" << std::endl;
         }
+#else
+        // Software JPEG decode (OpenCV) - no VB pool required
+        cv::Mat jpeg_img = decode_jpeg_software(test_image_path());
+        if (!jpeg_img.empty()) {
+            const std::string vpss_full_label = "SW Decode->VPSS Letterbox (full pipeline)";
+            auto vpss_full_result = run_benchmark(vpss_full_label, [&]() {
+                Frame frame(jpeg_img);  // cv::Mat -> Frame
+                processor.letterbox(frame, 640, 640, 114, nullptr);
+            }, iterations);
+            print_benchmark_result(vpss_full_result);
+            EXPECT_GT(vpss_full_result.avg_ms, 0.0);
+        } else {
+            std::cout << "[WARN] Failed to decode test image; skipping full pipeline benchmark" << std::endl;
+        }
+#endif
     } else {
         std::cout << "[WARN] No test image path; skipping full pipeline benchmark" << std::endl;
     }

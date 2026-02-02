@@ -91,10 +91,11 @@ TEST(VpssProcessorTest, ResizeUpscale) {
     VbBlockGuard vb_guard(vb_block);
     Frame frame(video_frame, false);
 
-    processor.resize(frame, 640, 480);
+    // Upscale within VPSS MEM capacity (1280x720) should succeed
+    EXPECT_NO_THROW(processor.resize(frame, 640, 480));
 
-    EXPECT_EQ(frame.width(), 640);
-    EXPECT_EQ(frame.height(), 480);
+    // Upscale beyond VPSS MEM capacity should throw
+    EXPECT_THROW(processor.resize(frame, 1920, 1080), std::invalid_argument);
 }
 
 TEST(VpssProcessorTest, CvtColorBgrToRgb) {

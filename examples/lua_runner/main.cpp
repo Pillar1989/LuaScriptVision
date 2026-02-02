@@ -11,7 +11,7 @@
 #include "modules/lua_utils.h"
 
 #if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
-#include "pipeline.h"
+#include "pipeline/cvi_pipeline.h"
 #include "modules/cv/mmf_context.h"
 #endif
 

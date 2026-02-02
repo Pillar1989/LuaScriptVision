@@ -1,10 +1,14 @@
 /**
  * test_input_source_image.cpp - ImageSource tests (VDEC JPEG)
+ *
+ * NOTE: This test uses hardware VDEC decoder which requires VB pool.
+ * Disabled by default in favor of software JPEG decode.
+ * Define USE_VDEC_DECODE to enable hardware decode tests.
  */
 
 #include "test_common.h"
 
-#ifdef USE_CVI_MPI
+#if defined(USE_CVI_MPI) && defined(USE_VDEC_DECODE)
 
 #include "cv/image_source.h"
 #include "cv/cvi_vpss_processor.h"
@@ -21,6 +25,7 @@ TEST(InputSourceImage, ReadAndLetterbox) {
         GTEST_SKIP() << "No test image path provided";
     }
 
+    std::cout << "\n[TEST] InputSourceImage.ReadAndLetterbox START" << std::endl;
     ImageSource source;
     ASSERT_TRUE(source.open(image_path));
 
@@ -40,12 +45,17 @@ TEST(InputSourceImage, ReadAndLetterbox) {
 
     source.release(frame);
     source.close();
+    std::cout << "[TEST] InputSourceImage.ReadAndLetterbox END" << std::endl;
 }
 
 #else
 
 TEST(InputSourceImage, Skipped) {
+#ifndef USE_CVI_MPI
     GTEST_SKIP() << "USE_CVI_MPI not defined";
+#else
+    GTEST_SKIP() << "USE_VDEC_DECODE not defined (using software JPEG decode)";
+#endif
 }
 
 #endif

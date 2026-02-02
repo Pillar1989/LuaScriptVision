@@ -22,7 +22,7 @@ public:
         int width = 0;
         int height = 0;
         double fps = 30.0;
-        PixelFormat format = PixelFormat::BGR;
+        PixelFormat format = PixelFormat::UNKNOWN;
         int vpss_grp = -1;
         bool enable_infer = true;
     };

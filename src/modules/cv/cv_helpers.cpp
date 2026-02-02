@@ -29,6 +29,22 @@ void resize(Frame& frame, int width, int height) {
         throw std::invalid_argument("cv_helpers::resize - frame is empty");
     }
 #ifdef USE_CVI_MPI
+    // For CVI frames, check against VPSS MEM capacity
+    if (frame.storage_type() == Frame::StorageType::CVI) {
+        const uint32_t max_w = MmfContext::vpss_max_width_for_mem();
+        const uint32_t max_h = MmfContext::vpss_max_height_for_mem();
+        if (static_cast<uint32_t>(width) > max_w || static_cast<uint32_t>(height) > max_h) {
+            throw std::invalid_argument("cv_helpers::resize - exceeds VPSS capacity");
+        }
+    } else
+#endif
+    {
+        // For CPU frames, check against current size (upscale requires new allocation)
+        if (width > frame.width() || height > frame.height()) {
+            throw std::invalid_argument("cv_helpers::resize - upscale not allowed for CPU frames");
+        }
+    }
+#ifdef USE_CVI_MPI
     if (frame.storage_type() == Frame::StorageType::CVI) {
         try {
             get_vpss_processor().resize(frame, width, height);

@@ -575,7 +575,10 @@ CviCamera::CviCamera() : config_(Config{}) {}
 CviCamera::CviCamera(const Config& config) : config_(config) {}
 
 CviCamera::~CviCamera() {
-    release();
+    // NOTE: release() is NOT called here by design.
+    // The caller (e.g., ParallelPipeline) is responsible for calling release()
+    // before destruction. This avoids double-cleanup when the caller already
+    // manages the resource lifecycle explicitly.
 }
 
 bool CviCamera::open() {
@@ -710,6 +713,9 @@ bool CviCamera::read_internal(Frame& frame, int timeout_ms, bool log_error) {
 }
 
 void CviCamera::release() {
+    if (!opened_) {
+        return;
+    }
     cleanup();
 }
 
@@ -1436,6 +1442,18 @@ bool CviCamera::bind_vi_vpss() {
 }
 
 void CviCamera::cleanup() {
+    // CRITICAL: Stop ISP thread first by calling CVI_ISP_Exit()
+    // This signals the thread to return from CVI_ISP_Run()
+    if (isp_thread_running_ || isp_inited_) {
+        CVI_ISP_Exit(vi_pipe_);
+        if (isp_thread_running_) {
+            pthread_join(isp_thread_, nullptr);
+            isp_thread_running_ = false;
+        }
+        isp_inited_ = false;
+    }
+
+    // Now safe to cleanup other resources
     if (vi_vpss_bound_) {
         MMF_CHN_S src{};
         src.enModId = CVI_ID_VI;
@@ -1489,15 +1507,24 @@ void CviCamera::cleanup() {
         vi_chn_enabled_ = false;
     }
 
-    if (isp_thread_running_ || isp_inited_) {
-        CVI_ISP_Exit(vi_pipe_);
-        if (isp_thread_running_) {
-            pthread_join(isp_thread_, nullptr);
-            isp_thread_running_ = false;
-        }
-        isp_inited_ = false;
+    if (vi_pipe_started_) {
+        CVI_VI_StopPipe(vi_pipe_);
+        vi_pipe_started_ = false;
+    }
+    if (vi_pipe_created_) {
+        CVI_VI_DestroyPipe(vi_pipe_);
+        vi_pipe_created_ = false;
+    }
+    if (vi_dev_enabled_) {
+        CVI_VI_DisableDev(vi_dev_);
+        vi_dev_enabled_ = false;
+    }
+    if (vi_opened_) {
+        CVI_SYS_VI_Close();
+        vi_opened_ = false;
     }
 
+    // Unregister 3A libraries after VI is closed
     if (sensor_callbacks_registered_ && sensor_profile_ && sensor_profile_->sns_obj &&
         sensor_profile_->sns_obj->pfnUnRegisterCallback) {
         ALG_LIB_S ae_lib{};
@@ -1523,23 +1550,6 @@ void CviCamera::cleanup() {
         std::snprintf(awb_lib.acLibName, sizeof(awb_lib.acLibName), "%s", CVI_AWB_LIB_NAME);
         CVI_AWB_UnRegister(vi_pipe_, &awb_lib);
         awb_registered_ = false;
-    }
-
-    if (vi_pipe_started_) {
-        CVI_VI_StopPipe(vi_pipe_);
-        vi_pipe_started_ = false;
-    }
-    if (vi_pipe_created_) {
-        CVI_VI_DestroyPipe(vi_pipe_);
-        vi_pipe_created_ = false;
-    }
-    if (vi_dev_enabled_) {
-        CVI_VI_DisableDev(vi_dev_);
-        vi_dev_enabled_ = false;
-    }
-    if (vi_opened_) {
-        CVI_SYS_VI_Close();
-        vi_opened_ = false;
     }
 
     sensor_.cleanup();

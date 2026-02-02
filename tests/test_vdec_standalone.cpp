@@ -1,6 +1,10 @@
 /**
  * test_vdec_standalone.cpp - Standalone VDEC JPEG decoder test
  *
+ * NOTE: This test uses hardware VDEC decoder which requires VB pool.
+ * Disabled by default in favor of software JPEG decode.
+ * Define USE_VDEC_DECODE to enable hardware decode tests.
+ *
  * Completely mimics SDK sample_vdec initialization flow to isolate VDEC issues.
  * Does NOT use existing test_common.cpp infrastructure.
  */
@@ -16,7 +20,7 @@
 #include <unistd.h>
 #include <gtest/gtest.h>
 
-#ifdef USE_CVI_MPI
+#if defined(USE_CVI_MPI) && defined(USE_VDEC_DECODE)
 
 #include <linux/cvi_comm_video.h>
 #include <cvi_vb.h>
@@ -838,7 +842,11 @@ int main(int argc, char* argv[]) {
 #else
 
 TEST(VdecStandaloneTest, Skipped) {
+#ifndef USE_CVI_MPI
     GTEST_SKIP() << "USE_CVI_MPI not defined";
+#else
+    GTEST_SKIP() << "USE_VDEC_DECODE not defined (using software JPEG decode)";
+#endif
 }
 
 int main(int argc, char* argv[]) {

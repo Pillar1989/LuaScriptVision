@@ -1,4 +1,4 @@
-#include "pipeline.h"
+#include "cvi_pipeline.h"
 
 #if defined(USE_CVI_TPU) && defined(USE_CVI_MPI)
 

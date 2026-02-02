@@ -77,6 +77,10 @@ set(TPU_LIB_DIR "${TPU_SDK_ROOT}/lib")
 set(CVI_MPI_INCLUDE_DIR "${SG200X_SDK_PATH}/cvi_mpi/include")
 set(CVI_MPI_LIB_DIR "${SG200X_SDK_PATH}/cvi_mpi/lib")
 
+# CVI RTSP paths
+set(CVI_RTSP_INCLUDE_DIR "${SG200X_SDK_PATH}/cvi_rtsp/install/include")
+set(CVI_RTSP_LIB_DIR "${SG200X_SDK_PATH}/cvi_rtsp/install/lib")
+
 # ISP include paths (use cv181x for SG2002/CV181X/CV182X)
 set(CVI_ISP_INCLUDE_DIR "${SG200X_SDK_PATH}/cvi_mpi/include/isp/cv181x")
 
@@ -84,6 +88,8 @@ message(STATUS "TPU SDK include: ${TPU_INCLUDE_DIR}")
 message(STATUS "TPU SDK lib: ${TPU_LIB_DIR}")
 message(STATUS "CVI MPI include: ${CVI_MPI_INCLUDE_DIR}")
 message(STATUS "CVI MPI lib: ${CVI_MPI_LIB_DIR}")
+message(STATUS "CVI RTSP include: ${CVI_RTSP_INCLUDE_DIR}")
+message(STATUS "CVI RTSP lib: ${CVI_RTSP_LIB_DIR}")
 
 # =============================================================================
 # Search Paths Configuration

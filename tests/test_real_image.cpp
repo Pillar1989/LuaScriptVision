@@ -12,6 +12,9 @@ TEST(RealImageTest, LoadAndProcess) {
 
     cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
     ASSERT_FALSE(img.empty()) << "Image not found or invalid: " << image_path;
+    if (img.cols < 640 || img.rows < 640) {
+        GTEST_SKIP() << "Image smaller than 640x640 (upscale not allowed)";
+    }
 
     Frame frame(img.clone());
     cv_helpers::resize(frame, 640, 640);
@@ -29,6 +32,9 @@ TEST(RealImageTest, PreprocessPipeline) {
 
     cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
     ASSERT_FALSE(img.empty()) << "Image not found or invalid: " << image_path;
+    if (img.cols < 640 || img.rows < 640) {
+        GTEST_SKIP() << "Image smaller than 640x640 (upscale not allowed)";
+    }
 
     Frame frame(img.clone());
     cv_helpers::resize(frame, 640, 640);
@@ -46,6 +52,9 @@ TEST(RealImageTest, ToTensor) {
 
     cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
     ASSERT_FALSE(img.empty()) << "Image not found or invalid: " << image_path;
+    if (img.cols < 640 || img.rows < 640) {
+        GTEST_SKIP() << "Image smaller than 640x640 (upscale not allowed)";
+    }
 
     Frame frame(img.clone());
     cv_helpers::resize(frame, 640, 640);
@@ -91,6 +100,9 @@ TEST(RealImageTest, InferencePreparation) {
 
     cv::Mat img = cv::imread(image_path, cv::IMREAD_COLOR);
     ASSERT_FALSE(img.empty()) << "Image not found or invalid: " << image_path;
+    if (img.cols < 640 || img.rows < 640) {
+        GTEST_SKIP() << "Image smaller than 640x640 (upscale not allowed)";
+    }
 
     Frame frame(img.clone());
     cv_helpers::resize(frame, 640, 640);

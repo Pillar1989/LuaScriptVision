@@ -105,7 +105,10 @@ CviVpssProcessor::CviVpssProcessor() {
 
 CviVpssProcessor::~CviVpssProcessor() {
 #ifdef USE_CVI_MPI
-    destroy_group();
+    // Only destroy group if it was created and not already destroyed
+    if (group_created_) {
+        destroy_group();
+    }
 #endif
 }
 
@@ -119,8 +122,13 @@ void CviVpssProcessor::resize(Frame& frame, int width, int height) {
         throw std::invalid_argument("CviVpssProcessor::resize - invalid dimensions");
     }
 
-    const int ori_w = frame.width();
-    const int ori_h = frame.height();
+    // Check against VPSS MEM group capacity, not current frame size
+    // This allows upscaling within VPSS hardware limits and available VB pools
+    const uint32_t max_w = MmfContext::vpss_max_width_for_mem();
+    const uint32_t max_h = MmfContext::vpss_max_height_for_mem();
+    if (static_cast<uint32_t>(width) > max_w || static_cast<uint32_t>(height) > max_h) {
+        throw std::invalid_argument("CviVpssProcessor::resize - exceeds VPSS MEM capacity");
+    }
 
     PixelFormat input_format = frame.pixel_format();
     if (input_format == PixelFormat::UNKNOWN) {

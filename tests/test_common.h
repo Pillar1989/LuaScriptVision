@@ -33,6 +33,7 @@
 
 #ifdef USE_CVI_MPI
 #include "cv/cvi_vpss_processor.h"
+#include "cv/hw_jpeg_decoder.h"
 #include <cvi_sys.h>
 #include <cvi_vb.h>
 #endif
@@ -47,6 +48,20 @@ struct TestConfig {
 
 void set_test_image_path(const std::string& path);
 const std::string& test_image_path();
+
+// ============================================================
+// JPEG Decoding Helpers
+// ============================================================
+
+// Software JPEG decode (using OpenCV)
+inline cv::Mat decode_jpeg_software(const std::string& path) {
+    return cv::imread(path, cv::IMREAD_COLOR);
+}
+
+inline cv::Mat decode_jpeg_software(const uint8_t* data, size_t size) {
+    std::vector<uint8_t> buf(data, data + size);
+    return cv::imdecode(buf, cv::IMREAD_COLOR);
+}
 
 // ============================================================
 // Performance Measurement
@@ -92,6 +107,33 @@ void cleanup_cvi_system();
 VB_POOL find_suitable_vb_pool(uint32_t width, uint32_t height, PIXEL_FORMAT_E fmt);
 bool is_cvi_ready();
 void register_cvi_environment();
+
+class VdecFrameGuard {
+public:
+    VdecFrameGuard(HwJpegDecoder* decoder, const VIDEO_FRAME_INFO_S& frame)
+        : decoder_(decoder), frame_(frame), released_(false) {}
+
+    ~VdecFrameGuard() {
+        release();
+    }
+
+    VdecFrameGuard(const VdecFrameGuard&) = delete;
+    VdecFrameGuard& operator=(const VdecFrameGuard&) = delete;
+
+    void release() {
+        if (!released_ && decoder_) {
+            decoder_->release_frame(frame_);
+            released_ = true;
+        }
+    }
+
+    const VIDEO_FRAME_INFO_S& get() const { return frame_; }
+
+private:
+    HwJpegDecoder* decoder_;
+    VIDEO_FRAME_INFO_S frame_;
+    bool released_;
+};
 
 class VbBlockGuard {
 public:

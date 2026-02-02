@@ -46,6 +46,8 @@ bool ParallelPipeline::start(InferenceCallback callback) {
     venc_config.fps = config_.stream_fps;
     venc_config.bitrate_kbps = config_.stream_bitrate_kbps;
     venc_config.gop = config_.stream_gop;
+    venc_config.quality = config_.stream_quality;
+    venc_config.ip_qp_delta = config_.stream_ip_qp_delta;
     venc_config.channel = 0;
 
     encoder_ = std::make_unique<VencEncoder>(venc_config);
@@ -94,6 +96,10 @@ bool ParallelPipeline::start(InferenceCallback callback) {
             break;
     }
 
+    // Audio config (PCM only)
+    rtsp_config.audio_codec = RtspServer::AudioCodec::PCM_L16;
+    rtsp_config.audio_sample_rate = config_.audio_sample_rate;
+
     rtsp_ = std::make_unique<RtspServer>(rtsp_config);
     if (!rtsp_->start()) {
         std::cerr << "[ParallelPipeline] Failed to start RTSP server" << std::endl;
@@ -102,6 +108,23 @@ bool ParallelPipeline::start(InferenceCallback callback) {
         encoder_->shutdown();
         encoder_.reset();
         return false;
+    }
+
+    // Step 5: Initialize audio capture if enabled
+    if (config_.enable_audio) {
+        AudioCapture::Config audio_config;
+        audio_config.device = config_.audio_device;
+        audio_config.sample_rate = config_.audio_sample_rate;
+        audio_config.channels = config_.audio_channels;
+        audio_config.bit_width = config_.audio_bit_width;
+        audio_config.volume = config_.audio_volume;
+
+        audio_capture_ = std::make_unique<AudioCapture>(audio_config);
+        if (!audio_capture_->start()) {
+            std::cerr << "[ParallelPipeline] Failed to start audio capture" << std::endl;
+            stop();  // Cleanup RTSP, camera, encoder
+            return false;
+        }
     }
 
     stop_requested_.store(false);
@@ -125,6 +148,11 @@ bool ParallelPipeline::start(InferenceCallback callback) {
 
     stream_thread_ = std::thread(&ParallelPipeline::stream_thread_func, this);
     infer_thread_ = std::thread(&ParallelPipeline::infer_thread_func, this);
+
+    // Start audio thread if enabled
+    if (config_.enable_audio && audio_capture_) {
+        audio_thread_ = std::thread(&ParallelPipeline::audio_thread_func, this);
+    }
 
     return true;
 }
@@ -151,12 +179,21 @@ void ParallelPipeline::stop() {
         encoder_.reset();
     }
 
-    // Step 3: Now threads can exit cleanly
+    // Step 3: Stop audio capture BEFORE joining audio thread
+    if (audio_capture_) {
+        audio_capture_->stop();
+        audio_capture_.reset();
+    }
+
+    // Step 4: Now threads can exit cleanly
     if (stream_thread_.joinable()) {
         stream_thread_.join();
     }
     if (infer_thread_.joinable()) {
         infer_thread_.join();
+    }
+    if (audio_thread_.joinable()) {
+        audio_thread_.join();
     }
 
     if (camera_) {
@@ -275,6 +312,51 @@ std::string ParallelPipeline::get_rtsp_url() const {
 ParallelPipeline::Stats ParallelPipeline::get_stats() const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     return stats_;
+}
+
+void ParallelPipeline::audio_thread_func() {
+    uint64_t frame_count = 0;
+    uint64_t start_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    std::cout << "[ParallelPipeline] Audio thread started" << std::endl;
+
+    while (!stop_requested_.load()) {
+        if (!audio_capture_) {
+            break;
+        }
+
+        AudioCapture::AudioFrame audio_frame;
+        if (audio_capture_->get_frame(&audio_frame, 50)) {
+            // Check stop again before using rtsp_ (might be reset during shutdown)
+            if (stop_requested_.load()) {
+                break;
+            }
+
+            // Send audio to RTSP
+            if (rtsp_) {
+                rtsp_->send_audio(audio_frame.data.data(), audio_frame.data.size(), audio_frame.pts);
+            }
+
+            frame_count++;
+
+            // Update stats
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                stats_.audio_frames = frame_count;
+                stats_.audio_pts = audio_frame.pts;
+
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                double elapsed_sec = (now_ms - start_time_ms) / 1000.0;
+                if (elapsed_sec > 0) {
+                    stats_.audio_fps = frame_count / elapsed_sec;
+                }
+            }
+        }
+    }
+
+    std::cout << "[ParallelPipeline] Audio thread exiting, frames=" << frame_count << std::endl;
 }
 
 #endif

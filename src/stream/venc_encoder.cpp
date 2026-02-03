@@ -143,7 +143,7 @@ bool VencEncoder::init_h264() {
     chn_attr.stRcAttr.stH264Cbr.bVariFpsEn = CVI_FALSE;
 
     chn_attr.stGopAttr.enGopMode = VENC_GOPMODE_NORMALP;
-    chn_attr.stGopAttr.stNormalP.s32IPQpDelta = 2;
+    chn_attr.stGopAttr.stNormalP.s32IPQpDelta = config_.ip_qp_delta;
 
     CVI_S32 rc = CVI_VENC_CreateChn(config_.channel, &chn_attr);
     if (rc != CVI_SUCCESS) {
@@ -185,7 +185,7 @@ bool VencEncoder::init_h265() {
     chn_attr.stRcAttr.stH265Cbr.bVariFpsEn = CVI_FALSE;
 
     chn_attr.stGopAttr.enGopMode = VENC_GOPMODE_NORMALP;
-    chn_attr.stGopAttr.stNormalP.s32IPQpDelta = 2;
+    chn_attr.stGopAttr.stNormalP.s32IPQpDelta = config_.ip_qp_delta;
 
     CVI_S32 rc = CVI_VENC_CreateChn(config_.channel, &chn_attr);
     if (rc != CVI_SUCCESS) {

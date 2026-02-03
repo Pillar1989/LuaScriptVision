@@ -151,6 +151,14 @@ if(NOT USE_ONNX_RUNTIME)
 
     set(OpenCV_INCLUDE_DIRS ${_fixed_opencv_includes})
     message(STATUS "Corrected OpenCV includes: ${OpenCV_INCLUDE_DIRS}")
+
+    # ALSA is a runtime library on the device (-lasound)
+    # Headers and libraries are in buildroot host sysroot (same as sscma-example)
+    set(ALSA_SYSROOT "${SG200X_SDK_PATH}/buildroot-2021.05/output/cvitek_CV181X_musl_riscv64/host/riscv64-buildroot-linux-musl/sysroot")
+    set(ALSA_INCLUDE_DIR "${ALSA_SYSROOT}/usr/include")
+    set(ALSA_LIB_DIR "${ALSA_SYSROOT}/usr/lib")
+    message(STATUS "ALSA audio capture: enabled (runtime library)")
+    message(STATUS "ALSA sysroot: ${ALSA_SYSROOT}")
 endif()
 
 # ONNX Runtime (only on x86_64/ARM platforms)
@@ -243,6 +251,12 @@ target_link_libraries(lua_runner PRIVATE
     ${OpenCV_LIBS}
 )
 
+# ALSA for audio capture (SG200X only) - runtime library
+# NOTE: Must use dynamic linking even in static build (no libasound.a available)
+if(NOT USE_ONNX_RUNTIME)
+    target_link_libraries(lua_runner PRIVATE "-Wl,-Bdynamic" asound "-Wl,-Bstatic")
+endif()
+
 # Lua linking: for static builds, lua must be linked after -static flag
 # For dynamic builds (ONNX), link normally
 if(USE_ONNX_RUNTIME)
@@ -278,11 +292,13 @@ if(NOT USE_ONNX_RUNTIME)
         ${TPU_INCLUDE_DIR}
         ${CVI_MPI_INCLUDE_DIR}
         ${CVI_RTSP_INCLUDE_DIR}
+        ${ALSA_INCLUDE_DIR}
     )
     target_link_directories(lua_runner PRIVATE
         ${TPU_LIB_DIR}
         ${CVI_MPI_LIB_DIR}
         ${CVI_RTSP_LIB_DIR}
+        ${ALSA_LIB_DIR}
     )
 
     # Base libraries (always needed for TPU/VPSS)
@@ -1082,6 +1098,7 @@ if(NOT USE_ONNX_RUNTIME)
             src/pipeline/parallel_pipeline.cpp
             src/stream/rtsp_server.cpp
             src/stream/venc_encoder.cpp
+            src/stream/audio_capture.cpp
             src/modules/cv/mmf_context.cpp
             src/modules/cv/cv_types.cpp
             src/modules/cv/cvi_camera.cpp
@@ -1101,6 +1118,7 @@ if(NOT USE_ONNX_RUNTIME)
             ${CVI_MPI_INCLUDE_DIR}
             ${CVI_ISP_INCLUDE_DIR}
             ${CVI_RTSP_INCLUDE_DIR}
+            ${ALSA_INCLUDE_DIR}
             ${OpenCV_INCLUDE_DIRS}
         )
 
@@ -1108,6 +1126,7 @@ if(NOT USE_ONNX_RUNTIME)
             ${TPU_LIB_DIR}
             ${CVI_MPI_LIB_DIR}
             ${CVI_RTSP_LIB_DIR}
+            ${ALSA_LIB_DIR}
         )
 
         target_link_libraries(test_parallel_pipeline PRIVATE
@@ -1136,6 +1155,7 @@ if(NOT USE_ONNX_RUNTIME)
             ${CVI_MPI_LIB_DIR}/libvo.a
             -Wl,--end-group
             cvi_rtsp
+            asound
             z
             m
             pthread
@@ -1219,12 +1239,14 @@ if(NOT USE_ONNX_RUNTIME AND ENABLE_CVI_CAMERA)
         ${CVI_MPI_INCLUDE_DIR}
         ${CVI_ISP_INCLUDE_DIR}
         ${CVI_RTSP_INCLUDE_DIR}
+        ${ALSA_INCLUDE_DIR}
     )
 
     target_link_directories(parallel_infer_stream PRIVATE
         ${TPU_LIB_DIR}
         ${CVI_MPI_LIB_DIR}
         ${CVI_RTSP_LIB_DIR}
+        ${ALSA_LIB_DIR}
     )
 
     target_link_libraries(parallel_infer_stream PRIVATE
@@ -1254,6 +1276,7 @@ if(NOT USE_ONNX_RUNTIME AND ENABLE_CVI_CAMERA)
         ${CVI_MPI_LIB_DIR}/libvo.a
         -Wl,--end-group
         cvi_rtsp
+        asound
         z
         m
         pthread

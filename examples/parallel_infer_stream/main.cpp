@@ -47,25 +47,31 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
 struct AppConfig {
     std::string script_path;
     std::string model_path;
+    std::string input = "camera";  // "camera" or image path
     int rtsp_port = 554;
     lua_cv::VencEncoder::CodecType codec = lua_cv::VencEncoder::CodecType::H264;
     int duration_sec = 0;  // 0 = run until Ctrl+C
     int stream_fps = 30;
-    int stream_bitrate_kbps = 2000;
+    int stream_bitrate_kbps = 4000;  // Increased from 2000 for better quality
 };
 
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog
               << " <script.lua> <model.cvimodel> [options]\n"
               << "\nOptions:\n"
+              << "  --input SOURCE       Input source: 'camera' or image path (default: camera)\n"
               << "  --rtsp-port PORT     RTSP server port (default: 554)\n"
               << "  --codec h264|h265    Video codec (default: h264)\n"
               << "  --duration SECONDS   Run duration, 0=infinite (default: 0)\n"
               << "  --fps FPS            Stream FPS (default: 30)\n"
-              << "  --bitrate KBPS       Stream bitrate in kbps (default: 2000)\n"
-              << "\nExample:\n"
+              << "  --bitrate KBPS       Stream bitrate in kbps (default: 4000)\n"
+              << "\nExamples:\n"
               << "  " << prog << " scripts/yolo11_detector.lua "
-              << "/userdata/Models/yolo11n.cvimodel --rtsp-port 8554\n";
+              << "/userdata/Models/yolo11n.cvimodel --rtsp-port 8554\n"
+              << "  " << prog << " scripts/yolo11_detector.lua "
+              << "/userdata/Models/yolo11n.cvimodel --input /tmp/image.jpg\n"
+              << "  " << prog << " scripts/yolo11_detector.lua "
+              << "/userdata/Models/yolo11n.cvimodel --bitrate 8000\n";
 }
 
 bool parse_args(int argc, char* argv[], AppConfig* config) {
@@ -79,7 +85,9 @@ bool parse_args(int argc, char* argv[], AppConfig* config) {
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--rtsp-port" && i + 1 < argc) {
+        if (arg == "--input" && i + 1 < argc) {
+            config->input = argv[++i];
+        } else if (arg == "--rtsp-port" && i + 1 < argc) {
             config->rtsp_port = std::atoi(argv[++i]);
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec_str = argv[++i];
@@ -236,7 +244,43 @@ int main(int argc, char* argv[]) {
               << " letterbox=" << (ctx.letterbox_enabled ? "yes" : "no")
               << " pad=" << static_cast<int>(ctx.pad_value) << "\n";
 
-    // 6. Configure and start ParallelPipeline
+    // 6. Check input type and choose pipeline
+    bool is_camera_mode = (config.input == "camera");
+
+    if (!is_camera_mode) {
+        // Image mode: use CviPipeline
+        std::cout << "[App] Image mode: " << config.input << "\n";
+
+        pipeline::CviPipeline pipeline;
+        pipeline.init(config.model_path, L, postprocess, preprocess_config_lua);
+
+        auto result = pipeline.run_image(config.input);
+
+        std::cout << "\n=== Timings ===\n"
+                  << "  Input: " << result.timings.input_ms << " ms\n"
+                  << "  Preprocess: " << result.timings.preprocess_ms << " ms\n"
+                  << "  Inference: " << result.timings.inference_ms << " ms\n"
+                  << "  Postprocess: " << result.timings.postprocess_ms << " ms\n"
+                  << "  Total: " << result.timings.total_ms << " ms\n";
+
+        // Cleanup
+        ctx.postprocess = LuaIntf::LuaRef();
+        ctx.preprocess_config = LuaIntf::LuaRef();
+        ctx.session.reset();
+        ctx.L = nullptr;
+        lua_close(L);
+        lua_cv::MmfContext::instance().shutdown();
+        ctx.vpss_processor.destroy_group();
+
+        std::cout << "[App] Done" << std::endl;
+        std::_Exit(0);
+        return 0;
+    }
+
+    // Camera mode: use ParallelPipeline
+    std::cout << "[App] Camera mode with streaming\n";
+
+    // 7. Configure and start ParallelPipeline
     lua_cv::ParallelPipeline::Config pipe_config;
     pipe_config.stream_fps = config.stream_fps;
     pipe_config.stream_bitrate_kbps = config.stream_bitrate_kbps;

@@ -24,7 +24,48 @@ make
 
 # Rebuild after changes
 cd build && make -j8
+
+# JPEG Decode Method Selection
+# Default: Software decode (OpenCV, no VB pool dependency)
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-sg200x.cmake -B build
+
+# Optional: Hardware VDEC decode (requires VB pool, may cause resource conflicts)
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-sg200x.cmake -DUSE_VDEC_DECODE=ON -B build
 ```
+
+### JPEG Decode Options
+
+LuaScriptVision supports two JPEG decoding methods:
+
+**Software Decode (Default, Recommended)**:
+- Uses OpenCV for JPEG decoding
+- No VB pool dependency
+- Avoids VDEC resource conflicts
+- Slightly slower decode (~5-10ms extra per image)
+- **Best for**: Testing, development, and most production scenarios
+
+**Hardware VDEC Decode (Optional)**:
+- Uses Sophgo VDEC hardware decoder
+- Requires VB pool allocation
+- May conflict with other video processing pipelines
+- Faster decode (~1-2ms per image)
+- **Best for**: High-throughput video processing with dedicated VB pool planning
+
+**How to switch**:
+```bash
+# Software decode (default)
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-sg200x.cmake -B build
+
+# Hardware decode
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-sg200x.cmake -DUSE_VDEC_DECODE=ON -B build
+```
+
+**Affected components**:
+- Test image loading in performance benchmarks
+- ImageSource class (image file input)
+- End-to-end pipeline tests
+
+**Note**: All Lua scripts and core inference functionality work identically with both methods. The only difference is JPEG decode performance and VB pool usage.
 
 ## Architecture Overview
 

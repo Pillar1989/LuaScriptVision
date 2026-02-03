@@ -28,8 +28,9 @@ public:
         uint32_t width = 1920;
         uint32_t height = 1080;
         uint32_t fps = 30;
-        uint32_t bitrate_kbps = 2000;
+        uint32_t bitrate_kbps = 4000;  // Increased from 2000 for better quality
         uint32_t gop = 30;
+        int32_t ip_qp_delta = -1;  // Added: I-frame QP delta (negative = higher quality I-frames)
         uint32_t quality = 80;
         VENC_CHN channel = 0;
     };

@@ -440,7 +440,10 @@ bool VencEncoder::get_stream(EncodedStream* stream, int timeout_ms) {
     if (rc != CVI_SUCCESS) {
         current_stream_.pstPack = nullptr;
         current_packs_.clear();
-        if (rc != CVI_ERR_VENC_BUF_EMPTY) {
+        if (rc != CVI_ERR_VENC_BUF_EMPTY &&
+            rc != CVI_ERR_VENC_BUSY &&
+            rc != CVI_ERR_VENC_EMPTY_STREAM_FRAME &&
+            rc != CVI_ERR_VENC_EMPTY_PACK) {
             std::cerr << "[VENC] CVI_VENC_GetStream failed: rc=" << rc
                       << " channel=" << config_.channel << std::endl;
         }

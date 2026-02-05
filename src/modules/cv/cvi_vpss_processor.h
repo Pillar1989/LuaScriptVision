@@ -31,6 +31,13 @@ public:
     void letterbox(Frame& frame, int width, int height, uint8_t pad_value,
                    LetterboxMeta* meta = nullptr,
                    PixelFormat output_format = PixelFormat::RGB_PLANAR);
+
+    // Combined crop and resize in single VPSS pass (for ROI inference)
+    void crop_resize(Frame& frame,
+                     int crop_x, int crop_y, int crop_w, int crop_h,
+                     int out_width, int out_height,
+                     PixelFormat output_format = PixelFormat::RGB);
+
     int last_error() const;
 
 #ifdef USE_CVI_MPI

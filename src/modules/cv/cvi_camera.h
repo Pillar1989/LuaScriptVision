@@ -49,6 +49,9 @@ public:
     int last_error() const;
 
     const char* get_sensor_name() const;
+    int vpss_group() const { return static_cast<int>(vpss_grp_); }
+    int vpss_stream_channel() const { return static_cast<int>(vpss_stream_chn_); }
+    int vpss_infer_channel() const { return static_cast<int>(vpss_chn_); }
 
 private:
     bool read_internal(Frame& frame, int timeout_ms, bool log_error);

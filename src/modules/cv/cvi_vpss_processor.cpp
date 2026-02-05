@@ -241,6 +241,57 @@ void CviVpssProcessor::crop(Frame& frame, int x, int y, int w, int h) {
 #endif
 }
 
+void CviVpssProcessor::crop_resize(Frame& frame,
+                                    int crop_x, int crop_y, int crop_w, int crop_h,
+                                    int out_width, int out_height,
+                                    PixelFormat output_format) {
+#ifdef USE_CVI_MPI
+    last_error_ = CVI_SUCCESS;
+    if (frame.empty()) {
+        throw std::invalid_argument("CviVpssProcessor::crop_resize - frame is empty");
+    }
+    if (crop_x < 0 || crop_y < 0 || crop_w <= 0 || crop_h <= 0 ||
+        crop_x + crop_w > frame.width() || crop_y + crop_h > frame.height()) {
+        throw std::invalid_argument("CviVpssProcessor::crop_resize - invalid crop region");
+    }
+    if (out_width <= 0 || out_height <= 0) {
+        throw std::invalid_argument("CviVpssProcessor::crop_resize - invalid output dimensions");
+    }
+
+    // Check against VPSS MEM group capacity
+    const uint32_t max_w = MmfContext::vpss_max_width_for_mem();
+    const uint32_t max_h = MmfContext::vpss_max_height_for_mem();
+    if (static_cast<uint32_t>(out_width) > max_w || static_cast<uint32_t>(out_height) > max_h) {
+        throw std::invalid_argument("CviVpssProcessor::crop_resize - output exceeds VPSS MEM capacity");
+    }
+
+    PixelFormat input_format = frame.pixel_format();
+    if (input_format == PixelFormat::UNKNOWN) {
+        input_format = PixelFormat::BGR;
+    }
+
+    // Use default output format if not specified
+    if (output_format == PixelFormat::UNKNOWN) {
+        output_format = PixelFormat::RGB;
+    }
+
+    // Combined crop + resize in single VPSS pass
+    process_frame(frame,
+                  static_cast<uint32_t>(out_width), static_cast<uint32_t>(out_height),
+                  output_format, true, crop_x, crop_y, crop_w, crop_h, false, 0);
+#else
+    (void)frame;
+    (void)crop_x;
+    (void)crop_y;
+    (void)crop_w;
+    (void)crop_h;
+    (void)out_width;
+    (void)out_height;
+    (void)output_format;
+    throw std::runtime_error("CviVpssProcessor requires USE_CVI_MPI");
+#endif
+}
+
 void CviVpssProcessor::letterbox(Frame& frame, int width, int height, uint8_t pad_value,
                                  LetterboxMeta* meta, PixelFormat output_format) {
 #ifdef USE_CVI_MPI

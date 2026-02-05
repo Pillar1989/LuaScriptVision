@@ -60,6 +60,11 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3 -DNDEBUG -flto")
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE_INIT "-flto")
 set(CMAKE_SHARED_LINKER_FLAGS_RELEASE_INIT "-flto")
 
+# Ensure musl dynamic linker path matches SG200X rootfs (/lib/ld-musl-riscv64.so.1)
+# libgcc_s is not available in the musl toolchain, so link libgcc statically.
+set(CMAKE_EXE_LINKER_FLAGS "-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 -static-libgcc"
+    CACHE STRING "SG200X musl dynamic linker" FORCE)
+
 # Default to Release unless explicitly specified
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

@@ -39,6 +39,7 @@ public:
     bool open() override;
     bool read(Frame& frame) override;
     bool read(Frame& frame, int timeout_ms);
+    bool read(Frame& frame, int timeout_ms, bool log_error);
     bool wait_for_ready(int timeout_ms);
     void release() override;
 

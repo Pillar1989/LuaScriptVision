@@ -91,15 +91,7 @@ int CameraNode::onStart() {
 }
 
 int CameraNode::onStop() {
-    if (!running_.load(std::memory_order_acquire)) {
-        return MA_OK;
-    }
-
-    running_.store(false, std::memory_order_release);
-
-    if (capture_thread_.joinable()) {
-        capture_thread_.join();
-    }
+    stopCapture();
 
 #ifdef USE_CVI_CAMERA
     if (camera_) {
@@ -108,6 +100,13 @@ int CameraNode::onStop() {
 #endif
 
     return MA_OK;
+}
+
+void CameraNode::stopCapture() {
+    bool was_running = running_.exchange(false, std::memory_order_acq_rel);
+    if (was_running && capture_thread_.joinable()) {
+        capture_thread_.join();
+    }
 }
 
 int CameraNode::onDestroy() {
@@ -196,14 +195,24 @@ void CameraNode::captureLoop() {
 #ifdef USE_CVI_CAMERA
         lua_cv::Frame frame;
 
-        // Read frame from camera
-        if (!camera_ || !camera_->read(frame, 100)) {
+        bool log_error = (skip_state_.camera_nobuf_streak == 0);
+        if (!camera_ || !camera_->read(frame, 100, log_error)) {
             nobuf_count_.fetch_add(1, std::memory_order_relaxed);
 
             // Handle NOBUF backoff
             skip_state_.camera_nobuf_streak++;
             if (skip_state_.camera_nobuf_streak >= computeNobufThreshold()) {
                 applyExponentialBackoff();
+                if (!running_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (skip_state_.next_infer_time > now) {
+                    auto cooldown = skip_state_.next_infer_time - now;
+                    if (cooldown > std::chrono::milliseconds(1)) {
+                        std::this_thread::sleep_for(cooldown);
+                    }
+                }
             }
             continue;
         }

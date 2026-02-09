@@ -324,7 +324,19 @@ int ModelNode::onCreate(const nlohmann::json& config) {
         }
     }
 
-    // 2. Create independent Lua State
+    // 2. Set LUA_PATH from script directory if not already set
+    const char* existing_lua_path = std::getenv("LUA_PATH");
+    if (!existing_lua_path) {
+        // Extract directory from script path and set LUA_PATH
+        size_t last_slash = script_path_.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            std::string script_dir = script_path_.substr(0, last_slash);
+            std::string lua_path = script_dir + "/?.lua;" + script_dir + "/?/init.lua;;";
+            setenv("LUA_PATH", lua_path.c_str(), 1);
+        }
+    }
+
+    // 3. Create independent Lua State
     L_ = luaL_newstate();
     if (!L_) {
         event("error", MA_ENOMEM, {{"message", "Failed to create Lua state"}});
@@ -840,7 +852,8 @@ nlohmann::json ModelNode::runFullFrameInference(const lua_cv::Frame& frame,
         {"upstream", upstream},
         {"threshold", conf_threshold_},
         {"frame_width", frame.width()},
-        {"frame_height", frame.height()}
+        {"frame_height", frame.height()},
+        {"output_count", session_ ? session_->output_count() : 1}
     };
     fill_meta_json(preprocess_meta, &meta);
 

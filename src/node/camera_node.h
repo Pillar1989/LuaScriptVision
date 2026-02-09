@@ -44,6 +44,7 @@ public:
 
     // Downstream timing feedback (called by ModelNode)
     void report_proc_time(const std::string& node_id, double proc_ms);
+    void stopCapture();
 
     // Statistics
     uint64_t frame_count() const { return frame_count_.load(std::memory_order_relaxed); }

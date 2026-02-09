@@ -191,9 +191,9 @@ int main(int argc, char* argv[]) {
 
     node::NodeFactory& factory = node::NodeFactory::instance();
     auto shutdown = [&](bool stop_server) {
+        factory.stop("camera");
         factory.stop("detector");
         factory.stop("streamer");
-        factory.stop("camera");
         factory.destroyAll();
         if (stop_server && server) {
             server->stop();

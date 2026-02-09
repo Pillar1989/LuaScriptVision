@@ -219,6 +219,11 @@ int NodeFactory::stop(const std::string& id) {
     if (it == nodes_.end()) {
         return MA_ENOENT;
     }
+#ifdef USE_CVI_MPI
+    if (auto* camera = dynamic_cast<CameraNode*>(it->second.get())) {
+        camera->stopCapture();
+    }
+#endif
     return it->second->stop();
 }
 
@@ -237,6 +242,13 @@ void NodeFactory::destroyAll() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Stop and destroy all nodes
+#ifdef USE_CVI_MPI
+    for (auto& [id, node] : nodes_) {
+        if (auto* camera = dynamic_cast<CameraNode*>(node.get())) {
+            camera->stopCapture();
+        }
+    }
+#endif
     for (auto& [id, node] : nodes_) {
         node->destroy();
         ResourceEstimator::instance().on_node_stopped(id);

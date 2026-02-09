@@ -642,6 +642,10 @@ bool CviCamera::read(Frame& frame, int timeout_ms) {
     return read_internal(frame, timeout_ms, true);
 }
 
+bool CviCamera::read(Frame& frame, int timeout_ms, bool log_error) {
+    return read_internal(frame, timeout_ms, log_error);
+}
+
 bool CviCamera::wait_for_ready(int timeout_ms) {
     if (!opened_) {
         std::cerr << "[ERROR] CviCamera::wait_for_ready - camera not opened" << std::endl;

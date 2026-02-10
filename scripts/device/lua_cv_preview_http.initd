@@ -1,0 +1,101 @@
+#!/bin/sh
+
+NAME="lua_cv_preview_http"
+ROOT_DIR="${ROOT_DIR:-/userdata/lua_preview_web}"
+PORT="${PORT:-8000}"
+PID_FILE="/tmp/${NAME}.pid"
+LOG_FILE="/tmp/${NAME}.log"
+
+PYTHON_BIN=""
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+fi
+
+is_running() {
+    [ -f "${PID_FILE}" ] || return 1
+    PID="$(cat "${PID_FILE}" 2>/dev/null)"
+    [ -n "${PID}" ] || return 1
+    kill -0 "${PID}" 2>/dev/null
+}
+
+start_service() {
+    if [ -z "${PYTHON_BIN}" ]; then
+        echo "[${NAME}] python not found"
+        return 1
+    fi
+
+    if [ ! -f "${ROOT_DIR}/index.html" ]; then
+        echo "[${NAME}] missing ${ROOT_DIR}/index.html"
+        return 1
+    fi
+
+    if is_running; then
+        echo "[${NAME}] already running (pid=$(cat "${PID_FILE}"))"
+        return 0
+    fi
+
+    mkdir -p "${ROOT_DIR}"
+    nohup "${PYTHON_BIN}" -m http.server "${PORT}" --bind 0.0.0.0 --directory "${ROOT_DIR}" >"${LOG_FILE}" 2>&1 &
+    echo "$!" > "${PID_FILE}"
+    sleep 1
+
+    if is_running; then
+        echo "[${NAME}] started: http://0.0.0.0:${PORT}/index.html"
+        return 0
+    fi
+
+    echo "[${NAME}] failed to start"
+    rm -f "${PID_FILE}"
+    return 1
+}
+
+stop_service() {
+    if ! is_running; then
+        echo "[${NAME}] not running"
+        rm -f "${PID_FILE}"
+        return 0
+    fi
+
+    PID="$(cat "${PID_FILE}")"
+    kill "${PID}" 2>/dev/null || true
+    sleep 1
+
+    if kill -0 "${PID}" 2>/dev/null; then
+        kill -9 "${PID}" 2>/dev/null || true
+    fi
+
+    rm -f "${PID_FILE}"
+    echo "[${NAME}] stopped"
+    return 0
+}
+
+status_service() {
+    if is_running; then
+        echo "[${NAME}] running (pid=$(cat "${PID_FILE}"), port=${PORT}, root=${ROOT_DIR})"
+        return 0
+    fi
+    echo "[${NAME}] stopped"
+    return 1
+}
+
+case "$1" in
+    start|"")
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        stop_service
+        start_service
+        ;;
+    status)
+        status_service
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

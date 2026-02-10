@@ -1,0 +1,71 @@
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace lua_cv {
+
+class WebSocketTransport {
+public:
+    enum class PayloadType {
+        Binary,
+        Text,
+    };
+
+    struct Config {
+        int port = 8080;
+        std::string path = "/";
+        int max_clients = 8;
+        int poll_ms = 10;
+    };
+
+    explicit WebSocketTransport(const Config& config);
+    ~WebSocketTransport();
+
+    WebSocketTransport(const WebSocketTransport&) = delete;
+    WebSocketTransport& operator=(const WebSocketTransport&) = delete;
+    WebSocketTransport(WebSocketTransport&&) = delete;
+    WebSocketTransport& operator=(WebSocketTransport&&) = delete;
+
+    bool start();
+    void stop();
+    bool is_running() const { return running_.load(std::memory_order_acquire); }
+
+    bool broadcast_binary(const uint8_t* data, size_t length);
+    bool broadcast_text(const char* data, size_t length);
+
+    int client_count() const { return client_count_.load(std::memory_order_relaxed); }
+    const Config& config() const { return config_; }
+
+private:
+#ifdef USE_MONGOOSE_WS
+    struct BroadcastFrame {
+        PayloadType type = PayloadType::Binary;
+        std::vector<uint8_t> data;
+    };
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+#endif
+
+    bool enqueue_frame(PayloadType type, const uint8_t* data, size_t length);
+    void run_loop();
+
+    Config config_;
+    std::atomic<bool> running_{false};
+    std::atomic<int> client_count_{0};
+    std::thread io_thread_;
+
+#ifdef USE_MONGOOSE_WS
+    mutable std::mutex queue_mutex_;
+    std::vector<BroadcastFrame> queue_;
+#endif
+};
+
+}  // namespace lua_cv

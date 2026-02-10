@@ -179,6 +179,7 @@ add_executable(test_model_node
     src/node/node_server.cpp
     src/node/camera_node.cpp
     src/node/model_node.cpp
+    src/stream/websocket_transport.cpp
     src/node/executor.cpp
     src/node/resource_estimator.cpp
     ${TENSOR_SOURCES}
@@ -188,6 +189,10 @@ add_executable(test_model_node
     ${BINDING_SOURCES}
     ${INFERENCE_SOURCES}
 )
+
+if(EXISTS "${MONGOOSE_SOURCE}")
+    target_sources(test_model_node PRIVATE "${MONGOOSE_SOURCE}")
+endif()
 
 target_include_directories(test_model_node PRIVATE
     ${SRC_COMMON_INCLUDES}

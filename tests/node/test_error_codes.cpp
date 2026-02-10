@@ -12,6 +12,7 @@ TEST(ErrorCodes, Values) {
     EXPECT_EQ(MA_EBUSY, 16);
     EXPECT_EQ(MA_EEXIST, 17);
     EXPECT_EQ(MA_EINVAL, 22);
+    EXPECT_EQ(MA_ENOTSUP, 95);
 }
 
 TEST(ErrorCodes, SuccessCheck) {

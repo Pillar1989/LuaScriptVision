@@ -41,6 +41,20 @@ file(GLOB PIPELINE_SOURCES "${CMAKE_SOURCE_DIR}/src/pipeline/*.cpp")
 file(GLOB NODE_SOURCES "${CMAKE_SOURCE_DIR}/src/node/*.cpp")
 
 # =============================================================================
+# WebSocket Backend (Mongoose)
+# =============================================================================
+set(MONGOOSE_ROOT "${CMAKE_SOURCE_DIR}/third_party/mongoose")
+set(MONGOOSE_SOURCE "${MONGOOSE_ROOT}/mongoose.c")
+
+if(EXISTS "${MONGOOSE_SOURCE}")
+    list(APPEND STREAM_SOURCES "${MONGOOSE_SOURCE}")
+    add_compile_definitions(USE_MONGOOSE_WS)
+    message(STATUS "WebSocket backend: mongoose (${MONGOOSE_SOURCE})")
+else()
+    message(WARNING "Mongoose source not found, WebSocket support disabled")
+endif()
+
+# =============================================================================
 # T-Head RISC-V Optimized Sources
 # =============================================================================
 if(RV_THEAD_ENABLED)

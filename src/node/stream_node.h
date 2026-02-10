@@ -10,6 +10,7 @@
 namespace lua_cv {
 class VencEncoder;
 class RtspServer;
+class WebSocketTransport;
 }
 
 namespace node {
@@ -38,14 +39,20 @@ private:
         int ip_qp_delta = -1;
         int port = 554;
         std::string session = "live";
+        bool websocket = false;
+        int ws_port = 8080;
+        std::string ws_path = "/";
+        int ws_max_clients = 8;
     } config_;
 
     CameraNode* camera_node_ = nullptr;
     std::unique_ptr<lua_cv::VencEncoder> encoder_;
     std::unique_ptr<lua_cv::RtspServer> rtsp_;
+    std::unique_ptr<lua_cv::WebSocketTransport> ws_;
     std::thread encode_thread_;
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> stream_frames_{0};
+    std::atomic<uint64_t> ws_frames_{0};
 
     void encodeLoop();
     bool resolveStreamChannel(int* vpss_grp, int* vpss_chn) const;

@@ -15,6 +15,7 @@
 
 // Forward declarations
 namespace inference { class CviSession; }
+namespace lua_cv { class WebSocketTransport; }
 
 namespace node {
 
@@ -75,6 +76,12 @@ private:
     PreprocessConfig preprocess_config_;
     bool preprocess_config_explicit_ = false;
     bool profile_ = false;
+    bool websocket_ = true;
+    int ws_port_ = 8090;
+    std::string ws_path_ = "/";
+    int ws_max_clients_ = 8;
+    bool output_ = false;
+    bool debug_ = false;
 
     // TPU Session
     std::unique_ptr<inference::CviSession> session_;
@@ -82,6 +89,7 @@ private:
     // Inference thread
     std::thread infer_thread_;
     std::atomic<bool> running_{false};
+    std::unique_ptr<lua_cv::WebSocketTransport> ws_;
 
     // Upstream camera reference (for timing feedback)
     CameraNode* upstream_camera_ = nullptr;
@@ -89,6 +97,7 @@ private:
     // Statistics
     std::atomic<uint64_t> infer_count_{0};
     std::atomic<uint64_t> error_count_{0};
+    std::atomic<uint64_t> ws_event_count_{0};
     double infer_ema_ms_ = 0.0;
     static constexpr double kEmaAlpha = 0.2;
 };

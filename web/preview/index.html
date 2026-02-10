@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LuaScriptVision Camera Preview</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 12px; background: #101114; color: #e8edf2; font-family: Arial, sans-serif; }
+    .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+    .status { font-size: 13px; padding: 4px 8px; border-radius: 4px; background: #1a1d22; border: 1px solid #2a2f38; }
+    .ok { color: #4fdc7f; }
+    .bad { color: #ff7373; }
+    .controls { display: flex; gap: 14px; align-items: center; margin-bottom: 8px; font-size: 14px; flex-wrap: wrap; }
+    .wrap { position: relative; display: inline-block; border: 1px solid #2a2f38; background: #000; }
+    #player { display: block; max-width: min(100vw - 30px, 1280px); max-height: 72vh; background: #000; }
+    #overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
+    #resultLog { margin-top: 8px; padding: 10px; max-height: 18vh; overflow: auto; border: 1px solid #2a2f38; background: #16191f; font-size: 12px; }
+    #json { margin-top: 8px; padding: 10px; max-height: 24vh; overflow: auto; border: 1px solid #2a2f38; background: #16191f; font-size: 12px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <span class="status">Video WS <span id="videoEndpoint"></span>: <span id="videoState" class="bad">disconnected</span></span>
+    <span class="status">Infer WS <span id="inferEndpoint"></span>: <span id="inferState" class="bad">disconnected</span></span>
+    <span class="status">FPS: <span id="fps">0</span></span>
+    <span class="status">Boxes: <span id="boxCount">0</span></span>
+  </div>
+
+  <div class="controls">
+    <label><input type="checkbox" id="toggleInfer" checked /> Show inference overlay</label>
+    <label><input type="checkbox" id="toggleDeLetterbox" checked /> Auto de-letterbox coords</label>
+    <label><input type="checkbox" id="toggleResultLog" checked /> Show inference result log</label>
+    <label><input type="checkbox" id="toggleJson" checked /> Show inference JSON</label>
+  </div>
+
+  <div class="wrap">
+    <video id="player" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <pre id="resultLog"></pre>
+  <pre id="json"></pre>
+
+  <script>
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    }
+
+    async function ensureJmuxer() {
+      if (window.JMuxer) return;
+      try {
+        await loadScript('./jmuxer.min.js');
+      } catch (_) {}
+      if (window.JMuxer) return;
+      await loadScript('https://cdn.jsdelivr.net/npm/jmuxer@2.1.0/dist/jmuxer.min.js');
+    }
+
+    function normalizeBox(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+
+      let x = Number.NaN;
+      let y = Number.NaN;
+      let w = Number.NaN;
+      let h = Number.NaN;
+
+      if (Number.isFinite(raw.x) && Number.isFinite(raw.y) && Number.isFinite(raw.w) && Number.isFinite(raw.h)) {
+        x = Number(raw.x);
+        y = Number(raw.y);
+        w = Number(raw.w);
+        h = Number(raw.h);
+      } else if (Number.isFinite(raw.x1) && Number.isFinite(raw.y1) && Number.isFinite(raw.x2) && Number.isFinite(raw.y2)) {
+        x = Number(raw.x1);
+        y = Number(raw.y1);
+        w = Number(raw.x2) - Number(raw.x1);
+        h = Number(raw.y2) - Number(raw.y1);
+      } else if (Array.isArray(raw.bbox) && raw.bbox.length >= 4) {
+        x = Number(raw.bbox[0]);
+        y = Number(raw.bbox[1]);
+        w = Number(raw.bbox[2]);
+        h = Number(raw.bbox[3]);
+      }
+
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) {
+        return null;
+      }
+
+      if (w < 0) { x += w; w = -w; }
+      if (h < 0) { y += h; h = -h; }
+
+      return {
+        x,
+        y,
+        w,
+        h,
+        score: raw.score ?? raw.confidence ?? raw.conf ?? raw.prob,
+        class_id: raw.class_id ?? raw.classId ?? raw.cls ?? raw.category_id,
+        label: raw.label ?? raw.name ?? raw.class_name
+      };
+    }
+
+    function collectIndexedValues(payload) {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return [];
+      }
+      const keys = Object.keys(payload)
+        .filter(key => /^\d+$/.test(key))
+        .sort((a, b) => Number(a) - Number(b));
+      return keys.map(key => payload[key]);
+    }
+
+    function parseBoxes(payload) {
+      if (!payload) return [];
+
+      let candidates = [];
+      if (Array.isArray(payload)) {
+        candidates = payload;
+      } else if (typeof payload === 'object') {
+        if (Array.isArray(payload.boxes)) {
+          candidates = payload.boxes;
+        } else if (Array.isArray(payload.detections)) {
+          candidates = payload.detections;
+        } else if (Array.isArray(payload.objects)) {
+          candidates = payload.objects;
+        } else if (Array.isArray(payload.items)) {
+          const merged = [];
+          for (const item of payload.items) merged.push(...parseBoxes(item));
+          return merged;
+        } else if (payload.result !== undefined) {
+          return parseBoxes(payload.result);
+        } else if (payload.results !== undefined) {
+          return parseBoxes(payload.results);
+        } else if (payload.data !== undefined) {
+          return parseBoxes(payload.data);
+        } else {
+          candidates = collectIndexedValues(payload);
+        }
+      }
+
+      return candidates.map(normalizeBox).filter(Boolean);
+    }
+
+    function readInferData(message) {
+      if (message && typeof message === 'object' && message.data !== undefined) {
+        return message.data;
+      }
+      return message || {};
+    }
+
+    function formatBoxLine(box, index) {
+      const label = box.label || `cls${box.class_id !== undefined ? box.class_id : ''}`;
+      const score = box.score !== undefined ? ` ${(Number(box.score) * 100).toFixed(1)}%` : '';
+      const x = Math.round(Number(box.x) || 0);
+      const y = Math.round(Number(box.y) || 0);
+      const w = Math.round(Number(box.w) || 0);
+      const h = Math.round(Number(box.h) || 0);
+      return `  #${index + 1} ${label}${score} @ [x=${x}, y=${y}, w=${w}, h=${h}]`;
+    }
+
+    function clamp(value, minValue, maxValue) {
+      return Math.max(minValue, Math.min(maxValue, value));
+    }
+
+    function detectBoxMode(boxes, frameW, frameH) {
+      const width = Math.max(1, Number(frameW) || 1);
+      const height = Math.max(1, Number(frameH) || 1);
+
+      let xywhScore = 0;
+      let xyxyScore = 0;
+      let checked = 0;
+
+      for (const item of boxes) {
+        if (checked >= 24) break;
+        if (!item || typeof item !== 'object') continue;
+
+        const x = Number(item.x);
+        const y = Number(item.y);
+        const w = Number(item.w);
+        const h = Number(item.h);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) {
+          continue;
+        }
+
+        checked += 1;
+
+        if (w > 0 && h > 0) {
+          const x2 = x + w;
+          const y2 = y + h;
+          if (x >= -width * 0.2 && y >= -height * 0.2 && x2 <= width * 1.2 && y2 <= height * 1.2) {
+            xywhScore += 1;
+          }
+        }
+
+        if (w > x && h > y && w <= width * 1.2 && h <= height * 1.2) {
+          xyxyScore += 1;
+        }
+      }
+
+      if (checked === 0) {
+        return 'xywh';
+      }
+
+      if (xyxyScore >= xywhScore + 2) {
+        return 'xyxy';
+      }
+      return 'xywh';
+    }
+
+    function resolveBoxGeometry(box, frameW, frameH, boxMode) {
+      if (!box) return null;
+
+      let x = Number(box.x);
+      let y = Number(box.y);
+      let w = Number(box.w);
+      let h = Number(box.h);
+
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) {
+        return null;
+      }
+
+      if (boxMode === 'xyxy') {
+        w = w - x;
+        h = h - y;
+      }
+
+      if (w < 0) {
+        x += w;
+        w = -w;
+      }
+      if (h < 0) {
+        y += h;
+        h = -h;
+      }
+
+      return { ...box, x, y, w, h };
+    }
+
+    function buildProjection(inferWidth, inferHeight, videoWidth, videoHeight, boxes, deLetterboxEnabled) {
+      const inferW = Math.max(1, Number(inferWidth) || 1);
+      const inferH = Math.max(1, Number(inferHeight) || 1);
+      const videoW = Math.max(1, Number(videoWidth) || 1);
+      const videoH = Math.max(1, Number(videoHeight) || 1);
+
+      const direct = { mode: 'direct', inferW, inferH, videoW, videoH };
+      if (!deLetterboxEnabled) {
+        return direct;
+      }
+
+      const inferAspect = inferW / inferH;
+      const videoAspect = videoW / videoH;
+      if (Math.abs(inferAspect - videoAspect) < 0.02) {
+        return direct;
+      }
+
+      const fit = Math.min(inferW / videoW, inferH / videoH);
+      if (!Number.isFinite(fit) || fit <= 0) {
+        return direct;
+      }
+
+      const contentW = videoW * fit;
+      const contentH = videoH * fit;
+      const padX = (inferW - contentW) * 0.5;
+      const padY = (inferH - contentH) * 0.5;
+      if (padX < 1 && padY < 1) {
+        return direct;
+      }
+
+      let checked = 0;
+      let insideContent = 0;
+      for (const item of boxes) {
+        if (checked >= 8) break;
+        const box = resolveBoxGeometry(item, inferW, inferH, 'xywh');
+        if (!box) continue;
+        checked += 1;
+
+        const x1 = box.x;
+        const y1 = box.y;
+        const x2 = box.x + box.w;
+        const y2 = box.y + box.h;
+
+        if (x1 >= padX - 4 && y1 >= padY - 4 && x2 <= inferW - padX + 4 && y2 <= inferH - padY + 4) {
+          insideContent += 1;
+        }
+      }
+
+      if (checked > 0 && insideContent / checked < 0.5) {
+        return direct;
+      }
+
+      return {
+        mode: 'de_letterbox',
+        inferW,
+        inferH,
+        videoW,
+        videoH,
+        fit,
+        padX,
+        padY
+      };
+    }
+
+    function projectBoxToCanvas(box, projection, canvasWidth, canvasHeight) {
+      if (!box || !projection) return null;
+
+      let x1 = box.x;
+      let y1 = box.y;
+      let x2 = box.x + box.w;
+      let y2 = box.y + box.h;
+
+      if (projection.mode === 'de_letterbox') {
+        x1 = (x1 - projection.padX) / projection.fit;
+        y1 = (y1 - projection.padY) / projection.fit;
+        x2 = (x2 - projection.padX) / projection.fit;
+        y2 = (y2 - projection.padY) / projection.fit;
+
+        x1 = clamp(x1, 0, projection.videoW);
+        y1 = clamp(y1, 0, projection.videoH);
+        x2 = clamp(x2, 0, projection.videoW);
+        y2 = clamp(y2, 0, projection.videoH);
+
+        const sx = canvasWidth / Math.max(1, projection.videoW);
+        const sy = canvasHeight / Math.max(1, projection.videoH);
+
+        return {
+          x: x1 * sx,
+          y: y1 * sy,
+          w: Math.max(0, (x2 - x1) * sx),
+          h: Math.max(0, (y2 - y1) * sy)
+        };
+      }
+
+      const sx = canvasWidth / Math.max(1, projection.inferW);
+      const sy = canvasHeight / Math.max(1, projection.inferH);
+      return {
+        x: x1 * sx,
+        y: y1 * sy,
+        w: Math.max(0, (x2 - x1) * sx),
+        h: Math.max(0, (y2 - y1) * sy)
+      };
+    }
+
+    (async function main() {
+      await ensureJmuxer();
+
+      const query = new URLSearchParams(location.search);
+      const host = query.get('host') || location.hostname;
+      const videoPort = Number(query.get('video_port') || '8080');
+      const inferPort = Number(query.get('infer_port') || '8090');
+      const videoPath = query.get('video_path') || '/';
+      const inferPath = query.get('infer_path') || '/';
+
+      const videoUrl = `ws://${host}:${videoPort}${videoPath}`;
+      const inferUrl = `ws://${host}:${inferPort}${inferPath}`;
+
+      const videoEndpoint = document.getElementById('videoEndpoint');
+      const inferEndpoint = document.getElementById('inferEndpoint');
+      const videoState = document.getElementById('videoState');
+      const inferState = document.getElementById('inferState');
+      const fpsEl = document.getElementById('fps');
+      const boxCountEl = document.getElementById('boxCount');
+      const resultLogEl = document.getElementById('resultLog');
+      const jsonEl = document.getElementById('json');
+      const toggleInfer = document.getElementById('toggleInfer');
+      const toggleDeLetterbox = document.getElementById('toggleDeLetterbox');
+      const toggleResultLog = document.getElementById('toggleResultLog');
+      const toggleJson = document.getElementById('toggleJson');
+      const video = document.getElementById('player');
+      const canvas = document.getElementById('overlay');
+      const ctx = canvas.getContext('2d');
+
+      videoEndpoint.textContent = `(${videoPort})`;
+      inferEndpoint.textContent = `(${inferPort})`;
+
+      let frameCounter = 0;
+      let fpsStart = performance.now();
+      let inferW = 640;
+      let inferH = 640;
+      let latestBoxes = [];
+      const inferLogLines = [];
+
+      const mux = new JMuxer({ node: 'player', mode: 'video', fps: 30, clearBuffer: true, flushingTime: 0 });
+
+      function setState(target, connected) {
+        target.textContent = connected ? 'connected' : 'disconnected';
+        target.className = connected ? 'ok' : 'bad';
+      }
+
+      function resizeOverlay() {
+        const rect = video.getBoundingClientRect();
+        canvas.width = Math.max(1, Math.floor(rect.width));
+        canvas.height = Math.max(1, Math.floor(rect.height));
+      }
+
+      function drawBoxes() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (!toggleInfer.checked) {
+          boxCountEl.textContent = '0';
+          return;
+        }
+
+        const videoW = Number(video.videoWidth) || inferW;
+        const videoH = Number(video.videoHeight) || inferH;
+        const boxMode = detectBoxMode(latestBoxes, inferW, inferH);
+        const projection = buildProjection(inferW, inferH, videoW, videoH, latestBoxes, toggleDeLetterbox.checked);
+
+        ctx.lineWidth = 2;
+        ctx.font = '14px sans-serif';
+
+        for (const rawBox of latestBoxes) {
+          const box = resolveBoxGeometry(rawBox, inferW, inferH, boxMode);
+          if (!box) continue;
+
+          const projected = projectBoxToCanvas(box, projection, canvas.width, canvas.height);
+          if (!projected) continue;
+
+          const x = projected.x;
+          const y = projected.y;
+          const w = projected.w;
+          const h = projected.h;
+          if (w < 2 || h < 2) continue;
+
+          const scoreText = box.score !== undefined ? ` ${(box.score * 100).toFixed(1)}%` : '';
+          const label = box.label || `cls${box.class_id !== undefined ? box.class_id : ''}`;
+          const text = `${label}${scoreText}`;
+
+          ctx.strokeStyle = '#00ff88';
+          ctx.strokeRect(x, y, w, h);
+
+          const textW = Math.max(40, text.length * 8);
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+          ctx.fillRect(x, Math.max(0, y - 16), textW, 16);
+          ctx.fillStyle = '#00ff88';
+          ctx.fillText(text, x + 2, Math.max(12, y - 4));
+        }
+
+        boxCountEl.textContent = String(latestBoxes.length);
+      }
+
+      function updateFps() {
+        frameCounter += 1;
+        const now = performance.now();
+        if (now - fpsStart >= 1000) {
+          fpsEl.textContent = String(frameCounter);
+          frameCounter = 0;
+          fpsStart = now;
+        }
+      }
+
+      function appendInferLog(data, boxes) {
+        const now = new Date();
+        const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+        const frameId = data && data.frame_id !== undefined ? data.frame_id : '-';
+        const latency = data && data.latency_ms !== undefined ? `${Number(data.latency_ms).toFixed(1)}ms` : '-';
+
+        inferLogLines.push(`[${timestamp}] frame=${frameId} boxes=${boxes.length} latency=${latency}`);
+        for (let index = 0; index < boxes.length; index += 1) {
+          inferLogLines.push(formatBoxLine(boxes[index], index));
+        }
+
+        while (inferLogLines.length > 240) inferLogLines.shift();
+
+        if (toggleResultLog.checked) {
+          resultLogEl.textContent = inferLogLines.join('\n');
+          resultLogEl.scrollTop = resultLogEl.scrollHeight;
+        }
+      }
+
+      function connectVideo() {
+        const ws = new WebSocket(videoUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => setState(videoState, true);
+        ws.onclose = () => { setState(videoState, false); setTimeout(connectVideo, 1000); };
+        ws.onerror = () => setState(videoState, false);
+        ws.onmessage = event => {
+          const bytes = new Uint8Array(event.data);
+          mux.feed({ video: bytes });
+          updateFps();
+          resizeOverlay();
+          drawBoxes();
+        };
+      }
+
+      function connectInfer() {
+        const ws = new WebSocket(inferUrl);
+
+        ws.onopen = () => setState(inferState, true);
+        ws.onclose = () => { setState(inferState, false); setTimeout(connectInfer, 1000); };
+        ws.onerror = () => setState(inferState, false);
+        ws.onmessage = event => {
+          try {
+            const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(new Uint8Array(event.data));
+            const obj = JSON.parse(text);
+            const data = readInferData(obj);
+
+            if (Array.isArray(data.resolution) && data.resolution.length >= 2) {
+              inferW = Number(data.resolution[0]) || inferW;
+              inferH = Number(data.resolution[1]) || inferH;
+            } else if (data.frame_width && data.frame_height) {
+              inferW = Number(data.frame_width) || inferW;
+              inferH = Number(data.frame_height) || inferH;
+            }
+
+            latestBoxes = parseBoxes(data);
+            drawBoxes();
+            appendInferLog(data, latestBoxes);
+
+            if (toggleJson.checked) jsonEl.textContent = JSON.stringify(data, null, 2);
+          } catch (err) {
+            if (toggleJson.checked) jsonEl.textContent = `infer parse error: ${err}`;
+          }
+        };
+      }
+
+      toggleInfer.addEventListener('change', drawBoxes);
+      toggleDeLetterbox.addEventListener('change', drawBoxes);
+      toggleResultLog.addEventListener('change', () => {
+        resultLogEl.classList.toggle('hidden', !toggleResultLog.checked);
+        if (toggleResultLog.checked) {
+          resultLogEl.textContent = inferLogLines.join('\n');
+          resultLogEl.scrollTop = resultLogEl.scrollHeight;
+        }
+      });
+      toggleJson.addEventListener('change', () => {
+        jsonEl.classList.toggle('hidden', !toggleJson.checked);
+      });
+
+      window.addEventListener('resize', () => { resizeOverlay(); drawBoxes(); });
+      setInterval(() => { resizeOverlay(); drawBoxes(); }, 500);
+
+      connectVideo();
+      connectInfer();
+      resizeOverlay();
+      drawBoxes();
+    })().catch(err => {
+      document.body.innerHTML = `<pre>Failed to initialize preview page: ${String(err)}</pre>`;
+    });
+  </script>
+</body>
+</html>

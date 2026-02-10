@@ -3,6 +3,7 @@
 #include "node_server.h"
 #include "camera_node.h"
 #include "resource_estimator.h"
+#include "stream/websocket_transport.h"
 #include "modules/cv/cv_helpers.h"
 #include "modules/cv/cv_types.h"
 #include "tensor/tensor.h"
@@ -323,6 +324,28 @@ int ModelNode::onCreate(const nlohmann::json& config) {
             profile_ = true;
         }
     }
+    if (config.contains("websocket")) {
+        websocket_ = config["websocket"].get<bool>();
+    }
+    if (config.contains("ws_port")) {
+        ws_port_ = config["ws_port"].get<int>();
+    }
+    if (config.contains("ws_path")) {
+        ws_path_ = config["ws_path"].get<std::string>();
+    }
+    if (config.contains("ws_max_clients")) {
+        ws_max_clients_ = config["ws_max_clients"].get<int>();
+    }
+    if (config.contains("output")) {
+        output_ = config["output"].get<bool>();
+    }
+    if (config.contains("debug")) {
+        debug_ = config["debug"].get<bool>();
+    }
+
+    if (debug_) {
+        output_ = true;
+    }
 
     // 2. Set LUA_PATH from script directory if not already set
     const char* existing_lua_path = std::getenv("LUA_PATH");
@@ -511,6 +534,27 @@ int ModelNode::onStart() {
         id_, usage, camera_id, upstream_model_id);
 
     running_.store(true, std::memory_order_release);
+
+    if (websocket_) {
+        lua_cv::WebSocketTransport::Config ws_cfg;
+        ws_cfg.port = ws_port_;
+        ws_cfg.path = ws_path_;
+        ws_cfg.max_clients = ws_max_clients_;
+        ws_ = std::make_unique<lua_cv::WebSocketTransport>(ws_cfg);
+        if (!ws_->start()) {
+            event("error", MA_EIO, {{"message", "ModelNode WebSocket start failed"}});
+            ws_.reset();
+            running_.store(false, std::memory_order_release);
+            ResourceEstimator::instance().on_node_stopped(id_);
+            return MA_EIO;
+        }
+        event("websocket", MA_OK, {
+            {"port", ws_port_},
+            {"path", ws_path_},
+            {"type", "json"}
+        });
+    }
+
     infer_thread_ = std::thread(&ModelNode::inferLoop, this);
 
     return MA_OK;
@@ -526,6 +570,11 @@ int ModelNode::onStop() {
 
     if (infer_thread_.joinable()) {
         infer_thread_.join();
+    }
+
+    if (ws_) {
+        ws_->stop();
+        ws_.reset();
     }
 
     inbox_.clear();
@@ -558,7 +607,9 @@ int ModelNode::onControl(const std::string& action, const nlohmann::json& data) 
         response("get_stats", MA_OK, {
             {"infer_count", infer_count_.load()},
             {"error_count", error_count_.load()},
-            {"infer_ema_ms", infer_ema_ms_}
+            {"infer_ema_ms", infer_ema_ms_},
+            {"ws_event_count", ws_event_count_.load()},
+            {"ws_clients", ws_ ? ws_->client_count() : 0}
         });
         return MA_OK;
     }
@@ -608,13 +659,52 @@ void ModelNode::inferLoop() {
                 upstream_camera_->report_proc_time(id_, elapsed_ms);
             }
 
-            // Publish result event
-            result["latency_ms"] = elapsed_ms;
-            result["frame_id"] = ctx->frame_id;
-            event("invoke", 0, result);
+            nlohmann::json event_data;
+            if (result.is_object()) {
+                event_data = std::move(result);
+            } else if (result.is_array()) {
+                event_data = nlohmann::json::object({{"boxes", std::move(result)}});
+            } else {
+                event_data = nlohmann::json::object({{"value", std::move(result)}});
+            }
+
+            event_data["latency_ms"] = elapsed_ms;
+            event_data["frame_id"] = ctx->frame_id;
+            if (!event_data.contains("frame_width")) {
+                event_data["frame_width"] = ctx->frame->frame().width();
+            }
+            if (!event_data.contains("frame_height")) {
+                event_data["frame_height"] = ctx->frame->frame().height();
+            }
+
+            event("invoke", MA_OK, event_data);
+
+            if (websocket_ && ws_) {
+                try {
+                    nlohmann::json ws_msg = {
+                        {"type", static_cast<int>(MessageType::EVENT)},
+                        {"name", "invoke"},
+                        {"code", MA_OK},
+                        {"data", event_data}
+                    };
+
+                    if (!output_ && ws_msg["data"].is_object()) {
+                        ws_msg["data"]["image"] = "";
+                    }
+
+                    std::string payload = ws_msg.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                    if (ws_->broadcast_text(payload.c_str(), payload.size())) {
+                        ws_event_count_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } catch (const std::exception& e) {
+                    if (debug_) {
+                        std::cerr << "[ModelNode] websocket serialize/send failed: " << e.what() << "\n";
+                    }
+                }
+            }
 
             // Forward to downstream
-            forwardToDownstream(ctx, result);
+            forwardToDownstream(ctx, event_data);
 
         } catch (const std::exception& e) {
             error_count_.fetch_add(1, std::memory_order_relaxed);

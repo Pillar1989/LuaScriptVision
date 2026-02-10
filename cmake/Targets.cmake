@@ -266,6 +266,7 @@ set(SRC_COMMON_INCLUDES
     "${CMAKE_SOURCE_DIR}/src/utils"
     "${CMAKE_SOURCE_DIR}/src/inference"
     "${CMAKE_SOURCE_DIR}/src/node"
+    "${CMAKE_SOURCE_DIR}/third_party/mongoose"
 )
 
 set(LUAINTF_INCLUDES

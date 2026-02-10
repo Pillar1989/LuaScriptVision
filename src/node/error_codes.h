@@ -11,5 +11,6 @@ constexpr int MA_ENOMEM   = 12;  // Out of memory
 constexpr int MA_EBUSY    = 16;  // Resource busy
 constexpr int MA_EEXIST   = 17;  // Already exists
 constexpr int MA_EINVAL   = 22;  // Invalid argument
+constexpr int MA_ENOTSUP  = 95;  // Operation not supported
 
 } // namespace node

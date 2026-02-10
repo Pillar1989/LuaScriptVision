@@ -21,6 +21,7 @@
 #include "node/camera_node.h"
 #include "node/model_node.h"
 #include "node/stream_node.h"
+#include "stream/preview_http_server.h"
 
 namespace {
 std::atomic<bool> g_stop{false};
@@ -46,6 +47,10 @@ struct AppConfig {
     int stream_bitrate_kbps = 4000;
     int stream_width = 1920;
     int stream_height = 1080;
+    int ws_video_port = 8080;
+    int ws_infer_port = 8090;
+    int preview_http_port = 8000;
+    bool preview_http = true;
     double infer_fps_limit = 0.0;
     float threshold = 0.25f;
     bool enable_mqtt = false;
@@ -71,6 +76,10 @@ void print_usage(const char* prog) {
               << "  --bitrate KBPS          Stream bitrate in kbps (default: 4000)\n"
               << "  --width W               Stream width (default: 1920)\n"
               << "  --height H              Stream height (default: 1080)\n"
+              << "  --ws-video-port PORT    Video WebSocket port (default: 8080)\n"
+              << "  --ws-infer-port PORT    Infer WebSocket port (default: 8090)\n"
+              << "  --preview-http-port P   Preview HTML HTTP port (default: 8000)\n"
+              << "  --no-preview-http       Disable built-in HTML preview server\n"
               << "  --infer-fps-limit FPS   Enable adaptive skip to limit inference FPS\n"
               << "  --sensor NAME           Sensor type (default: ov5647)\n"
               << "  --threshold VALUE       Confidence threshold (default: 0.25)\n"
@@ -115,6 +124,14 @@ bool parse_args(int argc, char* argv[], AppConfig* config) {
             config->stream_width = std::atoi(argv[++i]);
         } else if (arg == "--height" && i + 1 < argc) {
             config->stream_height = std::atoi(argv[++i]);
+        } else if (arg == "--ws-video-port" && i + 1 < argc) {
+            config->ws_video_port = std::atoi(argv[++i]);
+        } else if (arg == "--ws-infer-port" && i + 1 < argc) {
+            config->ws_infer_port = std::atoi(argv[++i]);
+        } else if (arg == "--preview-http-port" && i + 1 < argc) {
+            config->preview_http_port = std::atoi(argv[++i]);
+        } else if (arg == "--no-preview-http") {
+            config->preview_http = false;
         } else if (arg == "--infer-fps-limit" && i + 1 < argc) {
             config->infer_fps_limit = std::atof(argv[++i]);
         } else if (arg == "--sensor" && i + 1 < argc) {
@@ -190,11 +207,32 @@ int main(int argc, char* argv[]) {
     }
 
     node::NodeFactory& factory = node::NodeFactory::instance();
+    std::unique_ptr<lua_cv::PreviewHttpServer> preview_server;
+
+    if (config.preview_http) {
+        lua_cv::PreviewHttpServer::Config preview_cfg;
+        preview_cfg.port = config.preview_http_port;
+        preview_cfg.ws_video_port = config.ws_video_port;
+        preview_cfg.ws_infer_port = config.ws_infer_port;
+        preview_cfg.infer_width = 640;
+        preview_cfg.infer_height = 640;
+        preview_server = std::make_unique<lua_cv::PreviewHttpServer>(preview_cfg);
+        if (!preview_server->start()) {
+            std::cerr << "[App] Failed to start preview HTTP server on port "
+                      << config.preview_http_port << "\n";
+            preview_server.reset();
+        }
+    }
+
     auto shutdown = [&](bool stop_server) {
         factory.stop("camera");
         factory.stop("detector");
         factory.stop("streamer");
         factory.destroyAll();
+        if (preview_server) {
+            preview_server->stop();
+            preview_server.reset();
+        }
         if (stop_server && server) {
             server->stop();
         }
@@ -224,7 +262,9 @@ int main(int argc, char* argv[]) {
         {"width", config.stream_width},
         {"height", config.stream_height},
         {"port", config.rtsp_port},
-        {"session", config.session}
+        {"session", config.session},
+        {"websocket", true},
+        {"ws_port", config.ws_video_port}
     };
 
     if (!factory.create("streamer", "stream", stream_cfg, {"camera"})) {
@@ -237,7 +277,9 @@ int main(int argc, char* argv[]) {
     nlohmann::json model_cfg = {
         {"model", config.model_path},
         {"script", config.script_path},
-        {"threshold", config.threshold}
+        {"threshold", config.threshold},
+        {"websocket", true},
+        {"ws_port", config.ws_infer_port}
     };
     if (config.profile) {
         model_cfg["profile"] = true;
@@ -259,6 +301,12 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[App] RTSP: rtsp://<device_ip>:" << config.rtsp_port
               << "/" << config.session << "\n";
+    std::cout << "[App] Video WS: ws://<device_ip>:" << config.ws_video_port << "\n";
+    std::cout << "[App] Infer WS: ws://<device_ip>:" << config.ws_infer_port << "\n";
+    if (preview_server) {
+        std::cout << "[App] Preview HTML: "
+                  << preview_server->get_url("<device_ip>") << "\n";
+    }
     std::cout << "[App] Press Ctrl+C to stop...\n";
 
     auto start = std::chrono::steady_clock::now();

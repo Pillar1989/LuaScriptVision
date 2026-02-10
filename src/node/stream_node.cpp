@@ -5,6 +5,7 @@
 #ifdef USE_CVI_MPI
 #include "stream/venc_encoder.h"
 #include "stream/rtsp_server.h"
+#include "stream/websocket_transport.h"
 #endif
 
 #include <chrono>
@@ -49,10 +50,26 @@ int StreamNode::onCreate(const nlohmann::json& config) {
     if (config.contains("session")) {
         config_.session = config["session"].get<std::string>();
     }
+    if (config.contains("websocket")) {
+        config_.websocket = config["websocket"].get<bool>();
+    }
+    if (config.contains("ws_port")) {
+        config_.ws_port = config["ws_port"].get<int>();
+    }
+    if (config.contains("ws_path")) {
+        config_.ws_path = config["ws_path"].get<std::string>();
+    }
+    if (config.contains("ws_max_clients")) {
+        config_.ws_max_clients = config["ws_max_clients"].get<int>();
+    }
 
     if (config_.fps <= 0 || config_.width <= 0 || config_.height <= 0) {
         event("error", MA_EINVAL, {{"message", "Invalid stream dimensions or fps"}});
         return MA_EINVAL;
+    }
+    if (config_.websocket && config_.codec != "h264") {
+        event("error", MA_ENOTSUP, {{"message", "WebSocket video preview only supports H264 codec"}});
+        return MA_ENOTSUP;
     }
 
     // Resolve camera dependency
@@ -143,6 +160,28 @@ int StreamNode::onStart() {
         encoder_.reset();
         return MA_EIO;
     }
+
+    if (config_.websocket) {
+        lua_cv::WebSocketTransport::Config ws_cfg;
+        ws_cfg.port = config_.ws_port;
+        ws_cfg.path = config_.ws_path;
+        ws_cfg.max_clients = config_.ws_max_clients;
+        ws_ = std::make_unique<lua_cv::WebSocketTransport>(ws_cfg);
+        if (!ws_->start()) {
+            event("error", MA_EIO, {{"message", "WebSocket server start failed"}});
+            ws_.reset();
+            rtsp_->stop();
+            rtsp_.reset();
+            encoder_->shutdown();
+            encoder_.reset();
+            return MA_EIO;
+        }
+        event("websocket", MA_OK, {
+            {"port", config_.ws_port},
+            {"path", config_.ws_path},
+            {"codec", "h264"}
+        });
+    }
 #else
     event("error", MA_EINVAL, {{"message", "StreamNode requires CVI MPI support"}});
     return MA_EINVAL;
@@ -172,6 +211,11 @@ int StreamNode::onStop() {
         rtsp_.reset();
     }
 
+    if (ws_) {
+        ws_->stop();
+        ws_.reset();
+    }
+
     if (encoder_) {
         encoder_->shutdown();
         encoder_.reset();
@@ -190,7 +234,9 @@ int StreamNode::onDestroy() {
 int StreamNode::onControl(const std::string& action, const nlohmann::json& /*data*/) {
     if (action == "get_stats") {
         response("get_stats", MA_OK, {
-            {"stream_frames", stream_frames_.load(std::memory_order_relaxed)}
+            {"stream_frames", stream_frames_.load(std::memory_order_relaxed)},
+            {"ws_frames", ws_frames_.load(std::memory_order_relaxed)},
+            {"ws_clients", ws_ ? ws_->client_count() : 0}
         });
         return MA_OK;
     }
@@ -200,6 +246,7 @@ int StreamNode::onControl(const std::string& action, const nlohmann::json& /*dat
 void StreamNode::encodeLoop() {
 #ifdef USE_CVI_MPI
     uint64_t frame_count = 0;
+    uint64_t ws_frame_count = 0;
     while (running_.load(std::memory_order_acquire)) {
         if (!encoder_) {
             break;
@@ -219,6 +266,13 @@ void StreamNode::encodeLoop() {
         if (rtsp_ && rtsp_->send_video(stream.data.data(), stream.data.size(), pts)) {
             frame_count++;
             stream_frames_.store(frame_count, std::memory_order_release);
+        }
+
+        if (ws_) {
+            if (ws_->broadcast_binary(stream.data.data(), stream.data.size())) {
+                ws_frame_count++;
+                ws_frames_.store(ws_frame_count, std::memory_order_release);
+            }
         }
 
         encoder_->release_stream();
